@@ -18,7 +18,28 @@ case "${PROFILE}" in
     public|oss|incremental|fast)
         echo "Running public FluidVoice build without Fluid Intelligence..."
         cd "${PROJECT_DIR}"
-        exec xcodebuild -project Fluid.xcodeproj -scheme Fluid -destination 'platform=macOS' build CODE_SIGNING_ALLOWED=NO
+        xcodebuild -project Fluid.xcodeproj -scheme Fluid -destination 'platform=macOS' build \
+            CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM=
+
+        # xcodebuild's CLI build does not embed SPM dynamic frameworks
+        # (MediaRemoteAdapter), so the bundle crashes at launch with dyld
+        # "Library missing". Copy them in and re-sign ad hoc.
+        SETTINGS=$(xcodebuild -project Fluid.xcodeproj -scheme Fluid -destination 'platform=macOS' -showBuildSettings 2>/dev/null)
+        PRODUCTS_DIR=$(echo "${SETTINGS}" | awk -F' = ' '/ BUILT_PRODUCTS_DIR =/ {print $2; exit}')
+        APP_PATH="${PRODUCTS_DIR}/$(echo "${SETTINGS}" | awk -F' = ' '/ FULL_PRODUCT_NAME =/ {print $2; exit}')"
+
+        if [ -d "${PRODUCTS_DIR}/PackageFrameworks" ]; then
+            mkdir -p "${APP_PATH}/Contents/Frameworks"
+            for fw in "${PRODUCTS_DIR}/PackageFrameworks"/*.framework; do
+                echo "Embedding $(basename "${fw}")"
+                rm -rf "${APP_PATH}/Contents/Frameworks/$(basename "${fw}")"
+                cp -R "${fw}" "${APP_PATH}/Contents/Frameworks/"
+                codesign --force --sign - "${APP_PATH}/Contents/Frameworks/$(basename "${fw}")"
+            done
+            codesign --force --sign - --entitlements "${PROJECT_DIR}/Fluid.entitlements" "${APP_PATH}"
+        fi
+
+        echo "App ready at: ${APP_PATH}"
         ;;
     fi|private|dev|full)
         if [ ! -x "${PRIVATE_FI_BUILD_SCRIPT}" ]; then
