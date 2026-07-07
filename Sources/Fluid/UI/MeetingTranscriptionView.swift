@@ -56,7 +56,7 @@ struct MeetingTranscriptionView: View {
             ScrollView {
                 VStack(spacing: 24) {
                     // Live two-track meeting recording (MeetAI v2)
-                    MeetingRecorderCard()
+                    MeetingRecorderCard(asrService: self.asrService)
 
                     // File Selection Card
                     self.fileSelectionCard

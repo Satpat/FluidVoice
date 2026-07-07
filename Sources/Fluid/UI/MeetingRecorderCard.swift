@@ -11,7 +11,12 @@ extension MeetingRecordingSession {
 /// Start/stop card for live two-track meeting recording (system audio + mic).
 struct MeetingRecorderCard: View {
     @State private var session = MeetingRecordingSession.shared
+    @StateObject private var pipeline: MeetingTranscriptPipeline
     @Environment(\.theme) private var theme
+
+    init(asrService: ASRService) {
+        _pipeline = StateObject(wrappedValue: MeetingTranscriptPipeline(asrService: asrService))
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -100,29 +105,77 @@ struct MeetingRecorderCard: View {
     }
 
     private func stoppedContent(artifacts: MeetingRecordingArtifacts) -> some View {
-        HStack {
-            Image(systemName: "checkmark.circle.fill")
-                .font(.title2)
-                .foregroundColor(Color.fluidGreen)
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.title2)
+                    .foregroundColor(Color.fluidGreen)
 
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Recording saved")
-                    .font(.headline)
-                Text("\(artifacts.displayName) · \(Self.format(elapsed: artifacts.duration))")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(self.pipeline.transcriptURL == nil ? "Recording saved" : "Transcript ready")
+                        .font(.headline)
+                    Text("\(artifacts.displayName) · \(Self.format(elapsed: artifacts.duration))")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+
+                Spacer()
+
+                if let transcriptURL = self.pipeline.transcriptURL {
+                    Button("Open Transcript") {
+                        NSWorkspace.shared.open(transcriptURL)
+                    }
+                } else {
+                    Button(action: { self.transcribe(artifacts) }) {
+                        HStack {
+                            Image(systemName: "waveform")
+                            Text("Transcribe")
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(self.pipeline.isProcessing)
+                }
+
+                Button("Show in Finder") {
+                    NSWorkspace.shared.activateFileViewerSelecting([artifacts.systemAudio, artifacts.microphone])
+                }
+
+                Button("New Recording") {
+                    self.pipeline.transcriptURL = nil
+                    self.session.reset()
+                }
+                .disabled(self.pipeline.isProcessing)
             }
 
-            Spacer()
-
-            Button("Show in Finder") {
-                NSWorkspace.shared.activateFileViewerSelecting([artifacts.systemAudio, artifacts.microphone])
+            if self.pipeline.isProcessing {
+                VStack(alignment: .leading, spacing: 6) {
+                    ProgressView(value: self.pipeline.progress)
+                        .progressViewStyle(.linear)
+                    Text(self.pipeline.currentStatus)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
             }
 
-            Button("New Recording") {
-                self.session.reset()
+            if let error = self.pipeline.error {
+                HStack {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundColor(.red)
+                    Text(error)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
             }
-            .buttonStyle(.borderedProminent)
+        }
+    }
+
+    private func transcribe(_ artifacts: MeetingRecordingArtifacts) {
+        Task {
+            do {
+                _ = try await self.pipeline.process(artifacts)
+            } catch {
+                DebugLogger.shared.error("Meeting transcription failed: \(error)", source: "MeetingRecorderCard")
+            }
         }
     }
 
