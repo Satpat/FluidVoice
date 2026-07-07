@@ -212,7 +212,7 @@ final class MeetingTranscriptPipeline: ObservableObject {
     nonisolated static func splitOnSilence(
         samples: [Float],
         sampleRate: Int,
-        minSilence: TimeInterval = 0.7,
+        minSilence: TimeInterval = 0.45,
         minUtterance: TimeInterval = 1.0,
         maxUtterance: TimeInterval = 30.0
     ) -> [Utterance] {
@@ -222,7 +222,6 @@ final class MeetingTranscriptPipeline: ObservableObject {
         let windowCount = (samples.count + window - 1) / window
 
         var rms = [Float](repeating: 0, count: windowCount)
-        var overallSum: Float = 0
         for w in 0..<windowCount {
             let start = w * window
             let end = min(start + window, samples.count)
@@ -230,13 +229,16 @@ final class MeetingTranscriptPipeline: ObservableObject {
             for i in start..<end {
                 sum += samples[i] * samples[i]
             }
-            let value = (sum / Float(end - start)).squareRoot()
-            rms[w] = value
-            overallSum += value
+            rms[w] = (sum / Float(end - start)).squareRoot()
         }
-        // Threshold relative to the track's average level, floored for
-        // near-digital-silence tracks (e.g. system audio when nobody talks).
-        let threshold = max(0.004, (overallSum / Float(windowCount)) * 0.35)
+        // Threshold from the track's noise floor rather than its mean: long
+        // silent stretches (padded system audio, quiet mic) drag the mean
+        // down and a mean-relative threshold with it. p20 approximates the
+        // noise floor, p90 the speech level; cut a bit above the floor.
+        let sorted = rms.sorted()
+        let noiseFloor = sorted[windowCount / 5]
+        let speechLevel = sorted[min(windowCount - 1, windowCount * 9 / 10)]
+        let threshold = max(0.004, noiseFloor + (speechLevel - noiseFloor) * 0.18)
 
         let minSilenceWindows = max(1, Int(minSilence * Double(sampleRate)) / window)
         let minUtteranceSamples = Int(minUtterance * Double(sampleRate))

@@ -16,6 +16,8 @@ final class ProcessTapRecorder {
     @ObservationIgnored private weak var _tap: SystemAudioTap?
     @ObservationIgnored private var currentFile: AVAudioFile?
     @ObservationIgnored private(set) var lastPeak: Float = 0
+    @ObservationIgnored private var startHostTime: UInt64 = 0
+    @ObservationIgnored private var framesWritten: Int64 = 0
 
     private(set) var isRecording = false
 
@@ -52,7 +54,10 @@ final class ProcessTapRecorder {
                                    interleaved: format.isInterleaved)
         self.currentFile = file
 
-        try tap.run(on: self.queue) { [weak self] _, inInputData, _, _, _ in
+        self.startHostTime = mach_absolute_time()
+        self.framesWritten = 0
+
+        try tap.run(on: self.queue) { [weak self] _, inInputData, inInputTime, _, _ in
             guard let self, let file = self.currentFile else { return }
             do {
                 guard let buffer = AVAudioPCMBuffer(pcmFormat: format,
@@ -60,8 +65,26 @@ final class ProcessTapRecorder {
                                                     deallocator: nil) else {
                     throw MeetingRecordingError("Failed to wrap PCM buffer")
                 }
+
+                // The device delivers no buffers while every process is
+                // silent (idle output), so file time would drift from wall
+                // time and later gap-less audio would glue together. Pad any
+                // gap with silence so system-track timestamps stay aligned
+                // with the mic track.
+                let hostTime = inInputTime.pointee.mHostTime
+                if hostTime > self.startHostTime {
+                    let elapsed = Self.hostTicksToSeconds(hostTime - self.startHostTime)
+                    let expectedFrames = Int64(elapsed * format.sampleRate)
+                    let gap = expectedFrames - self.framesWritten
+                    if gap > Int64(format.sampleRate / 4) { // tolerate <0.25 s of jitter
+                        try self.writeSilence(frames: gap, format: format, to: file)
+                        self.framesWritten += gap
+                    }
+                }
+
                 self.lastPeak = ProcessTapRecorder.peak(of: buffer)
                 try file.write(from: buffer)
+                self.framesWritten += Int64(buffer.frameLength)
             } catch {
                 self.logger.error("write: \(error.localizedDescription, privacy: .public)")
             }
@@ -70,6 +93,38 @@ final class ProcessTapRecorder {
         }
 
         self.isRecording = true
+    }
+
+    private func writeSilence(frames: Int64, format: AVAudioFormat, to file: AVAudioFile) throws {
+        let chunkCapacity = AVAudioFrameCount(format.sampleRate) // 1 s per chunk
+        var remaining = frames
+        while remaining > 0 {
+            let count = AVAudioFrameCount(min(Int64(chunkCapacity), remaining))
+            guard let silence = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: count) else {
+                throw MeetingRecordingError("Failed to allocate silence buffer")
+            }
+            silence.frameLength = count
+            let byteCount = Int(count) * Int(format.streamDescription.pointee.mBytesPerFrame)
+            let bufferList = silence.mutableAudioBufferList
+            for i in 0..<Int(bufferList.pointee.mNumberBuffers) {
+                let audioBuffer = UnsafeMutableAudioBufferListPointer(bufferList)[i]
+                if let data = audioBuffer.mData {
+                    memset(data, 0, min(Int(audioBuffer.mDataByteSize), byteCount))
+                }
+            }
+            try file.write(from: silence)
+            remaining -= Int64(count)
+        }
+    }
+
+    private static let hostTimebase: mach_timebase_info_data_t = {
+        var info = mach_timebase_info_data_t()
+        mach_timebase_info(&info)
+        return info
+    }()
+
+    private static func hostTicksToSeconds(_ ticks: UInt64) -> Double {
+        Double(ticks) * Double(hostTimebase.numer) / Double(hostTimebase.denom) / 1_000_000_000
     }
 
     func stop() {
