@@ -24,6 +24,10 @@ final class MeetingMicRecorder {
     private(set) var isRecording = false
     @ObservationIgnored private(set) var lastPeak: Float = 0
 
+    /// Optional tee of the recorded audio as 16 kHz mono samples, called on
+    /// the audio tap thread. Used for live transcription; must be cheap.
+    @ObservationIgnored var liveSampleHandler: (([Float]) -> Void)?
+
     init(fileURL: URL) {
         self.fileURL = fileURL
         self.logger = Logger(subsystem: kMeetingRecordingSubsystem,
@@ -105,6 +109,12 @@ final class MeetingMicRecorder {
             self.lastPeak = MeetingMicRecorder.peak(of: converted)
         } catch {
             self.logger.error("write: \(error.localizedDescription, privacy: .public)")
+        }
+
+        if let handler = self.liveSampleHandler,
+           let channel = converted.floatChannelData
+        {
+            handler(Array(UnsafeBufferPointer(start: channel[0], count: Int(converted.frameLength))))
         }
     }
 

@@ -10,7 +10,8 @@ import AVFoundation
 import Combine
 import Foundation
 
-struct MeetingSegment: Sendable {
+struct MeetingSegment: Sendable, Identifiable {
+    let id = UUID()
     let start: TimeInterval
     let end: TimeInterval
     let speaker: String

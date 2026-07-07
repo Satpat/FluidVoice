@@ -41,6 +41,11 @@ final class MeetingRecordingSession {
     private(set) var state: State = .idle
     var systemPeak: Float { self.systemRecorder?.lastPeak ?? 0 }
     var micPeak: Float { self.micRecorder?.lastPeak ?? 0 }
+
+    /// Optional 16 kHz mono sample tees for live transcription. Set before
+    /// calling start(); invoked on audio threads.
+    @ObservationIgnored var liveMicSampleHandler: (([Float]) -> Void)?
+    @ObservationIgnored var liveSystemSampleHandler: (([Float]) -> Void)?
     var isRecording: Bool {
         if case .recording = self.state { return true }
         return false
@@ -85,10 +90,12 @@ final class MeetingRecordingSession {
             let micURL = folder.appendingPathComponent("mic.wav")
 
             let sysRec = ProcessTapRecorder(fileURL: systemURL, tap: tap)
+            sysRec.liveSampleHandler = self.liveSystemSampleHandler
             try sysRec.start()
             self.systemRecorder = sysRec
 
             let mic = MeetingMicRecorder(fileURL: micURL)
+            mic.liveSampleHandler = self.liveMicSampleHandler
             try mic.start()
             self.micRecorder = mic
 

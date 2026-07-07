@@ -11,11 +11,33 @@ extension MeetingRecordingSession {
 /// Start/stop card for live two-track meeting recording (system audio + mic).
 struct MeetingRecorderCard: View {
     @State private var session = MeetingRecordingSession.shared
+    @ObservedObject private var liveTranscriber = MeetingLiveTranscriber.shared
     @StateObject private var pipeline: MeetingTranscriptPipeline
     @Environment(\.theme) private var theme
 
+    private let asrService: ASRService
+
     init(asrService: ASRService) {
+        self.asrService = asrService
         _pipeline = StateObject(wrappedValue: MeetingTranscriptPipeline(asrService: asrService))
+    }
+
+    private func startRecording() {
+        let transcriber = MeetingLiveTranscriber.shared
+        self.session.liveMicSampleHandler = { transcriber.micQueue.append($0) }
+        self.session.liveSystemSampleHandler = { transcriber.systemQueue.append($0) }
+        self.session.start()
+        if case .recording = self.session.state {
+            transcriber.start(asrService: self.asrService)
+            // Kick the model load now so the first live tick can transcribe.
+            let asrService = self.asrService
+            Task { try? await asrService.ensureAsrReady() }
+        }
+    }
+
+    private func stopRecording() {
+        self.session.stop()
+        Task { await MeetingLiveTranscriber.shared.finish() }
     }
 
     var body: some View {
@@ -56,7 +78,7 @@ struct MeetingRecorderCard: View {
 
             Spacer()
 
-            Button(action: { self.session.start() }) {
+            Button(action: { self.startRecording() }) {
                 HStack {
                     Image(systemName: "record.circle")
                     Text("Start")
@@ -84,7 +106,7 @@ struct MeetingRecorderCard: View {
 
                 Spacer()
 
-                Button(action: { self.session.stop() }) {
+                Button(action: { self.stopRecording() }) {
                     HStack {
                         Image(systemName: "stop.fill")
                         Text("Stop")
@@ -99,6 +121,46 @@ struct MeetingRecorderCard: View {
                 VStack(spacing: 6) {
                     self.levelMeter(label: "System", level: self.session.systemPeak)
                     self.levelMeter(label: "Mic", level: self.session.micPeak)
+                }
+            }
+
+            self.liveTranscriptPane
+        }
+    }
+
+    @ViewBuilder
+    private var liveTranscriptPane: some View {
+        if !self.liveTranscriber.segments.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Live transcript")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 6) {
+                            ForEach(self.liveTranscriber.segments) { segment in
+                                (Text("[\(MeetingTranscriptPipeline.timestamp(segment.start))] ")
+                                    .foregroundColor(.secondary)
+                                    + Text("\(segment.speaker): ").bold()
+                                    + Text(segment.text))
+                                    .font(.callout)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .id(segment.id)
+                            }
+                        }
+                        .padding(10)
+                    }
+                    .frame(maxHeight: 220)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(self.theme.palette.contentBackground)
+                    )
+                    .onChange(of: self.liveTranscriber.segments.count) {
+                        if let last = self.liveTranscriber.segments.last {
+                            withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                        }
+                    }
                 }
             }
         }
@@ -142,10 +204,13 @@ struct MeetingRecorderCard: View {
 
                 Button("New Recording") {
                     self.pipeline.transcriptURL = nil
+                    MeetingLiveTranscriber.shared.reset()
                     self.session.reset()
                 }
                 .disabled(self.pipeline.isProcessing)
             }
+
+            self.liveTranscriptPane
 
             if self.pipeline.isProcessing {
                 VStack(alignment: .leading, spacing: 6) {

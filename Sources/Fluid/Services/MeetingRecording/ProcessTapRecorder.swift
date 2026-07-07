@@ -18,6 +18,13 @@ final class ProcessTapRecorder {
     @ObservationIgnored private(set) var lastPeak: Float = 0
     @ObservationIgnored private var startHostTime: UInt64 = 0
     @ObservationIgnored private var framesWritten: Int64 = 0
+    @ObservationIgnored private var liveConverter: AVAudioConverter?
+    @ObservationIgnored private var liveFormat: AVAudioFormat?
+
+    /// Optional tee of the recorded audio as 16 kHz mono samples, called on
+    /// the tap IO queue. Silence gaps are delivered as zeros so live sample
+    /// offsets stay wall-clock aligned with the file. Must be cheap.
+    @ObservationIgnored var liveSampleHandler: (([Float]) -> Void)?
 
     private(set) var isRecording = false
 
@@ -57,6 +64,14 @@ final class ProcessTapRecorder {
         self.startHostTime = mach_absolute_time()
         self.framesWritten = 0
 
+        if self.liveSampleHandler != nil {
+            let liveFormat = AVAudioFormat(
+                commonFormat: .pcmFormatFloat32, sampleRate: 16_000, channels: 1, interleaved: false
+            )
+            self.liveFormat = liveFormat
+            self.liveConverter = liveFormat.flatMap { AVAudioConverter(from: format, to: $0) }
+        }
+
         try tap.run(on: self.queue) { [weak self] _, inInputData, inInputTime, _, _ in
             guard let self, let file = self.currentFile else { return }
             do {
@@ -74,17 +89,27 @@ final class ProcessTapRecorder {
                 let hostTime = inInputTime.pointee.mHostTime
                 if hostTime > self.startHostTime {
                     let elapsed = Self.hostTicksToSeconds(hostTime - self.startHostTime)
-                    let expectedFrames = Int64(elapsed * format.sampleRate)
+                    // The timestamp can reference the end of the capture
+                    // cycle rather than its first sample; subtract this
+                    // buffer's own duration so a continuous stream never
+                    // looks gapped (it did: 0.26 s of silence was being
+                    // injected every cycle, shredding the audio).
+                    let expectedFrames = Int64(elapsed * format.sampleRate) - Int64(buffer.frameLength)
                     let gap = expectedFrames - self.framesWritten
                     if gap > Int64(format.sampleRate / 4) { // tolerate <0.25 s of jitter
                         try self.writeSilence(frames: gap, format: format, to: file)
                         self.framesWritten += gap
+                        if let handler = self.liveSampleHandler {
+                            let liveCount = Int(Double(gap) * 16_000 / format.sampleRate)
+                            handler([Float](repeating: 0, count: liveCount))
+                        }
                     }
                 }
 
                 self.lastPeak = ProcessTapRecorder.peak(of: buffer)
                 try file.write(from: buffer)
                 self.framesWritten += Int64(buffer.frameLength)
+                self.teeLiveSamples(from: buffer)
             } catch {
                 self.logger.error("write: \(error.localizedDescription, privacy: .public)")
             }
@@ -93,6 +118,30 @@ final class ProcessTapRecorder {
         }
 
         self.isRecording = true
+    }
+
+    private func teeLiveSamples(from buffer: AVAudioPCMBuffer) {
+        guard let handler = self.liveSampleHandler,
+              let converter = self.liveConverter,
+              let liveFormat = self.liveFormat else { return }
+
+        let ratio = liveFormat.sampleRate / buffer.format.sampleRate
+        let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 64
+        guard let converted = AVAudioPCMBuffer(pcmFormat: liveFormat, frameCapacity: capacity) else { return }
+
+        var consumed = false
+        var conversionError: NSError?
+        converter.convert(to: converted, error: &conversionError) { _, status in
+            if consumed {
+                status.pointee = .noDataNow
+                return nil
+            }
+            consumed = true
+            status.pointee = .haveData
+            return buffer
+        }
+        guard conversionError == nil, let channel = converted.floatChannelData else { return }
+        handler(Array(UnsafeBufferPointer(start: channel[0], count: Int(converted.frameLength))))
     }
 
     private func writeSilence(frames: Int64, format: AVAudioFormat, to file: AVAudioFile) throws {
