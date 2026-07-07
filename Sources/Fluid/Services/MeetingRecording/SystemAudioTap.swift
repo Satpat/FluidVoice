@@ -125,6 +125,22 @@ final class SystemAudioTap {
         err = AudioHardwareCreateAggregateDevice(description as CFDictionary, &self.aggregateDeviceID)
         guard err == noErr else { throw MeetingRecordingError("AudioHardwareCreateAggregateDevice: \(err)") }
         self.logger.debug("Aggregate device #\(self.aggregateDeviceID, privacy: .public)")
+
+        // The IOProc delivers buffers at the aggregate device's clock (the
+        // output device's rate, e.g. 96 kHz MacBook Pro speakers), but the tap
+        // ASBD can claim a different rate (48 kHz). Writing device-rate data
+        // under the tap-claimed rate pitch-shifts the recording, so trust the
+        // aggregate's nominal rate.
+        let aggregateRate: Double = (try? self.aggregateDeviceID.read(
+            kAudioDevicePropertyNominalSampleRate, defaultValue: Double(0)
+        )) ?? 0
+        if var desc = self.tapStreamDescription, aggregateRate > 0, desc.mSampleRate != aggregateRate {
+            self.logger.log(
+                "tap ASBD rate \(desc.mSampleRate, privacy: .public) != aggregate rate \(aggregateRate, privacy: .public); using aggregate rate"
+            )
+            desc.mSampleRate = aggregateRate
+            self.tapStreamDescription = desc
+        }
     }
 
     func run(on queue: DispatchQueue,

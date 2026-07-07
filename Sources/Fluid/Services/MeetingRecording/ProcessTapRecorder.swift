@@ -38,7 +38,8 @@ final class ProcessTapRecorder {
         guard let format = AVAudioFormat(streamDescription: &streamDescription) else {
             throw MeetingRecordingError("Failed to derive AVAudioFormat from tap stream description.")
         }
-        self.logger.info("system tap format: \(format, privacy: .public)")
+        // .log (default level) so it persists for `log show` diagnostics; .info is memory-only.
+        self.logger.log("system tap format: \(format, privacy: .public)")
 
         let settings: [String: Any] = [
             AVFormatIDKey: streamDescription.mFormatID,
