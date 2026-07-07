@@ -45,7 +45,7 @@ struct MeetingTranscriptionView: View {
                     .font(.title2)
                     .fontWeight(.semibold)
 
-                Text("Upload audio or video files to transcribe")
+                Text("Record a meeting or upload audio/video files to transcribe")
                     .font(.subheadline)
                     .foregroundColor(.secondary)
             }
@@ -55,6 +55,9 @@ struct MeetingTranscriptionView: View {
             // Main Content Area
             ScrollView {
                 VStack(spacing: 24) {
+                    // Live two-track meeting recording (MeetAI v2)
+                    MeetingRecorderCard()
+
                     // File Selection Card
                     self.fileSelectionCard
 
