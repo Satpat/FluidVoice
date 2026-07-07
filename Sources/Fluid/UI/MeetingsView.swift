@@ -40,6 +40,8 @@ struct MeetingsView: View {
                 VStack(spacing: 24) {
                     MeetingRecorderCard(asrService: self.asrService)
 
+                    MeetingQAPanel()
+
                     if !self.meetingEntries.isEmpty {
                         self.recentMeetingsSection
                     }

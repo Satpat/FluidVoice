@@ -205,6 +205,7 @@ struct MeetingRecorderCard: View {
                 Button("New Recording") {
                     self.pipeline.transcriptURL = nil
                     MeetingLiveTranscriber.shared.reset()
+                    MeetingQAService.shared.reset()
                     self.session.reset()
                 }
                 .disabled(self.pipeline.isProcessing)
