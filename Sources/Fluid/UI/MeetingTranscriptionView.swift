@@ -45,7 +45,7 @@ struct MeetingTranscriptionView: View {
                     .font(.title2)
                     .fontWeight(.semibold)
 
-                Text("Record a meeting or upload audio/video files to transcribe")
+                Text("Upload audio or video files to transcribe")
                     .font(.subheadline)
                     .foregroundColor(.secondary)
             }
@@ -55,9 +55,6 @@ struct MeetingTranscriptionView: View {
             // Main Content Area
             ScrollView {
                 VStack(spacing: 24) {
-                    // Live two-track meeting recording (MeetAI v2)
-                    MeetingRecorderCard(asrService: self.asrService)
-
                     // File Selection Card
                     self.fileSelectionCard
 
@@ -81,8 +78,9 @@ struct MeetingTranscriptionView: View {
                         self.dropErrorCard(message: message)
                     }
 
-                    // Recent transcriptions (persisted history)
-                    if !self.fileHistoryStore.entries.isEmpty {
+                    // Recent transcriptions (persisted history; meeting
+                    // recordings live in the Meetings tab)
+                    if !self.fileEntries.isEmpty {
                         Divider()
                             .padding(.vertical, 8)
                         self.recentTranscriptionsSection
@@ -344,6 +342,10 @@ struct MeetingTranscriptionView: View {
 
     // MARK: - Recent Transcriptions Section
 
+    private var fileEntries: [FileTranscriptionEntry] {
+        self.fileHistoryStore.entries.filter { !$0.fileName.hasPrefix("Meeting ") }
+    }
+
     private var recentTranscriptionsSection: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack {
@@ -361,7 +363,7 @@ struct MeetingTranscriptionView: View {
             }
 
             VStack(spacing: 8) {
-                ForEach(self.fileHistoryStore.entries) { entry in
+                ForEach(self.fileEntries) { entry in
                     self.recentEntryRow(entry: entry)
                 }
             }

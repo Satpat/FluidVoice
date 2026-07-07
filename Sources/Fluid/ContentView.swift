@@ -52,6 +52,7 @@ enum SidebarItem: Hashable {
     case voiceEngine
     case aiEnhancements
     case preferences
+    case meetings
     case meetingTools
     case customDictionary
     case stats
@@ -1181,6 +1182,7 @@ struct ContentView: View {
 
             Section {
                 self.sidebarNavigationLink(.commandMode, title: "Command Mode", systemImage: "terminal.fill")
+                self.sidebarNavigationLink(.meetings, title: "Meetings", systemImage: "person.2.wave.2.fill")
                 self.sidebarNavigationLink(.meetingTools, title: "File Transcription", systemImage: "doc.text.fill")
             } header: {
                 self.sidebarSectionHeader("Use")
@@ -1279,6 +1281,8 @@ struct ContentView: View {
             ))
         case .preferences:
             return AnyView(self.preferencesView)
+        case .meetings:
+            return AnyView(MeetingsView(asrService: self.asr))
         case .meetingTools:
             return AnyView(self.meetingToolsView)
         case .customDictionary:
