@@ -32,6 +32,8 @@
 	<string></string>
 	<key>POSTHOG_HOST</key>
 	<string>https://eu.i.posthog.com</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>FluidVoice records system audio during meetings so both sides of the conversation can be transcribed.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>FluidVoice uses on-device speech recognition to transcribe your voice commands and text quickly and privately.</string>
 </dict>
