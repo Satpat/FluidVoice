@@ -92,7 +92,15 @@ final class MeetingTranscriptPipeline: ObservableObject {
 
             self.currentStatus = "Merging tracks..."
             self.progress = 0.92
-            let merged = (micSegments + systemSegments).sorted { $0.start < $1.start }
+            var merged = (micSegments + systemSegments).sorted { $0.start < $1.start }
+
+            // Replace diarized "Them N" labels with real names when the
+            // transcript reveals them (self-introductions, direct address).
+            if !systemSegments.isEmpty {
+                self.currentStatus = "Naming speakers..."
+                self.progress = 0.94
+                merged = await MeetingSpeakerNamer.nameSpeakers(in: merged)
+            }
 
             let markdown = Self.renderMarkdown(segments: merged, artifacts: artifacts)
             let transcriptURL = artifacts.folder.appendingPathComponent("transcript.md")
