@@ -204,6 +204,8 @@ struct MeetingRecorderCard: View {
 
                 Button("New Recording") {
                     self.pipeline.transcriptURL = nil
+                    self.pipeline.summary = nil
+                    self.pipeline.summaryError = nil
                     MeetingLiveTranscriber.shared.reset()
                     MeetingQAService.shared.reset()
                     self.session.reset()
@@ -228,6 +230,47 @@ struct MeetingRecorderCard: View {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .foregroundColor(.red)
                     Text(error)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+
+            if let summary = self.pipeline.summary {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("Summary")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Spacer()
+                        Button(action: {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(summary, forType: .string)
+                        }) {
+                            Image(systemName: "doc.on.doc")
+                                .font(.caption)
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Copy summary")
+                    }
+
+                    ScrollView {
+                        Text(LocalizedStringKey(summary))
+                            .font(.callout)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(10)
+                    }
+                    .frame(maxHeight: 240)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(self.theme.palette.contentBackground)
+                    )
+                }
+            } else if let summaryError = self.pipeline.summaryError {
+                HStack {
+                    Image(systemName: "exclamationmark.triangle")
+                        .foregroundColor(.orange)
+                    Text("Summary unavailable: \(summaryError)")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }

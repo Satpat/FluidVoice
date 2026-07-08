@@ -25,6 +25,8 @@ final class MeetingTranscriptPipeline: ObservableObject {
     @Published var currentStatus: String = ""
     @Published var error: String?
     @Published var transcriptURL: URL?
+    @Published var summary: String?
+    @Published var summaryError: String?
 
     private let asrService: ASRService
 
@@ -99,6 +101,10 @@ final class MeetingTranscriptPipeline: ObservableObject {
             )
             FileTranscriptionHistoryStore.shared.addEntry(historyEntry)
 
+            self.currentStatus = "Summarizing..."
+            self.progress = 0.96
+            await self.summarize(mergedText: mergedText, artifacts: artifacts)
+
             self.currentStatus = "Complete!"
             self.progress = 1.0
             self.transcriptURL = transcriptURL
@@ -106,6 +112,56 @@ final class MeetingTranscriptPipeline: ObservableObject {
         } catch {
             self.error = error.localizedDescription
             throw error
+        }
+    }
+
+    // MARK: - Summary
+
+    /// Generate a meeting summary with the configured AI provider and write
+    /// summary.md next to the transcript. Failures are surfaced but never
+    /// fail the transcription itself.
+    private func summarize(mergedText: String, artifacts: MeetingRecordingArtifacts) async {
+        self.summary = nil
+        self.summaryError = nil
+        guard !mergedText.isEmpty else { return }
+
+        let systemPrompt = """
+        You summarise meetings. Below is a machine-generated transcript of a meeting between \
+        the user (labelled "Me") and the other participants (labelled "Them"); timestamps are \
+        minutes:seconds from the start and the transcription may contain recognition errors — \
+        infer the intended meaning where obvious. Write a concise summary in Markdown with \
+        these sections, omitting any section with nothing to say:
+
+        ## Overview — 1-3 sentences on what the meeting was about.
+        ## Key points — bullet list of the substantive points discussed.
+        ## Decisions — bullet list of decisions reached.
+        ## Action items — bullet list; note who owns each ("Me" or "Them") when clear.
+        ## Open questions — bullet list of unresolved items.
+
+        Transcript:
+        \(mergedText)
+        """
+
+        do {
+            let result = try await MeetingAIClient.complete(
+                systemPrompt: systemPrompt,
+                turns: [MeetingAIClient.Turn(role: "user", content: "Summarise this meeting.")]
+            )
+            let trimmed = result.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else {
+                throw MeetingRecordingError("The AI provider returned an empty summary.")
+            }
+            self.summary = trimmed
+
+            let summaryURL = artifacts.folder.appendingPathComponent("summary.md")
+            let document = "# Meeting summary — \(artifacts.displayName)\n\n\(trimmed)\n"
+            try? document.write(to: summaryURL, atomically: true, encoding: .utf8)
+        } catch {
+            self.summaryError = error.localizedDescription
+            DebugLogger.shared.warning(
+                "Meeting summary failed: \(error.localizedDescription)",
+                source: "MeetingTranscriptPipeline"
+            )
         }
     }
 
