@@ -10,14 +10,23 @@
 import Foundation
 
 enum MeetingSpeakerNamer {
+    struct Result {
+        var segments: [MeetingSegment]
+        /// Original label -> discovered real name, for enrolling voice profiles.
+        var appliedMap: [String: String]
+    }
+
     /// Return `segments` with speaker labels replaced by real names where the
-    /// transcript supports it. Best-effort: any failure returns the input
-    /// unchanged. "Me" (the local user) is never renamed.
-    static func nameSpeakers(in segments: [MeetingSegment]) async -> [MeetingSegment] {
-        // Labels that could carry a discoverable name: the diarized "Them"
-        // speakers. Skip when there is nothing to disambiguate.
-        let labels = Set(segments.map(\.speaker)).subtracting([MeetingTranscriptPipeline.micSpeakerLabel])
-        guard !labels.isEmpty else { return segments }
+    /// transcript supports it, plus the applied {label -> name} map. Best-effort:
+    /// any failure returns the input unchanged. "Me" is never renamed, and
+    /// labels already resolved to a real name (via a voice profile) are left as
+    /// is — only provisional "Them"/"Them N" labels are candidates.
+    static func nameSpeakers(in segments: [MeetingSegment]) async -> Result {
+        let systemLabel = MeetingTranscriptPipeline.systemSpeakerLabel
+        let labels = Set(segments.map(\.speaker))
+            .subtracting([MeetingTranscriptPipeline.micSpeakerLabel])
+            .filter { $0 == systemLabel || $0.hasPrefix("\(systemLabel) ") } // only provisional labels
+        guard !labels.isEmpty else { return Result(segments: segments, appliedMap: [:]) }
 
         let transcript = segments
             .map { "[\(MeetingTranscriptPipeline.timestamp($0.start))] \($0.speaker): \($0.text)" }
@@ -55,11 +64,11 @@ enum MeetingSpeakerNamer {
                 "Speaker naming skipped: \(error.localizedDescription)",
                 source: "MeetingSpeakerNamer"
             )
-            return segments
+            return Result(segments: segments, appliedMap: [:])
         }
 
         let nameMap = Self.parseNameMap(from: response, validLabels: labels)
-        guard !nameMap.isEmpty else { return segments }
+        guard !nameMap.isEmpty else { return Result(segments: segments, appliedMap: [:]) }
 
         DebugLogger.shared.info(
             "Speaker names from transcript: \(nameMap)",
@@ -67,15 +76,11 @@ enum MeetingSpeakerNamer {
         )
 
         // Apply the map (MeetAI rename_speakers pattern).
-        return segments.map { segment in
+        let renamed = segments.map { segment -> MeetingSegment in
             guard let name = nameMap[segment.speaker] else { return segment }
-            return MeetingSegment(
-                start: segment.start,
-                end: segment.end,
-                speaker: name,
-                text: segment.text
-            )
+            return MeetingSegment(start: segment.start, end: segment.end, speaker: name, text: segment.text)
         }
+        return Result(segments: renamed, appliedMap: nameMap)
     }
 
     /// Extract a {label: name} map from the model's JSON reply, keeping only

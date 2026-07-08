@@ -187,6 +187,11 @@ struct MeetingRecorderCard: View {
                     Button("Open Transcript") {
                         NSWorkspace.shared.open(transcriptURL)
                     }
+                    if let summaryURL = MeetingFiles.summaryURL(inFolder: artifacts.folder) {
+                        Button("Open Summary") {
+                            NSWorkspace.shared.open(summaryURL)
+                        }
+                    }
                 } else {
                     Button(action: { self.transcribe(artifacts) }) {
                         HStack {

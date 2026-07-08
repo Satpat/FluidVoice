@@ -84,23 +84,35 @@ final class MeetingTranscriptPipeline: ObservableObject {
                 progressRange: 0.4...0.75
             )
 
+            var embeddingByLabel: [String: [Float]] = [:]
             if !systemSegments.isEmpty {
                 self.currentStatus = "Identifying speakers..."
                 self.progress = 0.8
-                systemSegments = await Self.applyDiarization(to: systemSegments, samples: systemSamples)
+                let resolution = await Self.resolveSpeakers(to: systemSegments, samples: systemSamples)
+                systemSegments = resolution.segments
+                embeddingByLabel = resolution.embeddingByLabel
             }
 
             self.currentStatus = "Merging tracks..."
             self.progress = 0.92
             var merged = (micSegments + systemSegments).sorted { $0.start < $1.start }
 
-            // Replace diarized "Them N" labels with real names when the
+            // Replace remaining "Them N" labels with real names when the
             // transcript reveals them (self-introductions, direct address).
+            var appliedNameMap: [String: String] = [:]
             if !systemSegments.isEmpty {
                 self.currentStatus = "Naming speakers..."
                 self.progress = 0.94
-                merged = await MeetingSpeakerNamer.nameSpeakers(in: merged)
+                let namingResult = await MeetingSpeakerNamer.nameSpeakers(in: merged)
+                merged = namingResult.segments
+                appliedNameMap = namingResult.appliedMap
             }
+
+            // Persist voice identities: enrol every speaker that ended up with
+            // a real name (recognised from a profile, or discovered from the
+            // transcript) so the same voice is recognised in future meetings.
+            await Self.enrollProfiles(embeddingByLabel: embeddingByLabel, appliedNameMap: appliedNameMap)
+            Self.writeSpeakerEmbeddings(embeddingByLabel, folder: artifacts.folder)
 
             let markdown = Self.renderMarkdown(segments: merged, artifacts: artifacts)
             let transcriptURL = artifacts.folder.appendingPathComponent("transcript.md")
@@ -222,46 +234,89 @@ final class MeetingTranscriptPipeline: ObservableObject {
         return segments
     }
 
-    // MARK: - Speaker diarization ("Them" track)
+    // MARK: - Speaker diarization + identity ("Them" track)
 
-    /// Relabel system-audio segments with per-speaker labels ("Them 1",
-    /// "Them 2", ...) using FluidAudio's diarizer. Best-effort: any failure
-    /// (model download, inference) keeps the plain "Them" labels. When only
-    /// one speaker is detected, labels are also left as "Them".
-    nonisolated static func applyDiarization(
+    struct SpeakerResolution {
+        var segments: [MeetingSegment]
+        /// Final label -> L2-normalised voice centroid, for enrolment and for
+        /// persisting per-meeting so speakers can be named manually later.
+        var embeddingByLabel: [String: [Float]]
+    }
+
+    /// Diarize the system track, relabel each segment by its dominant speaker,
+    /// and resolve identities: a cluster matching a saved voice profile takes
+    /// that person's name; otherwise it becomes "Them"/"Them N". Also returns
+    /// each final label's voice centroid. Best-effort: any diarizer failure
+    /// keeps the plain "Them" labels and no embeddings.
+    static func resolveSpeakers(
         to segments: [MeetingSegment],
         samples: [Float]
-    ) async -> [MeetingSegment] {
-        let speakerSegments: [TimedSpeakerSegment]
+    ) async -> SpeakerResolution {
+        let result: DiarizationResult
         do {
             let models = try await DiarizerModels.downloadIfNeeded()
             let diarizer = DiarizerManager()
             diarizer.initialize(models: models)
             defer { diarizer.cleanup() }
-            let result = try diarizer.performCompleteDiarization(samples, sampleRate: 16_000)
-            speakerSegments = result.segments
+            result = try diarizer.performCompleteDiarization(samples, sampleRate: 16_000)
         } catch {
             DebugLogger.shared.warning(
                 "Diarization skipped: \(error.localizedDescription)",
                 source: "MeetingTranscriptPipeline"
             )
-            return segments
+            return SpeakerResolution(segments: segments, embeddingByLabel: [:])
         }
 
-        let distinctSpeakers = Set(speakerSegments.map(\.speakerId))
-        guard distinctSpeakers.count > 1 else { return segments }
+        let speakerSegments = result.segments
+        let speakerIds = speakerSegments.map(\.speakerId)
+        let distinctSpeakers = Set(speakerIds)
+        guard !distinctSpeakers.isEmpty else {
+            return SpeakerResolution(segments: segments, embeddingByLabel: [:])
+        }
 
-        // Number speakers by order of first appearance so "Them 1" is
-        // whoever spoke first.
-        var speakerNumbers: [String: Int] = [:]
-        for speakerSegment in speakerSegments.sorted(by: { $0.startTimeSeconds < $1.startTimeSeconds }) {
-            if speakerNumbers[speakerSegment.speakerId] == nil {
-                speakerNumbers[speakerSegment.speakerId] = speakerNumbers.count + 1
+        // Centroid embedding per diarized speaker: prefer the diarizer's own
+        // speaker database, else average that speaker's segment embeddings.
+        var centroidById: [String: [Float]] = [:]
+        for id in distinctSpeakers {
+            if let dbEmbedding = result.speakerDatabase?[id] {
+                centroidById[id] = SpeakerProfileStore.normalize(dbEmbedding)
+            } else {
+                let embeddings = speakerSegments.filter { $0.speakerId == id }.map(\.embedding).filter { !$0.isEmpty }
+                if let averaged = Self.averageEmbedding(embeddings) {
+                    centroidById[id] = averaged
+                }
             }
         }
 
-        return segments.map { segment in
-            // Dominant speaker = most overlapped time within the segment.
+        // Resolve a display name per speaker id: known profile match, else a
+        // provisional "Them"/"Them N".
+        let matchedNames: [String: String?] = await MainActor.run {
+            var out: [String: String?] = [:]
+            for (id, centroid) in centroidById {
+                out[id] = SpeakerProfileStore.shared.bestMatchName(for: centroid)
+            }
+            return out
+        }
+
+        var provisionalNumber: [String: Int] = [:]
+        let singleUnmatched = distinctSpeakers.count == 1 && (matchedNames.values.first ?? nil) == nil
+        for id in speakerSegments.sorted(by: { $0.startTimeSeconds < $1.startTimeSeconds }).map(\.speakerId) {
+            guard provisionalNumber[id] == nil, (matchedNames[id] ?? nil) == nil else { continue }
+            provisionalNumber[id] = provisionalNumber.count + 1
+        }
+
+        func label(for id: String) -> String {
+            if let matched = matchedNames[id] ?? nil { return matched }
+            if singleUnmatched { return Self.systemSpeakerLabel }
+            return "\(Self.systemSpeakerLabel) \(provisionalNumber[id] ?? 1)"
+        }
+
+        var embeddingByLabel: [String: [Float]] = [:]
+        for (id, centroid) in centroidById {
+            embeddingByLabel[label(for: id)] = centroid
+        }
+
+        let relabelled = segments.map { segment -> MeetingSegment in
             var overlapBySpeaker: [String: Double] = [:]
             for speakerSegment in speakerSegments {
                 let overlap = min(segment.end, Double(speakerSegment.endTimeSeconds))
@@ -270,18 +325,65 @@ final class MeetingTranscriptPipeline: ObservableObject {
                     overlapBySpeaker[speakerSegment.speakerId, default: 0] += overlap
                 }
             }
-            guard let dominant = overlapBySpeaker.max(by: { $0.value < $1.value })?.key,
-                  let number = speakerNumbers[dominant]
-            else {
+            guard let dominant = overlapBySpeaker.max(by: { $0.value < $1.value })?.key else {
                 return segment
             }
-            return MeetingSegment(
-                start: segment.start,
-                end: segment.end,
-                speaker: "\(Self.systemSpeakerLabel) \(number)",
-                text: segment.text
-            )
+            return MeetingSegment(start: segment.start, end: segment.end, speaker: label(for: dominant), text: segment.text)
         }
+
+        return SpeakerResolution(segments: relabelled, embeddingByLabel: embeddingByLabel)
+    }
+
+    /// True for a real person's name, i.e. not "Me" and not a provisional
+    /// "Them"/"Them N" placeholder.
+    static func isRealSpeakerName(_ label: String) -> Bool {
+        if label == Self.micSpeakerLabel || label == Self.systemSpeakerLabel { return false }
+        if label.hasPrefix("\(Self.systemSpeakerLabel) "),
+           Int(label.dropFirst(Self.systemSpeakerLabel.count + 1)) != nil {
+            return false
+        }
+        return true
+    }
+
+    /// Enrol/update a voice profile for each speaker that resolved to a real
+    /// name. `embeddingByLabel` is keyed by the *diarization* label; the
+    /// transcript namer may have renamed some of those, so consult its map.
+    private static func enrollProfiles(
+        embeddingByLabel: [String: [Float]],
+        appliedNameMap: [String: String]
+    ) async {
+        var enrolments: [(name: String, embedding: [Float])] = []
+        for (label, embedding) in embeddingByLabel {
+            let finalName = appliedNameMap[label] ?? label
+            guard Self.isRealSpeakerName(finalName) else { continue }
+            enrolments.append((finalName, embedding))
+        }
+        guard !enrolments.isEmpty else { return }
+        await MainActor.run {
+            for enrolment in enrolments {
+                SpeakerProfileStore.shared.enroll(name: enrolment.name, embedding: enrolment.embedding)
+            }
+        }
+    }
+
+    /// Persist per-meeting speaker centroids so a speaker can be named
+    /// manually later (which enrols the voice for future recognition).
+    private static func writeSpeakerEmbeddings(_ embeddingByLabel: [String: [Float]], folder: URL) {
+        guard !embeddingByLabel.isEmpty else { return }
+        let url = folder.appendingPathComponent("speakers.json")
+        if let data = try? JSONSerialization.data(withJSONObject: embeddingByLabel, options: [.prettyPrinted, .sortedKeys]) {
+            try? data.write(to: url, options: .atomic)
+        }
+    }
+
+    private static func averageEmbedding(_ embeddings: [[Float]]) -> [Float]? {
+        guard let first = embeddings.first else { return nil }
+        var sum = [Float](repeating: 0, count: first.count)
+        for embedding in embeddings where embedding.count == first.count {
+            let normalized = SpeakerProfileStore.normalize(embedding)
+            for i in sum.indices { sum[i] += normalized[i] }
+        }
+        return SpeakerProfileStore.normalize(sum)
     }
 
     // MARK: - Audio loading

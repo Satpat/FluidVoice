@@ -49,6 +49,8 @@ struct MeetingsView: View {
 
                     MeetingQAPanel()
 
+                    KnownSpeakersPanel()
+
                     if !self.meetingEntries.isEmpty {
                         self.recentMeetingsSection
                     }
@@ -167,6 +169,18 @@ struct MeetingsView: View {
                 }
 
                 HStack {
+                    if let transcriptURL = MeetingFiles.transcriptURL(inFolder: self.recordingFolder(for: entry)) {
+                        Button(action: { NSWorkspace.shared.open(transcriptURL) }) {
+                            Label("Transcript", systemImage: "doc.text")
+                        }
+                        .help("Open transcript.md")
+                    }
+                    if let summaryURL = MeetingFiles.summaryURL(inFolder: self.recordingFolder(for: entry)) {
+                        Button(action: { NSWorkspace.shared.open(summaryURL) }) {
+                            Label("Summary", systemImage: "doc.plaintext")
+                        }
+                        .help("Open summary.md")
+                    }
                     Button(action: { self.reprocess(entry: entry) }) {
                         Label("Re-transcribe", systemImage: "arrow.clockwise")
                     }
