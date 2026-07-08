@@ -132,6 +132,23 @@ final class FileTranscriptionHistoryStore: ObservableObject {
         )
     }
 
+    /// Replace an entry's transcript text in place (e.g. after relabelling
+    /// speakers), preserving its identity and position.
+    func updateEntryText(id: UUID, newText: String) {
+        guard let index = self.entries.firstIndex(where: { $0.id == id }) else { return }
+        let old = self.entries[index]
+        self.entries[index] = FileTranscriptionEntry(
+            id: old.id,
+            timestamp: old.timestamp,
+            fileName: old.fileName,
+            duration: old.duration,
+            processingTime: old.processingTime,
+            confidence: old.confidence,
+            text: newText
+        )
+        self.saveEntries()
+    }
+
     func deleteEntry(id: UUID) {
         self.entries.removeAll { $0.id == id }
         if self.selectedEntryID == id {

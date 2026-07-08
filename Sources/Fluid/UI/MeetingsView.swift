@@ -146,18 +146,23 @@ struct MeetingsView: View {
         )
     }
 
-    /// Enrol the chosen name with this speaker's voice, then re-transcribe so
-    /// the meeting (transcript + summary) is relabelled with the name.
+    /// Enrol the chosen name with this speaker's voice (so future meetings
+    /// recognise them), then relabel this meeting in place — no re-transcribe.
     private func nameSpeaker(entry: FileTranscriptionEntry, label: String) {
         let key = self.nameKey(entry, label)
         let name = (self.speakerNameInputs[key] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else { return }
-        let embeddings = MeetingFiles.speakerEmbeddings(inFolder: self.recordingFolder(for: entry))
+        let folder = self.recordingFolder(for: entry)
+        let embeddings = MeetingFiles.speakerEmbeddings(inFolder: folder)
         guard let embedding = embeddings[label] else { return }
 
         self.speakerStore.enroll(name: name, embedding: embedding)
         self.speakerNameInputs[key] = nil
-        self.reprocess(entry: entry)
+        self.reprocessingFolder = self.folderName(for: entry)
+        Task {
+            defer { self.reprocessingFolder = nil }
+            await MeetingRelabeler.relabel(folder: folder, historyEntryID: entry.id, map: [label: name])
+        }
     }
 
     private func reprocess(entry: FileTranscriptionEntry) {

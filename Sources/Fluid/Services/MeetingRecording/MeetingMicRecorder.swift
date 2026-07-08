@@ -34,10 +34,26 @@ final class MeetingMicRecorder {
                              category: "MeetingMicRecorder(\(fileURL.lastPathComponent))")
     }
 
+    private(set) var echoCancellationEnabled = false
+
     func start() throws {
         guard !self.isRecording else { return }
 
         let input = self.engine.inputNode
+
+        // Acoustic echo cancellation: when the meeting audio plays out of the
+        // speakers, it bleeds into the microphone and the far-end voice ends
+        // up duplicated on the "Me" track. Apple's voice-processing I/O unit
+        // references the system output and cancels it from the mic. Must be
+        // enabled before the engine starts; best-effort (older/edge hardware
+        // may refuse), with a transcript-level dedup as the backstop.
+        do {
+            try input.setVoiceProcessingEnabled(true)
+            self.echoCancellationEnabled = true
+        } catch {
+            self.logger.warning("Voice-processing AEC unavailable: \(error.localizedDescription, privacy: .public)")
+        }
+
         let inputFormat = input.outputFormat(forBus: 0)
         guard inputFormat.sampleRate > 0 else {
             throw MeetingRecordingError("Microphone not available (no input device).")

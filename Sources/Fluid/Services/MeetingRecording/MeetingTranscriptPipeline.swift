@@ -97,6 +97,12 @@ final class MeetingTranscriptPipeline: ObservableObject {
             self.progress = 0.92
             var merged = (micSegments + systemSegments).sorted { $0.start < $1.start }
 
+            // Echo backstop: when recording with speakers + mic, the far-end
+            // voice bleeds into the mic and duplicates onto the "Me" track.
+            // Drop any mic segment that echoes a near-simultaneous system
+            // segment so leaked audio never appears attributed to the user.
+            merged = Self.suppressEcho(in: merged)
+
             // Replace remaining "Them N" labels with real names when the
             // transcript reveals them (self-introductions, direct address).
             var appliedNameMap: [String: String] = [:]
@@ -160,10 +166,26 @@ final class MeetingTranscriptPipeline: ObservableObject {
         self.summaryError = nil
         guard !mergedText.isEmpty else { return }
 
+        do {
+            let body = try await Self.generateSummaryBody(mergedText: mergedText)
+            self.summary = body
+            try? Self.writeSummary(body: body, displayName: artifacts.displayName, folder: artifacts.folder)
+        } catch {
+            self.summaryError = error.localizedDescription
+            DebugLogger.shared.warning(
+                "Meeting summary failed: \(error.localizedDescription)",
+                source: "MeetingTranscriptPipeline"
+            )
+        }
+    }
+
+    /// Generate the summary body (Markdown) from a merged transcript. Reused
+    /// by the pipeline and by in-place relabelling.
+    static func generateSummaryBody(mergedText: String) async throws -> String {
         func systemPrompt(_ transcript: String) -> String {
             """
             You summarise meetings. Below is a machine-generated transcript of a meeting between \
-            the user (labelled "Me") and the other participants (labelled "Them", or "Them 1"/\
+            the user (labelled "Me") and the other participants (labelled "Them", or named/"Them 1"/\
             "Them 2"/... when individual speakers were distinguished); timestamps are \
             minutes:seconds from the start and the transcription may contain recognition errors — \
             infer the intended meaning where obvious. Write a concise summary in Markdown with \
@@ -172,36 +194,29 @@ final class MeetingTranscriptPipeline: ObservableObject {
             ## Overview — 1-3 sentences on what the meeting was about.
             ## Key points — bullet list of the substantive points discussed.
             ## Decisions — bullet list of decisions reached.
-            ## Action items — bullet list; note who owns each ("Me" or "Them") when clear.
+            ## Action items — bullet list; note who owns each when clear.
             ## Open questions — bullet list of unresolved items.
 
             Transcript:
             \(transcript)
             """
         }
-
-        do {
-            let result = try await MeetingAIClient.completeAboutTranscript(
-                transcript: mergedText,
-                turns: [MeetingAIClient.Turn(role: "user", content: "Summarise this meeting.")],
-                systemPrompt: systemPrompt
-            )
-            let trimmed = result.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else {
-                throw MeetingRecordingError("The AI provider returned an empty summary.")
-            }
-            self.summary = trimmed
-
-            let summaryURL = artifacts.folder.appendingPathComponent("summary.md")
-            let document = "# Meeting summary — \(artifacts.displayName)\n\n\(trimmed)\n"
-            try? document.write(to: summaryURL, atomically: true, encoding: .utf8)
-        } catch {
-            self.summaryError = error.localizedDescription
-            DebugLogger.shared.warning(
-                "Meeting summary failed: \(error.localizedDescription)",
-                source: "MeetingTranscriptPipeline"
-            )
+        let result = try await MeetingAIClient.completeAboutTranscript(
+            transcript: mergedText,
+            turns: [MeetingAIClient.Turn(role: "user", content: "Summarise this meeting.")],
+            systemPrompt: systemPrompt
+        )
+        let trimmed = result.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw MeetingRecordingError("The AI provider returned an empty summary.")
         }
+        return trimmed
+    }
+
+    static func writeSummary(body: String, displayName: String, folder: URL) throws {
+        let summaryURL = folder.appendingPathComponent("summary.md")
+        let document = "# Meeting summary — \(displayName)\n\n\(body)\n"
+        try document.write(to: summaryURL, atomically: true, encoding: .utf8)
     }
 
     // MARK: - Per-track transcription
@@ -232,6 +247,63 @@ final class MeetingTranscriptPipeline: ObservableObject {
                 + (progressRange.upperBound - progressRange.lowerBound) * fraction
         }
         return segments
+    }
+
+    // MARK: - Echo suppression (speaker -> mic bleed)
+
+    /// Remove "Me" (mic) segments that duplicate a near-simultaneous system
+    /// segment — the acoustic bleed of the far-end voice through the speakers.
+    /// System audio never contains the mic, so a shared utterance is always
+    /// leak on the mic side; keep the system copy, drop the mic echo.
+    static func suppressEcho(in segments: [MeetingSegment]) -> [MeetingSegment] {
+        let micLabel = Self.micSpeakerLabel
+        let systemSegments = segments.filter { $0.speaker != micLabel }
+        guard !systemSegments.isEmpty else { return segments }
+
+        let systemTokens = systemSegments.map { (seg: $0, tokens: Self.tokenSet($0.text)) }
+        let windowSeconds = 5.0
+
+        var kept: [MeetingSegment] = []
+        var dropped = 0
+        for segment in segments {
+            if segment.speaker == micLabel {
+                let tokens = Self.tokenSet(segment.text)
+                if !tokens.isEmpty {
+                    let isEcho = systemTokens.contains { candidate in
+                        guard abs(candidate.seg.start - segment.start) <= windowSeconds
+                            || Self.overlaps(segment, candidate.seg) else { return false }
+                        return Self.tokenSimilarity(tokens, candidate.tokens) >= 0.6
+                    }
+                    if isEcho {
+                        dropped += 1
+                        continue
+                    }
+                }
+            }
+            kept.append(segment)
+        }
+        if dropped > 0 {
+            DebugLogger.shared.info("Echo suppression removed \(dropped) leaked mic segment(s)", source: "MeetingTranscriptPipeline")
+        }
+        return kept
+    }
+
+    private static func overlaps(_ a: MeetingSegment, _ b: MeetingSegment) -> Bool {
+        min(a.end, b.end) - max(a.start, b.start) > 0
+    }
+
+    private static func tokenSet(_ text: String) -> Set<String> {
+        let lowered = text.lowercased()
+        let cleaned = lowered.map { $0.isLetter || $0.isNumber || $0.isWhitespace ? $0 : " " }
+        return Set(String(cleaned).split(whereSeparator: { $0.isWhitespace }).map(String.init))
+    }
+
+    /// Symmetric token overlap: |A∩B| / |smaller set|, so a short echoed
+    /// phrase still matches a longer system segment that contains it.
+    private static func tokenSimilarity(_ a: Set<String>, _ b: Set<String>) -> Double {
+        guard !a.isEmpty, !b.isEmpty else { return 0 }
+        let intersection = a.intersection(b).count
+        return Double(intersection) / Double(min(a.count, b.count))
     }
 
     // MARK: - Speaker diarization + identity ("Them" track)
