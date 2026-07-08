@@ -38,21 +38,20 @@ enum MeetingReprocessor {
         )
     }
 
-    /// Most recent recording folder under the sessions directory.
+    /// Most recent recording folder by recording time. Folder names are ISO
+    /// timestamps (see ISO8601DateFormatter.meetingFileSafe), so a descending
+    /// lexical sort is chronological — unlike file modification time, which
+    /// reprocessing rewrites.
     static func latestRecordingFolder() -> URL? {
         let base = MeetingRecordingSession.defaultBaseDirectory()
         let folders = (try? FileManager.default.contentsOfDirectory(
             at: base,
-            includingPropertiesForKeys: [.contentModificationDateKey],
+            includingPropertiesForKeys: [.isDirectoryKey],
             options: [.skipsHiddenFiles]
         )) ?? []
         return folders
             .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
-            .sorted {
-                let a = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
-                let b = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
-                return a > b
-            }
+            .sorted { $0.lastPathComponent > $1.lastPathComponent }
             .first
     }
 

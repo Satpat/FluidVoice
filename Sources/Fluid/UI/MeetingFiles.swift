@@ -13,4 +13,14 @@ enum MeetingFiles {
     private static func existing(_ url: URL) -> URL? {
         FileManager.default.fileExists(atPath: url.path) ? url : nil
     }
+
+    /// Per-meeting speaker voice centroids written by the pipeline
+    /// (label -> embedding), used for manual naming/enrolment.
+    static func speakerEmbeddings(inFolder folder: URL) -> [String: [Float]] {
+        let url = folder.appendingPathComponent("speakers.json")
+        guard let data = try? Data(contentsOf: url),
+              let raw = try? JSONSerialization.jsonObject(with: data) as? [String: [Double]]
+        else { return [:] }
+        return raw.mapValues { $0.map(Float.init) }
+    }
 }

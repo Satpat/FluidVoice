@@ -9,7 +9,9 @@ struct MeetingsView: View {
     @ObservedObject private var fileHistoryStore = FileTranscriptionHistoryStore.shared
     @State private var expandedEntryID: FileTranscriptionEntry.ID?
     @StateObject private var reprocessPipeline: MeetingTranscriptPipeline
+    @ObservedObject private var speakerStore = SpeakerProfileStore.shared
     @State private var reprocessingFolder: String?
+    @State private var speakerNameInputs: [String: String] = [:]
     @Environment(\.theme) private var theme
 
     init(asrService: ASRService) {
@@ -92,6 +94,72 @@ struct MeetingsView: View {
         MeetingReprocessor.artifacts(inFolder: self.recordingFolder(for: entry)) != nil
     }
 
+    /// Labels for the meeting's detected speakers that aren't yet a real
+    /// person (plain "Them"/"Them N"), offered for manual naming.
+    private func unnamedSpeakerLabels(for entry: FileTranscriptionEntry) -> [String] {
+        MeetingFiles.speakerEmbeddings(inFolder: self.recordingFolder(for: entry))
+            .keys
+            .filter { !MeetingTranscriptPipeline.isRealSpeakerName($0) }
+            .sorted()
+    }
+
+    @ViewBuilder
+    private func nameSpeakersSection(entry: FileTranscriptionEntry) -> some View {
+        let labels = self.unnamedSpeakerLabels(for: entry)
+        if !labels.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Name speakers")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Text("Assign a name to save this voice. That person is then recognised automatically in future meetings.")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                ForEach(labels, id: \.self) { label in
+                    HStack(spacing: 8) {
+                        Text(label)
+                            .font(.callout)
+                            .frame(width: 70, alignment: .leading)
+                        TextField("Real name", text: self.nameBinding(entry: entry, label: label))
+                            .textFieldStyle(.roundedBorder)
+                        Button("Save & apply") { self.nameSpeaker(entry: entry, label: label) }
+                            .disabled(
+                                self.reprocessPipeline.isProcessing
+                                    || (self.speakerNameInputs[self.nameKey(entry, label)] ?? "")
+                                    .trimmingCharacters(in: .whitespaces).isEmpty
+                            )
+                    }
+                }
+            }
+            .padding(.horizontal, 12)
+        }
+    }
+
+    private func nameKey(_ entry: FileTranscriptionEntry, _ label: String) -> String {
+        "\(self.folderName(for: entry))|\(label)"
+    }
+
+    private func nameBinding(entry: FileTranscriptionEntry, label: String) -> Binding<String> {
+        let key = self.nameKey(entry, label)
+        return Binding(
+            get: { self.speakerNameInputs[key] ?? "" },
+            set: { self.speakerNameInputs[key] = $0 }
+        )
+    }
+
+    /// Enrol the chosen name with this speaker's voice, then re-transcribe so
+    /// the meeting (transcript + summary) is relabelled with the name.
+    private func nameSpeaker(entry: FileTranscriptionEntry, label: String) {
+        let key = self.nameKey(entry, label)
+        let name = (self.speakerNameInputs[key] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return }
+        let embeddings = MeetingFiles.speakerEmbeddings(inFolder: self.recordingFolder(for: entry))
+        guard let embedding = embeddings[label] else { return }
+
+        self.speakerStore.enroll(name: name, embedding: embedding)
+        self.speakerNameInputs[key] = nil
+        self.reprocess(entry: entry)
+    }
+
     private func reprocess(entry: FileTranscriptionEntry) {
         let folder = self.recordingFolder(for: entry)
         guard let artifacts = MeetingReprocessor.artifacts(inFolder: folder) else { return }
@@ -156,6 +224,8 @@ struct MeetingsView: View {
                         .padding(12)
                 }
                 .frame(maxHeight: 260)
+
+                self.nameSpeakersSection(entry: entry)
 
                 if self.reprocessingFolder == self.folderName(for: entry), self.reprocessPipeline.isProcessing {
                     VStack(alignment: .leading, spacing: 6) {
