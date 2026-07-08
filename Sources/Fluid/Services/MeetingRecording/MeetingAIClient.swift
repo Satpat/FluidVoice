@@ -12,6 +12,73 @@ enum MeetingAIClient {
         let content: String
     }
 
+    // MARK: - Context-window handling
+
+    /// Rough chars-per-token heuristic; good enough for budgeting.
+    static func approxTokens(_ text: String) -> Int {
+        max(1, text.count / 4)
+    }
+
+    /// Conservative context budget by provider. Apple Intelligence's
+    /// on-device model has a hard ~4k window; other providers get a
+    /// moderate default and the retry loop below adapts downward when a
+    /// server rejects the prompt as too long.
+    static func contextBudgetTokens(for provider: ResolvedProvider) -> Int {
+        provider.providerID == "apple-intelligence" ? 4096 : 16384
+    }
+
+    /// Keep the most recent transcript lines within a token budget, with an
+    /// omission marker so the model knows earlier content is missing.
+    static func trimmedTranscript(_ transcript: String, maxTokens: Int) -> String {
+        let maxChars = maxTokens * 4
+        guard transcript.count > maxChars else { return transcript }
+
+        let lines = transcript.components(separatedBy: "\n")
+        var kept: [String] = []
+        var chars = 0
+        for line in lines.reversed() {
+            chars += line.count + 1
+            if chars > maxChars { break }
+            kept.append(line)
+        }
+        let omitted = max(0, lines.count - kept.count)
+        return "[Earlier part of the meeting (\(omitted) lines) omitted to fit the model's context window; the most recent part follows.]\n"
+            + kept.reversed().joined(separator: "\n")
+    }
+
+    /// Run a completion whose system prompt embeds a (possibly long) meeting
+    /// transcript. The transcript is pre-trimmed to the provider's budget,
+    /// and when a provider still reports a context overflow the budget is
+    /// halved and the call retried.
+    static func completeAboutTranscript(
+        transcript: String,
+        turns: [Turn],
+        systemPrompt: (String) -> String
+    ) async throws -> String {
+        var budgetTokens = Self.contextBudgetTokens(for: Self.resolveProvider())
+        let overheadTokens = Self.approxTokens(systemPrompt(""))
+            + turns.reduce(0) { $0 + Self.approxTokens($1.content) }
+            + 1024 // response reserve
+
+        var attempt = 0
+        while true {
+            attempt += 1
+            let transcriptBudget = max(512, budgetTokens - overheadTokens)
+            let fitted = Self.trimmedTranscript(transcript, maxTokens: transcriptBudget)
+            do {
+                return try await Self.complete(systemPrompt: systemPrompt(fitted), turns: turns)
+            } catch {
+                let message = error.localizedDescription.lowercased()
+                let isContextOverflow = message.contains("context")
+                    || message.contains("too long")
+                    || message.contains("maximum length")
+                    || message.contains("token limit")
+                guard isContextOverflow, attempt < 4, transcriptBudget > 512 else { throw error }
+                budgetTokens /= 2
+            }
+        }
+    }
+
     static func complete(systemPrompt: String, turns: [Turn]) async throws -> String {
         let resolved = Self.resolveProvider()
 

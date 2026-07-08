@@ -134,28 +134,31 @@ final class MeetingTranscriptPipeline: ObservableObject {
         self.summaryError = nil
         guard !mergedText.isEmpty else { return }
 
-        let systemPrompt = """
-        You summarise meetings. Below is a machine-generated transcript of a meeting between \
-        the user (labelled "Me") and the other participants (labelled "Them", or "Them 1"/\
-        "Them 2"/... when individual speakers were distinguished); timestamps are \
-        minutes:seconds from the start and the transcription may contain recognition errors — \
-        infer the intended meaning where obvious. Write a concise summary in Markdown with \
-        these sections, omitting any section with nothing to say:
+        func systemPrompt(_ transcript: String) -> String {
+            """
+            You summarise meetings. Below is a machine-generated transcript of a meeting between \
+            the user (labelled "Me") and the other participants (labelled "Them", or "Them 1"/\
+            "Them 2"/... when individual speakers were distinguished); timestamps are \
+            minutes:seconds from the start and the transcription may contain recognition errors — \
+            infer the intended meaning where obvious. Write a concise summary in Markdown with \
+            these sections, omitting any section with nothing to say:
 
-        ## Overview — 1-3 sentences on what the meeting was about.
-        ## Key points — bullet list of the substantive points discussed.
-        ## Decisions — bullet list of decisions reached.
-        ## Action items — bullet list; note who owns each ("Me" or "Them") when clear.
-        ## Open questions — bullet list of unresolved items.
+            ## Overview — 1-3 sentences on what the meeting was about.
+            ## Key points — bullet list of the substantive points discussed.
+            ## Decisions — bullet list of decisions reached.
+            ## Action items — bullet list; note who owns each ("Me" or "Them") when clear.
+            ## Open questions — bullet list of unresolved items.
 
-        Transcript:
-        \(mergedText)
-        """
+            Transcript:
+            \(transcript)
+            """
+        }
 
         do {
-            let result = try await MeetingAIClient.complete(
-                systemPrompt: systemPrompt,
-                turns: [MeetingAIClient.Turn(role: "user", content: "Summarise this meeting.")]
+            let result = try await MeetingAIClient.completeAboutTranscript(
+                transcript: mergedText,
+                turns: [MeetingAIClient.Turn(role: "user", content: "Summarise this meeting.")],
+                systemPrompt: systemPrompt
             )
             let trimmed = result.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else {

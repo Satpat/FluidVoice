@@ -37,18 +37,20 @@ final class MeetingQAService: ObservableObject {
         self.isThinking = true
         defer { self.isThinking = false }
 
-        let systemPrompt = """
-        You are a meeting assistant. Below is the machine-generated transcript so far of a \
-        meeting between the user (labelled "Me") and the other participants (labelled "Them", \
-        or "Them 1"/"Them 2"/... when individual speakers were distinguished). \
-        Timestamps are minutes:seconds from the start. The transcription may contain \
-        recognition errors; infer the intended meaning where it is obvious. Answer the user's \
-        questions about the meeting concisely and factually. If the transcript does not \
-        contain the answer, say so plainly.
+        func systemPrompt(_ transcript: String) -> String {
+            """
+            You are a meeting assistant. Below is the machine-generated transcript so far of a \
+            meeting between the user (labelled "Me") and the other participants (labelled "Them", \
+            or "Them 1"/"Them 2"/... when individual speakers were distinguished). \
+            Timestamps are minutes:seconds from the start. The transcription may contain \
+            recognition errors; infer the intended meaning where it is obvious. Answer the user's \
+            questions about the meeting concisely and factually. If the transcript does not \
+            contain the answer, say so plainly.
 
-        Transcript so far:
-        \(transcript.isEmpty ? "(no speech captured yet)" : transcript)
-        """
+            Transcript so far:
+            \(transcript.isEmpty ? "(no speech captured yet)" : transcript)
+            """
+        }
 
         // Include recent turns so follow-up questions have context.
         let turns = self.messages.suffix(9).map {
@@ -56,7 +58,11 @@ final class MeetingQAService: ObservableObject {
         }
 
         do {
-            let answer = try await MeetingAIClient.complete(systemPrompt: systemPrompt, turns: turns)
+            let answer = try await MeetingAIClient.completeAboutTranscript(
+                transcript: transcript,
+                turns: turns,
+                systemPrompt: systemPrompt
+            )
             let trimmed = answer.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else {
                 throw MeetingRecordingError("The AI provider returned an empty response.")
