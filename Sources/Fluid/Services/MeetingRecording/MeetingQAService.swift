@@ -39,7 +39,8 @@ final class MeetingQAService: ObservableObject {
 
         let systemPrompt = """
         You are a meeting assistant. Below is the machine-generated transcript so far of a \
-        meeting between the user (labelled "Me") and the other participants (labelled "Them"). \
+        meeting between the user (labelled "Me") and the other participants (labelled "Them", \
+        or "Them 1"/"Them 2"/... when individual speakers were distinguished). \
         Timestamps are minutes:seconds from the start. The transcription may contain \
         recognition errors; infer the intended meaning where it is obvious. Answer the user's \
         questions about the meeting concisely and factually. If the transcript does not \

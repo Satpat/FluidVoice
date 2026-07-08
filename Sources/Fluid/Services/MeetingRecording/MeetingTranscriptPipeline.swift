@@ -8,6 +8,7 @@
 
 import AVFoundation
 import Combine
+import FluidAudio
 import Foundation
 
 struct MeetingSegment: Sendable, Identifiable {
@@ -66,20 +67,28 @@ final class MeetingTranscriptPipeline: ObservableObject {
             }
 
             self.currentStatus = "Transcribing your microphone track..."
+            let micSamples = try Self.loadSamples16kMono(url: artifacts.microphone)
             let micSegments = try await self.transcribeTrack(
-                url: artifacts.microphone,
+                samples: micSamples,
                 speaker: Self.micSpeakerLabel,
                 provider: provider,
-                progressRange: 0.05...0.45
+                progressRange: 0.05...0.4
             )
 
             self.currentStatus = "Transcribing the system-audio track..."
-            let systemSegments = try await self.transcribeTrack(
-                url: artifacts.systemAudio,
+            let systemSamples = try Self.loadSamples16kMono(url: artifacts.systemAudio)
+            var systemSegments = try await self.transcribeTrack(
+                samples: systemSamples,
                 speaker: Self.systemSpeakerLabel,
                 provider: provider,
-                progressRange: 0.45...0.9
+                progressRange: 0.4...0.75
             )
+
+            if !systemSegments.isEmpty {
+                self.currentStatus = "Identifying speakers..."
+                self.progress = 0.8
+                systemSegments = await Self.applyDiarization(to: systemSegments, samples: systemSamples)
+            }
 
             self.currentStatus = "Merging tracks..."
             self.progress = 0.92
@@ -127,7 +136,8 @@ final class MeetingTranscriptPipeline: ObservableObject {
 
         let systemPrompt = """
         You summarise meetings. Below is a machine-generated transcript of a meeting between \
-        the user (labelled "Me") and the other participants (labelled "Them"); timestamps are \
+        the user (labelled "Me") and the other participants (labelled "Them", or "Them 1"/\
+        "Them 2"/... when individual speakers were distinguished); timestamps are \
         minutes:seconds from the start and the transcription may contain recognition errors — \
         infer the intended meaning where obvious. Write a concise summary in Markdown with \
         these sections, omitting any section with nothing to say:
@@ -168,12 +178,11 @@ final class MeetingTranscriptPipeline: ObservableObject {
     // MARK: - Per-track transcription
 
     private func transcribeTrack(
-        url: URL,
+        samples: [Float],
         speaker: String,
         provider: TranscriptionProvider,
         progressRange: ClosedRange<Double>
     ) async throws -> [MeetingSegment] {
-        let samples = try Self.loadSamples16kMono(url: url)
         let utterances = Self.splitOnSilence(samples: samples, sampleRate: 16_000)
         var segments: [MeetingSegment] = []
 
@@ -194,6 +203,68 @@ final class MeetingTranscriptPipeline: ObservableObject {
                 + (progressRange.upperBound - progressRange.lowerBound) * fraction
         }
         return segments
+    }
+
+    // MARK: - Speaker diarization ("Them" track)
+
+    /// Relabel system-audio segments with per-speaker labels ("Them 1",
+    /// "Them 2", ...) using FluidAudio's diarizer. Best-effort: any failure
+    /// (model download, inference) keeps the plain "Them" labels. When only
+    /// one speaker is detected, labels are also left as "Them".
+    nonisolated static func applyDiarization(
+        to segments: [MeetingSegment],
+        samples: [Float]
+    ) async -> [MeetingSegment] {
+        let speakerSegments: [TimedSpeakerSegment]
+        do {
+            let models = try await DiarizerModels.downloadIfNeeded()
+            let diarizer = DiarizerManager()
+            diarizer.initialize(models: models)
+            defer { diarizer.cleanup() }
+            let result = try diarizer.performCompleteDiarization(samples, sampleRate: 16_000)
+            speakerSegments = result.segments
+        } catch {
+            DebugLogger.shared.warning(
+                "Diarization skipped: \(error.localizedDescription)",
+                source: "MeetingTranscriptPipeline"
+            )
+            return segments
+        }
+
+        let distinctSpeakers = Set(speakerSegments.map(\.speakerId))
+        guard distinctSpeakers.count > 1 else { return segments }
+
+        // Number speakers by order of first appearance so "Them 1" is
+        // whoever spoke first.
+        var speakerNumbers: [String: Int] = [:]
+        for speakerSegment in speakerSegments.sorted(by: { $0.startTimeSeconds < $1.startTimeSeconds }) {
+            if speakerNumbers[speakerSegment.speakerId] == nil {
+                speakerNumbers[speakerSegment.speakerId] = speakerNumbers.count + 1
+            }
+        }
+
+        return segments.map { segment in
+            // Dominant speaker = most overlapped time within the segment.
+            var overlapBySpeaker: [String: Double] = [:]
+            for speakerSegment in speakerSegments {
+                let overlap = min(segment.end, Double(speakerSegment.endTimeSeconds))
+                    - max(segment.start, Double(speakerSegment.startTimeSeconds))
+                if overlap > 0 {
+                    overlapBySpeaker[speakerSegment.speakerId, default: 0] += overlap
+                }
+            }
+            guard let dominant = overlapBySpeaker.max(by: { $0.value < $1.value })?.key,
+                  let number = speakerNumbers[dominant]
+            else {
+                return segment
+            }
+            return MeetingSegment(
+                start: segment.start,
+                end: segment.end,
+                speaker: "\(Self.systemSpeakerLabel) \(number)",
+                text: segment.text
+            )
+        }
     }
 
     // MARK: - Audio loading
