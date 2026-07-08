@@ -8,7 +8,14 @@ struct MeetingsView: View {
     let asrService: ASRService
     @ObservedObject private var fileHistoryStore = FileTranscriptionHistoryStore.shared
     @State private var expandedEntryID: FileTranscriptionEntry.ID?
+    @StateObject private var reprocessPipeline: MeetingTranscriptPipeline
+    @State private var reprocessingFolder: String?
     @Environment(\.theme) private var theme
+
+    init(asrService: ASRService) {
+        self.asrService = asrService
+        _reprocessPipeline = StateObject(wrappedValue: MeetingTranscriptPipeline(asrService: asrService))
+    }
 
     /// Meeting transcripts are stored in the shared file-transcription
     /// history under this prefix (see MeetingTranscriptPipeline).
@@ -68,6 +75,35 @@ struct MeetingsView: View {
         }
     }
 
+    /// Meeting history entries are named "Meeting <folderName>"; recover the
+    /// session folder from that.
+    private func folderName(for entry: FileTranscriptionEntry) -> String {
+        String(entry.fileName.dropFirst(Self.meetingEntryPrefix.count))
+    }
+
+    private func recordingFolder(for entry: FileTranscriptionEntry) -> URL {
+        MeetingRecordingSession.defaultBaseDirectory()
+            .appendingPathComponent(self.folderName(for: entry), isDirectory: true)
+    }
+
+    private func canReprocess(_ entry: FileTranscriptionEntry) -> Bool {
+        MeetingReprocessor.artifacts(inFolder: self.recordingFolder(for: entry)) != nil
+    }
+
+    private func reprocess(entry: FileTranscriptionEntry) {
+        let folder = self.recordingFolder(for: entry)
+        guard let artifacts = MeetingReprocessor.artifacts(inFolder: folder) else { return }
+        self.reprocessingFolder = self.folderName(for: entry)
+        Task {
+            defer { self.reprocessingFolder = nil }
+            do {
+                _ = try await self.reprocessPipeline.process(artifacts)
+            } catch {
+                DebugLogger.shared.error("Re-transcribe failed: \(error)", source: "MeetingsView")
+            }
+        }
+    }
+
     private func meetingRow(entry: FileTranscriptionEntry) -> some View {
         let isExpanded = self.expandedEntryID == entry.id
         return VStack(alignment: .leading, spacing: 0) {
@@ -119,7 +155,25 @@ struct MeetingsView: View {
                 }
                 .frame(maxHeight: 260)
 
+                if self.reprocessingFolder == self.folderName(for: entry), self.reprocessPipeline.isProcessing {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ProgressView(value: self.reprocessPipeline.progress)
+                            .progressViewStyle(.linear)
+                        Text(self.reprocessPipeline.currentStatus)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    .padding(.horizontal, 12)
+                }
+
                 HStack {
+                    Button(action: { self.reprocess(entry: entry) }) {
+                        Label("Re-transcribe", systemImage: "arrow.clockwise")
+                    }
+                    .disabled(self.reprocessPipeline.isProcessing || !self.canReprocess(entry))
+                    .help(self.canReprocess(entry)
+                        ? "Re-run transcription, speaker labels, and summary with the current pipeline"
+                        : "Original audio for this meeting was not found")
                     Spacer()
                     Button(action: {
                         NSPasteboard.general.clearContents()

@@ -617,6 +617,10 @@ struct ContentView: View {
             }
 
             DebugLogger.shared.info("✅ Audio subsystems initialized", source: "ContentView")
+
+            // One-shot: reprocess the latest recording if requested (e.g. to
+            // apply an updated transcription/diarization/summary pipeline).
+            MeetingReprocessor.runLaunchReprocessIfRequested(asrService: self.appServices.asr)
         }
     }
 

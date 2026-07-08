@@ -101,12 +101,18 @@ final class MeetingTranscriptPipeline: ObservableObject {
             let mergedText = merged
                 .map { "[\(Self.timestamp($0.start))] \($0.speaker): \($0.text)" }
                 .joined(separator: "\n")
+            let fileName = "Meeting \(artifacts.displayName)"
+            // Replace any prior transcript for this same recording so
+            // re-transcribing updates in place instead of duplicating.
+            for existing in FileTranscriptionHistoryStore.shared.entries where existing.fileName == fileName {
+                FileTranscriptionHistoryStore.shared.deleteEntry(id: existing.id)
+            }
             let historyEntry = TranscriptionResult(
                 text: mergedText,
                 confidence: 1.0,
                 duration: artifacts.duration,
                 processingTime: Date().timeIntervalSince(startTime),
-                fileName: "Meeting \(artifacts.displayName)"
+                fileName: fileName
             )
             FileTranscriptionHistoryStore.shared.addEntry(historyEntry)
 

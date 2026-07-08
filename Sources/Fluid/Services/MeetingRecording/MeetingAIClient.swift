@@ -19,12 +19,14 @@ enum MeetingAIClient {
         max(1, text.count / 4)
     }
 
-    /// Conservative context budget by provider. Apple Intelligence's
-    /// on-device model has a hard ~4k window; other providers get a
-    /// moderate default and the retry loop below adapts downward when a
-    /// server rejects the prompt as too long.
+    /// Context budget by provider. Apple Intelligence's on-device model has a
+    /// hard ~4k window. Every other provider starts effectively unbounded so
+    /// the FULL transcript is sent — accuracy is never silently degraded by
+    /// trimming a transcript the model could have held. If a provider really
+    /// rejects the prompt as too long, the retry loop below backs the budget
+    /// down until it fits.
     static func contextBudgetTokens(for provider: ResolvedProvider) -> Int {
-        provider.providerID == "apple-intelligence" ? 4096 : 16384
+        provider.providerID == "apple-intelligence" ? 4096 : 1_000_000
     }
 
     /// Keep the most recent transcript lines within a token budget, with an
