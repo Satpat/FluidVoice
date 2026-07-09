@@ -45,10 +45,16 @@ enum MeetingRelabeler {
         }
 
         // 4) regenerate the summary from the relabelled transcript so names are
-        //    reflected there too (best-effort).
+        //    reflected there too, then the title from that summary (best-effort).
         if let mergedText = relabelledTranscript ?? (try? String(contentsOf: transcriptURL, encoding: .utf8)),
            let body = try? await MeetingTranscriptPipeline.generateSummaryBody(mergedText: Self.plainTranscript(mergedText)) {
             try? MeetingTranscriptPipeline.writeSummary(body: body, displayName: folder.lastPathComponent, folder: folder)
+
+            let startedAt = ISO8601DateFormatter.meetingFileSafe.date(from: folder.lastPathComponent)
+                ?? (try? folder.resourceValues(forKeys: [.creationDateKey]).creationDate)
+                ?? Date()
+            let title = await MeetingTranscriptPipeline.generateTitleLine(context: body, startedAt: startedAt)
+            MeetingTranscriptPipeline.writeTitle(title, folder: folder)
         }
 
         return true
