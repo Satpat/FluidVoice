@@ -40,9 +40,13 @@ enum MeetingSpeakerNamer {
 
             Determine the real first name of each labelled speaker ONLY when the transcript \
             clearly evidences it — for example the speaker introduces themselves ("I'm Sarah", \
-            "this is John speaking") or is unambiguously addressed by name in a way that maps to \
-            that exact label. Do NOT guess, and do NOT infer a name from topic or context. If a \
-            label's name is not clearly evidenced, use null.
+            "this is John speaking"). IMPORTANT: a name a speaker uses while talking TO someone \
+            (direct address, e.g. "thanks, Sam" or "what do you think, Sam?") identifies the \
+            LISTENER, not the speaker — never assign such a name to the speaker's own label. \
+            Since "Me" is usually the person being addressed by the others, names they use in \
+            direct address most likely belong to "Me" and must NOT be assigned to any label. \
+            Do NOT guess, and do NOT infer a name from topic or context. If a label's name is \
+            not clearly evidenced, use null.
 
             Respond with ONLY a JSON object mapping each label to a name string or null, e.g.:
             {"Them 1": "Sarah", "Them 2": null}

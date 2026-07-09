@@ -100,31 +100,45 @@ struct MeetingsView: View {
         MeetingReprocessor.artifacts(inFolder: self.recordingFolder(for: entry)) != nil
     }
 
-    /// Labels for the meeting's detected speakers that aren't yet a real
-    /// person (plain "Them"/"Them N"), offered for manual naming.
-    private func unnamedSpeakerLabels(for entry: FileTranscriptionEntry) -> [String] {
-        MeetingFiles.speakerEmbeddings(inFolder: self.recordingFolder(for: entry))
-            .keys
-            .filter { !MeetingTranscriptPipeline.isRealSpeakerName($0) }
-            .sorted()
+    /// Distinct speaker labels parsed from the meeting's transcript lines
+    /// ("[MM:SS] Label: ..."), excluding "Me". Parsing the transcript (rather
+    /// than speakers.json) means every speaker is offered — including ones
+    /// the automatic namer got wrong, so they can be corrected here.
+    private func speakerLabels(for entry: FileTranscriptionEntry) -> [String] {
+        var labels: [String] = []
+        for line in entry.text.components(separatedBy: "\n") {
+            guard line.hasPrefix("["),
+                  let bracketEnd = line.range(of: "] "),
+                  let colon = line.range(of: ":", range: bracketEnd.upperBound..<line.endIndex)
+            else { continue }
+            let label = String(line[bracketEnd.upperBound..<colon.lowerBound])
+                .trimmingCharacters(in: .whitespaces)
+            guard !label.isEmpty,
+                  label != MeetingTranscriptPipeline.micSpeakerLabel,
+                  !labels.contains(label)
+            else { continue }
+            labels.append(label)
+        }
+        return labels
     }
 
     @ViewBuilder
     private func nameSpeakersSection(entry: FileTranscriptionEntry) -> some View {
-        let labels = self.unnamedSpeakerLabels(for: entry)
+        let labels = self.speakerLabels(for: entry)
         if !labels.isEmpty {
             VStack(alignment: .leading, spacing: 8) {
-                Text("Name speakers")
+                Text("Speakers")
                     .font(.caption)
                     .foregroundColor(.secondary)
-                Text("Assign a name to save this voice. That person is then recognised automatically in future meetings.")
+                Text("Rename a speaker to correct or assign their identity. The voice is saved, so that person is recognised automatically in future meetings.")
                     .font(.caption2)
                     .foregroundColor(.secondary)
                 ForEach(labels, id: \.self) { label in
                     HStack(spacing: 8) {
                         Text(label)
                             .font(.callout)
-                            .frame(width: 70, alignment: .leading)
+                            .frame(width: 90, alignment: .leading)
+                            .lineLimit(1)
                         TextField("Real name", text: self.nameBinding(entry: entry, label: label))
                             .textFieldStyle(.roundedBorder)
                         Button("Save & apply") { self.nameSpeaker(entry: entry, label: label) }
@@ -152,17 +166,31 @@ struct MeetingsView: View {
         )
     }
 
-    /// Enrol the chosen name with this speaker's voice (so future meetings
+    /// Save the chosen name for this speaker's voice (so future meetings
     /// recognise them), then relabel this meeting in place — no re-transcribe.
+    /// Handles corrections: renaming a mislabelled speaker moves their voice
+    /// samples to the new name, merging with an existing profile if one exists.
     private func nameSpeaker(entry: FileTranscriptionEntry, label: String) {
         let key = self.nameKey(entry, label)
         let name = (self.speakerNameInputs[key] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty else { return }
+        guard !name.isEmpty, name != label else { return }
         let folder = self.recordingFolder(for: entry)
         let embeddings = MeetingFiles.speakerEmbeddings(inFolder: folder)
-        guard let embedding = embeddings[label] else { return }
 
-        self.speakerStore.enroll(name: name, embedding: embedding)
+        if let wrongProfile = self.speakerStore.profiles.first(where: { $0.name.lowercased() == label.lowercased() }) {
+            // The label was a (mis)assigned name with an enrolled voice: move
+            // its embedding to the corrected name (enroll merges centroids)
+            // and drop the wrong profile.
+            self.speakerStore.enroll(name: name, embedding: wrongProfile.embedding)
+            self.speakerStore.delete(id: wrongProfile.id)
+        } else if let embedding = embeddings[label]
+            ?? (embeddings.count == 1 ? embeddings.values.first : nil) {
+            // Provisional label ("Them"/"Them N"): enrol its voice centroid.
+            // Fall back to the sole embedding when the label was renamed after
+            // speakers.json was written.
+            self.speakerStore.enroll(name: name, embedding: embedding)
+        }
+
         self.speakerNameInputs[key] = nil
         self.reprocessingFolder = self.folderName(for: entry)
         Task {
