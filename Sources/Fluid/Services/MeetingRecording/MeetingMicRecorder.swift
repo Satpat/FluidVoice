@@ -50,6 +50,14 @@ final class MeetingMicRecorder {
         do {
             try input.setVoiceProcessingEnabled(true)
             self.echoCancellationEnabled = true
+            // The voice-processing unit is built for VoIP and by default
+            // DUCKS all other system audio while active, which drastically
+            // lowered meeting playback volume. Keep the echo cancellation but
+            // reduce ducking to the minimum the system allows.
+            input.voiceProcessingOtherAudioDuckingConfiguration = AVAudioVoiceProcessingOtherAudioDuckingConfiguration(
+                enableAdvancedDucking: false,
+                duckingLevel: .min
+            )
         } catch {
             self.logger.warning("Voice-processing AEC unavailable: \(error.localizedDescription, privacy: .public)")
         }

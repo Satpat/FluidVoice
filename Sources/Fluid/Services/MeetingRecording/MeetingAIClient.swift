@@ -104,6 +104,12 @@ enum MeetingAIClient {
         if !isLocal, resolved.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             throw MeetingRecordingError("Missing API key for \(resolved.providerID). Configure it under AI Enhancement.")
         }
+        if isLocal {
+            // Local LLM servers (llama-server, Ollama) can still be starting
+            // when a post-launch pipeline runs; wait for reachability instead
+            // of failing the whole batch with connection errors.
+            await Self.waitForLocalEndpoint(resolved.baseURL)
+        }
 
         var messages: [[String: Any]] = [["role": "system", "content": systemPrompt]]
         for turn in turns {
@@ -124,6 +130,24 @@ enum MeetingAIClient {
 
         let response = try await LLMClient.shared.call(config)
         return response.content
+    }
+
+    /// Wait (up to ~40 s) for a local endpoint to accept connections.
+    /// Any HTTP response counts — we only need the server process up.
+    private static func waitForLocalEndpoint(_ baseURL: String) async {
+        guard let url = URL(string: baseURL) else { return }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 2
+        for attempt in 0..<20 {
+            if (try? await URLSession.shared.data(for: request)) != nil {
+                if attempt > 0 {
+                    DebugLogger.shared.info("Local AI endpoint became reachable after \(attempt * 2)s", source: "MeetingAIClient")
+                }
+                return
+            }
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+        }
+        DebugLogger.shared.warning("Local AI endpoint unreachable: \(baseURL)", source: "MeetingAIClient")
     }
 
     // MARK: - Provider resolution
