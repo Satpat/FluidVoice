@@ -28,6 +28,17 @@ final class MeetingMicRecorder {
     /// the audio tap thread. Used for live transcription; must be cheap.
     @ObservationIgnored var liveSampleHandler: (([Float]) -> Void)?
 
+    /// Current system-audio output peak (0-1), for the leak gate below.
+    @ObservationIgnored var systemLevelProvider: (() -> Float)?
+
+    /// Leak gate: when the speakers are loud and the mic only hears a weak
+    /// signal, that signal is speaker bleed, not the user. Silence it at the
+    /// source. The user's own speech is far louder at the mic than the bleed,
+    /// so it passes the ratio test even while the far end is talking.
+    private static let gateSystemActiveThreshold: Float = 0.08
+    private static let gateLeakRatio: Float = 0.35
+    @ObservationIgnored private(set) var gatedFrameCount: Int = 0
+
     init(fileURL: URL) {
         self.fileURL = fileURL
         self.logger = Logger(subsystem: kMeetingRecordingSubsystem,
@@ -128,6 +139,18 @@ final class MeetingMicRecorder {
             self.logger.error("convert: \(error.localizedDescription, privacy: .public)")
             return
         }
+        // Leak gate (see gateLeakRatio above): silence bleed-only frames while
+        // preserving the frame count so wall-clock alignment is untouched.
+        let micPeak = MeetingMicRecorder.peak(of: converted)
+        if let systemLevel = self.systemLevelProvider?(),
+           systemLevel > Self.gateSystemActiveThreshold,
+           micPeak < systemLevel * Self.gateLeakRatio,
+           let channel = converted.floatChannelData
+        {
+            memset(channel[0], 0, Int(converted.frameLength) * MemoryLayout<Float>.size)
+            self.gatedFrameCount += Int(converted.frameLength)
+        }
+
         do {
             try file.write(from: converted)
             self.lastPeak = MeetingMicRecorder.peak(of: converted)

@@ -96,6 +96,10 @@ final class MeetingRecordingSession {
 
             let mic = MeetingMicRecorder(fileURL: micURL)
             mic.liveSampleHandler = self.liveMicSampleHandler
+            // Feed the system-output level to the mic's leak gate: when the
+            // speakers are loud and the mic hears only a weak signal, that is
+            // bleed and gets silenced at the source.
+            mic.systemLevelProvider = { [weak sysRec] in sysRec?.lastPeak ?? 0 }
             try mic.start()
             self.micRecorder = mic
 
