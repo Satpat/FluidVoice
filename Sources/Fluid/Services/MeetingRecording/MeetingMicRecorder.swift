@@ -45,34 +45,17 @@ final class MeetingMicRecorder {
                              category: "MeetingMicRecorder(\(fileURL.lastPathComponent))")
     }
 
-    private(set) var echoCancellationEnabled = false
+    // NOTE: Apple's voice-processing AEC (setVoiceProcessingEnabled) was
+    // tried here and REMOVED: on an input-only engine it recorded pure
+    // silence on the mic, its device reconfiguration starved the system-audio
+    // tap (1.7s captured from a 2-minute meeting), and it ducked all system
+    // playback. Echo defence is instead the leak gate below plus the
+    // transcript-level echo suppression in MeetingTranscriptPipeline.
 
     func start() throws {
         guard !self.isRecording else { return }
 
         let input = self.engine.inputNode
-
-        // Acoustic echo cancellation: when the meeting audio plays out of the
-        // speakers, it bleeds into the microphone and the far-end voice ends
-        // up duplicated on the "Me" track. Apple's voice-processing I/O unit
-        // references the system output and cancels it from the mic. Must be
-        // enabled before the engine starts; best-effort (older/edge hardware
-        // may refuse), with a transcript-level dedup as the backstop.
-        do {
-            try input.setVoiceProcessingEnabled(true)
-            self.echoCancellationEnabled = true
-            // The voice-processing unit is built for VoIP and by default
-            // DUCKS all other system audio while active, which drastically
-            // lowered meeting playback volume. Keep the echo cancellation but
-            // reduce ducking to the minimum the system allows.
-            input.voiceProcessingOtherAudioDuckingConfiguration = AVAudioVoiceProcessingOtherAudioDuckingConfiguration(
-                enableAdvancedDucking: false,
-                duckingLevel: .min
-            )
-        } catch {
-            self.logger.warning("Voice-processing AEC unavailable: \(error.localizedDescription, privacy: .public)")
-        }
-
         let inputFormat = input.outputFormat(forBus: 0)
         guard inputFormat.sampleRate > 0 else {
             throw MeetingRecordingError("Microphone not available (no input device).")
