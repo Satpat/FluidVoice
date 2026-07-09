@@ -10,6 +10,14 @@ enum MeetingFiles {
         Self.existing(folder.appendingPathComponent("summary.md"))
     }
 
+    /// Friendly display name written by the pipeline ("Title (friendly date)").
+    static func title(inFolder folder: URL) -> String? {
+        guard let url = Self.existing(folder.appendingPathComponent("title.txt")),
+              let text = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
     private static func existing(_ url: URL) -> URL? {
         FileManager.default.fileExists(atPath: url.path) ? url : nil
     }

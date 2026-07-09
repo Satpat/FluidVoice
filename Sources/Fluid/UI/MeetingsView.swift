@@ -79,6 +79,12 @@ struct MeetingsView: View {
         }
     }
 
+    /// Friendly generated title when the pipeline has written one; the raw
+    /// "Meeting <timestamp>" name otherwise.
+    private func displayTitle(for entry: FileTranscriptionEntry) -> String {
+        MeetingFiles.title(inFolder: self.recordingFolder(for: entry)) ?? entry.fileName
+    }
+
     /// Meeting history entries are named "Meeting <folderName>"; recover the
     /// session folder from that.
     private func folderName(for entry: FileTranscriptionEntry) -> String {
@@ -192,7 +198,7 @@ struct MeetingsView: View {
                         .frame(width: 24)
 
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(entry.fileName)
+                        Text(self.displayTitle(for: entry))
                             .font(.system(size: 14, weight: .medium))
                             .lineLimit(1)
                         Text("\(entry.relativeTimeString) · \(MeetingTranscriptPipeline.timestamp(entry.duration))")

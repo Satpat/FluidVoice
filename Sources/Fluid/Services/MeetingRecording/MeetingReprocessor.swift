@@ -11,6 +11,11 @@ enum MeetingReprocessor {
     /// meeting without manual steps.
     static let reprocessLatestOnLaunchKey = "MeetAIReprocessLatestOnLaunch"
 
+    /// UserDefaults flag: when true, sweep every recording folder once on
+    /// launch — full pipeline for folders without the new diarization output,
+    /// title backfill only for those that already have it.
+    static let reprocessAllOnLaunchKey = "MeetAIReprocessAllOnLaunch"
+
     /// Reconstruct artifacts from a session folder. Prefers session.json;
     /// falls back to the conventional file names when it is absent.
     static func artifacts(inFolder folder: URL) -> MeetingRecordingArtifacts? {
@@ -55,9 +60,16 @@ enum MeetingReprocessor {
             .first
     }
 
-    /// If the launch flag is set, reprocess the latest recording once.
+    /// If a launch flag is set, run the corresponding one-shot reprocess.
     static func runLaunchReprocessIfRequested(asrService: ASRService) {
         let defaults = UserDefaults.standard
+
+        if defaults.bool(forKey: reprocessAllOnLaunchKey) {
+            defaults.set(false, forKey: reprocessAllOnLaunchKey)
+            Task { await reprocessAll(asrService: asrService) }
+            return
+        }
+
         guard defaults.bool(forKey: reprocessLatestOnLaunchKey) else { return }
         defaults.set(false, forKey: reprocessLatestOnLaunchKey)
 
@@ -77,5 +89,68 @@ enum MeetingReprocessor {
                 DebugLogger.shared.error("Launch reprocess failed: \(error.localizedDescription)", source: "MeetingReprocessor")
             }
         }
+    }
+
+    /// A folder has the new diarization output when both the speaker
+    /// embeddings and a transcript exist.
+    static func hasDiarizationOutput(_ folder: URL) -> Bool {
+        FileManager.default.fileExists(atPath: folder.appendingPathComponent("speakers.json").path)
+            && FileManager.default.fileExists(atPath: folder.appendingPathComponent("transcript.md").path)
+    }
+
+    static func allRecordingFolders() -> [URL] {
+        let base = MeetingRecordingSession.defaultBaseDirectory()
+        let folders = (try? FileManager.default.contentsOfDirectory(
+            at: base,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        )) ?? []
+        return folders
+            .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
+            .sorted { $0.lastPathComponent > $1.lastPathComponent }
+    }
+
+    /// Sweep every recording, newest first, sequentially: full pipeline for
+    /// folders without the new diarization output; folders that already have
+    /// it only get the friendly title backfilled when missing.
+    static func reprocessAll(asrService: ASRService) async {
+        let folders = allRecordingFolders()
+        DebugLogger.shared.info("Reprocess-all: \(folders.count) recording folder(s)", source: "MeetingReprocessor")
+
+        for folder in folders {
+            guard let artifacts = artifacts(inFolder: folder) else {
+                DebugLogger.shared.warning("Reprocess-all: skipping \(folder.lastPathComponent) (no audio)", source: "MeetingReprocessor")
+                continue
+            }
+
+            if hasDiarizationOutput(folder) {
+                if MeetingFiles.title(inFolder: folder) == nil {
+                    let transcript = (try? String(contentsOf: folder.appendingPathComponent("transcript.md"), encoding: .utf8)) ?? ""
+                    let summary = try? String(contentsOf: folder.appendingPathComponent("summary.md"), encoding: .utf8)
+                    let startedAt = ISO8601DateFormatter.meetingFileSafe.date(from: folder.lastPathComponent) ?? artifacts.startedAt
+                    let title = await MeetingTranscriptPipeline.generateTitleLine(
+                        context: summary ?? transcript,
+                        startedAt: startedAt
+                    )
+                    MeetingTranscriptPipeline.writeTitle(title, folder: folder)
+                    DebugLogger.shared.info("Reprocess-all: titled \(folder.lastPathComponent): \(title)", source: "MeetingReprocessor")
+                } else {
+                    DebugLogger.shared.info("Reprocess-all: \(folder.lastPathComponent) already complete", source: "MeetingReprocessor")
+                }
+                continue
+            }
+
+            DebugLogger.shared.info("Reprocess-all: full pipeline for \(folder.lastPathComponent)", source: "MeetingReprocessor")
+            let pipeline = MeetingTranscriptPipeline(asrService: asrService)
+            do {
+                _ = try await pipeline.process(artifacts)
+            } catch {
+                DebugLogger.shared.error(
+                    "Reprocess-all failed for \(folder.lastPathComponent): \(error.localizedDescription)",
+                    source: "MeetingReprocessor"
+                )
+            }
+        }
+        DebugLogger.shared.info("Reprocess-all complete", source: "MeetingReprocessor")
     }
 }

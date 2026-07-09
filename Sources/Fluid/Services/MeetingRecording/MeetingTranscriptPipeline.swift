@@ -28,6 +28,7 @@ final class MeetingTranscriptPipeline: ObservableObject {
     @Published var transcriptURL: URL?
     @Published var summary: String?
     @Published var summaryError: String?
+    @Published var meetingTitle: String?
 
     private let asrService: ASRService
 
@@ -146,6 +147,17 @@ final class MeetingTranscriptPipeline: ObservableObject {
             self.progress = 0.96
             await self.summarize(mergedText: mergedText, artifacts: artifacts)
 
+            // Friendly meeting name: short generated title + readable date,
+            // shown in place of the raw folder timestamp everywhere.
+            self.currentStatus = "Naming meeting..."
+            self.progress = 0.98
+            let titleLine = await Self.generateTitleLine(
+                context: self.summary ?? mergedText,
+                startedAt: artifacts.startedAt
+            )
+            Self.writeTitle(titleLine, folder: artifacts.folder)
+            self.meetingTitle = titleLine
+
             self.currentStatus = "Complete!"
             self.progress = 1.0
             self.transcriptURL = transcriptURL
@@ -217,6 +229,46 @@ final class MeetingTranscriptPipeline: ObservableObject {
         let summaryURL = folder.appendingPathComponent("summary.md")
         let document = "# Meeting summary — \(displayName)\n\n\(body)\n"
         try document.write(to: summaryURL, atomically: true, encoding: .utf8)
+    }
+
+    // MARK: - Meeting title
+
+    /// "Short generated title (friendly date)". Best-effort: falls back to
+    /// plain "Meeting (date)" if the AI provider is unavailable.
+    static func generateTitleLine(context: String, startedAt: Date) async -> String {
+        var title = "Meeting"
+        do {
+            let raw = try await MeetingAIClient.complete(
+                systemPrompt: """
+                You title meetings. Reply with ONLY a concise, descriptive 3-6 word title \
+                for the meeting described below. No quotes, no trailing punctuation.
+                """,
+                turns: [MeetingAIClient.Turn(role: "user", content: String(context.prefix(4000)))]
+            )
+            let line = raw
+                .components(separatedBy: .newlines)
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .first { !$0.isEmpty } ?? ""
+            let cleaned = line.trimmingCharacters(in: CharacterSet(charactersIn: "\"'“”`#*.")).trimmingCharacters(in: .whitespaces)
+            if !cleaned.isEmpty {
+                title = String(cleaned.prefix(60))
+            }
+        } catch {
+            DebugLogger.shared.warning(
+                "Meeting title generation failed: \(error.localizedDescription)",
+                source: "MeetingTranscriptPipeline"
+            )
+        }
+        return "\(title) (\(Self.friendlyDate(startedAt)))"
+    }
+
+    static func friendlyDate(_ date: Date) -> String {
+        date.formatted(.dateTime.weekday(.abbreviated).day().month(.abbreviated).hour().minute())
+    }
+
+    static func writeTitle(_ title: String, folder: URL) {
+        let url = folder.appendingPathComponent("title.txt")
+        try? title.write(to: url, atomically: true, encoding: .utf8)
     }
 
     // MARK: - Per-track transcription

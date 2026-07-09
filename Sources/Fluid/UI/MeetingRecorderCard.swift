@@ -174,7 +174,8 @@ struct MeetingRecorderCard: View {
                     .foregroundColor(Color.fluidGreen)
 
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(self.pipeline.transcriptURL == nil ? "Recording saved" : "Transcript ready")
+                    Text(self.pipeline.meetingTitle
+                        ?? (self.pipeline.transcriptURL == nil ? "Recording saved" : "Transcript ready"))
                         .font(.headline)
                     Text("\(artifacts.displayName) · \(Self.format(elapsed: artifacts.duration))")
                         .font(.caption)
@@ -211,6 +212,7 @@ struct MeetingRecorderCard: View {
                     self.pipeline.transcriptURL = nil
                     self.pipeline.summary = nil
                     self.pipeline.summaryError = nil
+                    self.pipeline.meetingTitle = nil
                     MeetingLiveTranscriber.shared.reset()
                     MeetingQAService.shared.reset()
                     self.session.reset()
