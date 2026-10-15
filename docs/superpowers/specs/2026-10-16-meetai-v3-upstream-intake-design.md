@@ -342,6 +342,16 @@ Command: §8.1, run in this worktree with a scratch DerivedData.
   - `AudioRouteRecoveryIntegrationTests.testTwentyOrdinaryStartsAndStopsKeepRecoveryIdle`: expects `parakeet-tdt`, got `parakeet-tdt-v2` (reads local model settings).
 - Rule: after every commit, the failing set must be exactly these 11 (or a subset); no new failures.
 
+### Verification (2026-10-16)
+
+- Spike: `2026-10-13T01:31:26/system.wav` through the CAF path gave speakers ["Speaker 1","Speaker 2"], 221 segments (legacy WAV chunks gave 0 attributed speakers).
+- Embedder model test: same voice 0.98, different voice 0.09 (synthetic voices).
+- Migration dry run on a copy of real data: folders=113 done=105 skipped=8 failed=0. The 4 extra skips contain only "No speech detected".
+- Full suite (signed): executed 2316, 42 skipped, 9 failed, all within the 11-test baseline above (`UpdateInstallationPipelineTests`: testCancelledTaskBeforePreparationDoesNotTouchOriginalStageOrBackup, testDevelopmentCandidateIsRejectedAsReleaseButAcceptedAsRollbackAndRetained, testInstalledBuildChangedSinceApprovalRejectsPreparation, testInstalledVersionChangedSinceApprovalRejectsPreparation, testPreexistingBackupDestinationIsPreservedAndOriginalIsUntouched, testRegularFileAtBackupParentAbortsWithoutReplacingOriginal, testReleaseInstallationHasVerifiedBackupAndCanRecoverWithoutConsumingSource, testReleaseWithoutApprovedVersionIsRejectedBeforeAnyStagingOrBackup, testTamperedCandidateCannotReplaceOriginalOrCreateBackup).
+- `./build.sh` (signed dev build, Debug bundle ID): BUILD SUCCEEDED, exit 0.
+- Signing change: test runs are signed with personal team BVA3X42BK9, after a keychain prompt hung unsigned test hosts.
+- Manual checklist (§8.7) and install: pending user go-ahead.
+
 ## 12. Plan-time amendments
 
 Facts found while writing the implementation plan that refine this spec:
@@ -351,7 +361,7 @@ Facts found while writing the implementation plan that refine this spec:
 3. **H6 placement**: one call at the end of the coordinator's private `performCorrection` (which backs `renameSpeaker`, `renameSpeakers`, `mergeSpeakers`, `reassignSegment`, `nameUnknownSegment`, transcript edits). The handler is diff-based: a speaker counts as user-renamed only when its display name is not a default label and differs from the sidecar's `lastAppliedName`. MeetAI writes `lastAppliedName` *before* its own renames, so its renames never enrol voices. `speakers.json` records gain `lastAppliedName`.
 4. **Default speaker labels** are upstream's `Speaker N`, `Microphone Speaker N`, `Room Speaker`, `Meeting audio`, `Microphone / Unknown`, plus the fork's legacy `Them` / `Them N` (for migrated meetings).
 5. **Title ownership**: MeetAI owns a title while `session.defaultTitleBase != nil` (upstream clears it on any rename) or `session.title == meta.lastLLMTitle`. User title edits go through `renameSession`, which does not pass `performCorrection`, so ownership is checked whenever MeetAI considers retitling.
-6. **Synthetic audio sessions** write 16 kHz mono 16-bit WAV chunks (60 s) at `tracks/<kind>/NNNNNN.wav` in the legacy chunk shape (no `captureAnalysisAsset`), which upstream's materializer reads. They are saved in state `.interrupted` with `endedAt` set, so they satisfy `hasRetryableAudio` and upstream's recovery UI can retry them if MeetAI's own `retryProcessing` call fails. Microphone eras are marked `.acousticallyClosed` for single-track imports (no far-end audio exists) and `.legacyUnclassified` for Tier 2 fork recordings.
+6. **Synthetic audio sessions** write PCM-first CAF Float32 chunks at `tracks/<kind>/NNNNNN.caf` with audioSchemaVersion 2 and a ready `captureAnalysisAsset` (`linearPCMFloat32CAFV1`). The first design (16 kHz mono 16-bit WAV chunks in the legacy chunk shape) was dropped because the spike showed legacy WAV chunks yielded 0 attributed speakers while CAF yielded 2 speakers / 221 segments. Sessions are saved in state `.interrupted` with `endedAt` set, so they satisfy `hasRetryableAudio` and upstream's recovery UI can retry them if MeetAI's own `retryProcessing` call fails. Microphone eras are marked `.acousticallyClosed` for single-track imports (no far-end audio exists) and `.legacyUnclassified` for Tier 2 fork recordings.
 7. **Migration session IDs are deterministic** (derived from the folder name), so an interrupted migration never creates duplicates.
 8. **Tier 2 re-processing UI** lives in the MeetAI settings sheet's migration section (one more hook point avoided). On success the transcript-only session is replaced; on failure the new session is deleted and the old one kept.
 9. **Upload formats**: whatever AVFoundation can decode (`.audio`, `.movie` UTTypes). Upstream's separate `.opus`/`.oga` decoder is not reused.
