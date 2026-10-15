@@ -104,13 +104,16 @@ actor MeetAISidecarStore {
         }
     }
 
-    /// Deletes sidecar folders whose session is not in `keeping`. Returns the removed IDs.
-    func sweepOrphans(keeping ids: Set<MeetingSessionID>) throws -> [MeetingSessionID] {
+    /// Deletes sidecar folders whose session is not live. Returns the removed IDs. Entries that are
+    /// not UUID-named directories are never touched.
+    func sweepOrphans(isLive: @Sendable (MeetingSessionID) async -> Bool) async throws -> [MeetingSessionID] {
         let directory = self.paths.sessionsDirectory
         guard FileManager.default.fileExists(atPath: directory.path) else { return [] }
         var removed: [MeetingSessionID] = []
         for url in try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) {
-            guard let id = UUID(uuidString: url.lastPathComponent), !ids.contains(id) else { continue }
+            guard let id = UUID(uuidString: url.lastPathComponent),
+                  (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true,
+                  await !isLive(id) else { continue }
             try FileManager.default.removeItem(at: url)
             removed.append(id)
         }

@@ -20,7 +20,15 @@ enum MeetAIBootstrap {
     static func sweepOrphanedSidecars() async {
         do {
             let ids = Set(try await MeetingSessionStore.shared.loadAll().map(\.id))
-            let removed = try await MeetAISidecarStore.shared.sweepOrphans(keeping: ids)
+            // loadAll skips unreadable sessions, so also consult the directory: never delete on doubt.
+            let removed = try await MeetAISidecarStore.shared.sweepOrphans { id in
+                if ids.contains(id) { return true }
+                do {
+                    return try await MeetingSessionStore.shared.existingSessionDirectory(for: id) != nil
+                } catch {
+                    return true
+                }
+            }
             if !removed.isEmpty {
                 DebugLogger.shared.info("Removed \(removed.count) orphaned MeetAI sidecars", source: "MeetAI")
             }
