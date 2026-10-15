@@ -60,4 +60,11 @@ final class DictationCoordinatorTests: XCTestCase {
         XCTAssertTrue(task.isCancelled)
         XCTAssertNil(coordinator.prewarmDictationTask)
     }
+
+    func testApplyShortcutSettings_isSafeBeforeBoot() {
+        let coordinator = DictationCoordinator()
+        XCTAssertNil(coordinator.hotkeyManager)
+        coordinator.applyShortcutSettings() // no manager yet: must be a no-op, not a crash
+        XCTAssertFalse(coordinator.hotkeyManagerInitialized)
+    }
 }

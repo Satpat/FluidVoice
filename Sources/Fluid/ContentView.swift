@@ -168,8 +168,8 @@ struct ContentView: View {
     }
 
     @Environment(\.theme) private var theme
-    @State private var hotkeyManager: GlobalHotkeyManager? = nil
-    @State private var hotkeyManagerInitialized: Bool = false
+    /// Observed only so SettingsView's hotkeyManagerInitialized binding refreshes the UI.
+    @ObservedObject private var dictationObserver = AppServices.shared.dictation
 
     @State private var appear = false
     @State private var accessibilityEnabled = false
@@ -295,7 +295,7 @@ struct ContentView: View {
                 self.handlePendingAppNavigation()
             }
             .onReceive(NotificationCenter.default.publisher(for: .dictationPromptShortcutsChanged)) { _ in
-                self.hotkeyManager?.updatePromptShortcutAssignments(SettingsStore.shared.dictationPromptShortcutAssignments())
+                self.dictation.applyShortcutSettings()
             }
             .onReceive(NotificationCenter.default.publisher(for: .settingsBackupDidRestore)) { _ in
                 self.reloadSettingsStateAfterBackupRestore()
@@ -387,16 +387,10 @@ struct ContentView: View {
 
                 let display = storedShortcuts.map(\.displayString).joined(separator: ", ")
                 DebugLogger.shared.debug("Primary dictation shortcuts changed to \(display)", source: "ContentView")
-                self.hotkeyManager?.updatePrimaryShortcuts(storedShortcuts)
+                self.dictation.applyShortcutSettings()
 
                 // Update initialization status after shortcut change
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    self.hotkeyManagerInitialized = self.hotkeyManager?.validateEventTapHealth() ?? false
-                    DebugLogger.shared.debug(
-                        "Hotkey manager initialized: \(self.hotkeyManagerInitialized)",
-                        source: "ContentView"
-                    )
-                }
+                self.dictation.refreshHotkeyHealth()
             }
             .onChange(of: self.selectedSidebarItem) { _, newValue in
                 self.handleModeTransition(from: self.previousSidebarItem, to: newValue)
@@ -414,9 +408,9 @@ struct ContentView: View {
                     self.finishAccessibilityPermissionFlow()
                 }
 
-                if enabled && self.hotkeyManager != nil && !self.hotkeyManagerInitialized {
+                if enabled && self.dictation.hotkeyManager != nil && !self.dictation.hotkeyManagerInitialized {
                     DebugLogger.shared.debug("Accessibility enabled, reinitializing hotkey manager", source: "ContentView")
-                    self.hotkeyManager?.reinitialize()
+                    self.dictation.reinitializeHotkeys()
                 }
             }
             .onChange(of: self.selectedModel) { _, newValue in
@@ -429,11 +423,11 @@ struct ContentView: View {
                 SettingsStore.shared.selectedProviderID = newValue
             }
             .onChange(of: self.activeShortcutRecordingTarget) { _, _ in
-                self.hotkeyManager?.resetModifierOnlyShortcutTracking()
+                self.dictation.hotkeyManager?.resetModifierOnlyShortcutTracking()
             }
             .onChange(of: self.commandModeHotkeyShortcut) { _, newValue in
                 SettingsStore.shared.commandModeHotkeyShortcut = newValue
-                self.hotkeyManager?.updateCommandModeShortcut(newValue)
+                self.dictation.applyShortcutSettings()
             }
             .onChange(of: self.isPromptModeShortcutEnabled) { newValue in
                 self.handlePromptShortcutEnabledChange(newValue)
@@ -462,7 +456,7 @@ struct ContentView: View {
 
     private func handlePromptShortcutEnabledChange(_ isEnabled: Bool) {
         SettingsStore.shared.promptModeShortcutEnabled = isEnabled
-        self.hotkeyManager?.updatePromptModeShortcutEnabled(isEnabled)
+        self.dictation.applyShortcutSettings()
 
         if !isEnabled {
             if self.activeShortcutRecordingTarget == .secondaryDictation {
@@ -482,7 +476,7 @@ struct ContentView: View {
 
     private func handleCommandShortcutEnabledChange(_ isEnabled: Bool) {
         SettingsStore.shared.commandModeShortcutEnabled = isEnabled
-        self.hotkeyManager?.updateCommandModeShortcutEnabled(isEnabled)
+        self.dictation.applyShortcutSettings()
 
         if !isEnabled {
             if self.activeShortcutRecordingTarget == .command {
@@ -502,7 +496,7 @@ struct ContentView: View {
 
     private func handleRewriteShortcutEnabledChange(_ isEnabled: Bool) {
         SettingsStore.shared.rewriteModeShortcutEnabled = isEnabled
-        self.hotkeyManager?.updateRewriteModeShortcutEnabled(isEnabled)
+        self.dictation.applyShortcutSettings()
 
         if !isEnabled {
             if self.activeShortcutRecordingTarget == .edit {
@@ -529,6 +523,7 @@ struct ContentView: View {
                 selectSidebarItem: { self.selectedSidebarItem = $0 },
                 isAccessibilityEnabled: { self.accessibilityEnabled },
                 isTranscriptionEditorFocused: { self.isTranscriptionFocused },
+                isShortcutCaptureActive: { self.isRecordingAnyShortcutCapture },
                 providerSelectionDidChange: { providerID, providerKey, selectedModels, modelName in
                     self.selectedProviderID = providerID
                     self.currentProvider = providerKey
@@ -564,7 +559,7 @@ struct ContentView: View {
         self.scheduleDelayedAudioInitialization()
         self.configureNotchCallbacks()
         self.startAccessibilityPolling()
-        self.initializeHotkeyManagerIfNeeded()
+        self.dictation.bootIfNeeded()
 
         Task {
             try? await Task.sleep(nanoseconds: 1_000_000_000)
@@ -733,7 +728,7 @@ struct ContentView: View {
     ) -> NSEvent? {
         guard isRecordingAnyShortcut else {
             if self.cancelRecordingHotkeyShortcut.matches(keyCode: event.keyCode, modifiers: eventModifiers),
-               self.handleCancelShortcut()
+               self.dictation.handleCancelShortcut()
             {
                 return nil
             }
@@ -1036,15 +1031,15 @@ struct ContentView: View {
         case .secondaryDictation:
             self.promptModeHotkeyShortcut = shortcut
             SettingsStore.shared.promptModeHotkeyShortcut = shortcut
-            self.hotkeyManager?.updatePromptModeShortcut(shortcut)
+            self.dictation.applyShortcutSettings()
         case .command:
             self.commandModeHotkeyShortcut = shortcut
             SettingsStore.shared.commandModeHotkeyShortcut = shortcut
-            self.hotkeyManager?.updateCommandModeShortcut(shortcut)
+            self.dictation.applyShortcutSettings()
         case .edit:
             self.rewriteModeHotkeyShortcut = shortcut
             SettingsStore.shared.rewriteModeHotkeyShortcut = shortcut
-            self.hotkeyManager?.updateRewriteModeShortcut(shortcut)
+            self.dictation.applyShortcutSettings()
         case .cancel:
             self.cancelRecordingHotkeyShortcut = shortcut
             SettingsStore.shared.cancelRecordingHotkeyShortcut = shortcut
@@ -1057,7 +1052,7 @@ struct ContentView: View {
             var configuration = SettingsStore.shared.dictationPromptConfiguration(for: selection)
             configuration.shortcut = shortcut
             SettingsStore.shared.setDictationPromptConfiguration(configuration, for: selection)
-            self.hotkeyManager?.updatePromptShortcutAssignments(SettingsStore.shared.dictationPromptShortcutAssignments())
+            self.dictation.applyShortcutSettings()
         case .newPrompt:
             NotificationCenter.default.post(
                 name: .newPromptShortcutRecorded,
@@ -1087,15 +1082,15 @@ struct ContentView: View {
         case .secondaryDictation:
             self.isPromptModeShortcutEnabled = enabled
             SettingsStore.shared.promptModeShortcutEnabled = enabled
-            self.hotkeyManager?.updatePromptModeShortcutEnabled(enabled)
+            self.dictation.applyShortcutSettings()
         case .command:
             self.isCommandModeShortcutEnabled = enabled
             SettingsStore.shared.commandModeShortcutEnabled = enabled
-            self.hotkeyManager?.updateCommandModeShortcutEnabled(enabled)
+            self.dictation.applyShortcutSettings()
         case .edit:
             self.isRewriteModeShortcutEnabled = enabled
             SettingsStore.shared.rewriteModeShortcutEnabled = enabled
-            self.hotkeyManager?.updateRewriteModeShortcutEnabled(enabled)
+            self.dictation.applyShortcutSettings()
         case .pasteLast:
             self.isPasteLastTranscriptionShortcutEnabled = enabled
             SettingsStore.shared.pasteLastTranscriptionShortcutEnabled = enabled
@@ -1436,11 +1431,11 @@ struct ContentView: View {
             commandModeShortcutEnabled: self.$isCommandModeShortcutEnabled,
             rewriteShortcutEnabled: self.$isRewriteModeShortcutEnabled,
             pasteLastTranscriptionShortcutEnabled: self.$isPasteLastTranscriptionShortcutEnabled,
-            hotkeyManagerInitialized: self.$hotkeyManagerInitialized,
+            hotkeyManagerInitialized: self.$dictationObserver.hotkeyManagerInitialized,
             hotkeyMode: self.$hotkeyMode,
             enableStreamingPreview: self.$enableStreamingPreview,
             copyToClipboard: self.$copyToClipboard,
-            hotkeyManager: self.hotkeyManager,
+            hotkeyManager: self.dictation.hotkeyManager,
             menuBarManager: self.menuBarManager,
             startRecording: { self.dictation.startRecording() },
             refreshDevices: self.refreshDevices,
@@ -1744,259 +1739,6 @@ struct ContentView: View {
         // Close the add model UI
         self.showingAddModel = false
         self.newModelName = ""
-    }
-
-    private func initializeHotkeyManagerIfNeeded() {
-        NotchContentState.shared.onPromptModeSwitchRequested = { mode in
-            self.dictation.handleLivePromptModeSwitch(mode)
-        }
-        NotchContentState.shared.onOverlayModeSwitchRequested = { mode in
-            self.dictation.handleLiveOverlayModeSwitch(mode)
-        }
-        NotchContentState.shared.onReprocessLastRequested = {
-            self.dictation.reprocessLastDictation()
-        }
-        NotchContentState.shared.onCopyLastRequested = {
-            self.dictation.copyLastDictationFromHistory()
-        }
-        NotchContentState.shared.onPasteLastRequested = {
-            self.dictation.pasteLastDictationFromHistory()
-        }
-        NotchContentState.shared.onUndoLastAIRequested = {
-            self.dictation.undoLastAIProcessingFromHistory()
-        }
-        NotchContentState.shared.onOpenPreferencesRequested = {
-            self.menuBarManager.openPreferencesFromUI()
-        }
-        NotchContentState.shared.onCancelRequested = {
-            _ = self.handleCancelShortcut()
-        }
-        NotchContentState.shared.onDictationPromptSelectionRequested = { selection in
-            let privateAIAvailable = PrivateAIProviderPromptFormat.isAvailable()
-            switch selection {
-            case .off:
-                break
-            case .privateAI:
-                guard privateAIAvailable else { return }
-            case .default, .profile:
-                guard !privateAIAvailable else { return }
-            }
-            let slot = self.dictation.activeDictationShortcutSlot ?? .primary
-            SettingsStore.shared.setDictationPromptSelection(selection, for: slot)
-            self.dictation.applyDictationShortcutSelectionContext(for: slot)
-        }
-
-        guard self.hotkeyManager == nil else { return }
-
-        self.hotkeyManager = GlobalHotkeyManager(
-            asrService: self.asr,
-            primaryShortcuts: self.primaryDictationShortcuts,
-            promptModeShortcut: self.promptModeHotkeyShortcut,
-            commandModeShortcut: self.commandModeHotkeyShortcut,
-            rewriteModeShortcut: self.rewriteModeHotkeyShortcut,
-            promptShortcutAssignments: SettingsStore.shared.dictationPromptShortcutAssignments(),
-            promptModeShortcutEnabled: self.isPromptModeShortcutEnabled,
-            commandModeShortcutEnabled: self.isCommandModeShortcutEnabled,
-            rewriteModeShortcutEnabled: self.isRewriteModeShortcutEnabled,
-            startRecordingCallback: {
-                DebugLogger.shared.debug("ContentView: startRecordingCallback invoked by hotkey", source: "ContentView")
-                self.dictation.startRecording()
-            },
-            dictationModeCallback: {
-                DebugLogger.shared.info("Dictate mode triggered", source: "ContentView")
-                DebugLogger.shared.debug(
-                    "ContentView: selected model for dictate hotkey=\(SettingsStore.shared.selectedSpeechModel.displayName)",
-                    source: "ContentView"
-                )
-                self.dictation.beginDictationRecording(for: .primary, mode: .dictate)
-            },
-            stopAndProcessCallback: {
-                let route = self.dictation.currentDictationOutputRouteForHotkeyStop()
-                DebugLogger.shared.info("Hotkey stop callback using route: \(route.rawValue)", source: "ContentView")
-                await self.dictation.stopAndProcessTranscription(route: route)
-            },
-            promptModeCallback: {
-                DebugLogger.shared.info("Prompt mode triggered", source: "ContentView")
-                self.dictation.beginDictationRecording(for: .secondary, mode: .promptMode)
-            },
-            promptSelectionCallback: { selection in
-                DebugLogger.shared.info("Prompt selection shortcut triggered", source: "ContentView")
-                self.dictation.beginDictationRecording(for: selection, mode: .promptMode)
-            },
-            commandModeCallback: {
-                DebugLogger.shared.info("Command mode triggered", source: "ContentView")
-                self.dictation.captureRecordingContext()
-
-                // Set flag so stopAndProcessTranscription knows to process as command
-                self.dictation.setActiveRecordingMode(.command)
-
-                // Set overlay mode to command
-                self.menuBarManager.setOverlayMode(.command)
-
-                guard !self.asr.isRunning else { return }
-
-                self.dictation.advanceOverlayLifecycle()
-
-                // Start recording immediately for the command
-                DebugLogger.shared.info(
-                    "Starting voice recording for command",
-                    source: "ContentView"
-                )
-                TranscriptionSoundPlayer.shared.playStartSound()
-                Task {
-                    await self.asr.start()
-                }
-            },
-            rewriteModeCallback: {
-                self.dictation.captureRecordingContext()
-
-                // Try to capture text first while still in the other app
-                let captured = self.dictation.rewriteModeService.captureSelectedText()
-                DebugLogger.shared.info("Rewrite mode triggered, text captured: \(captured)", source: "ContentView")
-
-                if !captured {
-                    // No text selected - start in "write mode" where user speaks
-                    // what to write
-                    DebugLogger.shared
-                        .info(
-                            "No text selected - starting in write/improve mode",
-                            source: "ContentView"
-                        )
-                    self.dictation.rewriteModeService.startWithoutSelection()
-                    // Set overlay mode to edit
-                    self.menuBarManager.setOverlayMode(.edit)
-                } else {
-                    // Text was selected - edit mode (with selected context)
-                    self.menuBarManager.setOverlayMode(.edit)
-                }
-
-                // Set flag so stopAndProcessTranscription knows to process as rewrite
-                self.dictation.setActiveRecordingMode(.edit)
-
-                guard !self.asr.isRunning else { return }
-
-                self.dictation.advanceOverlayLifecycle()
-
-                // Start recording immediately for the edit instruction
-                DebugLogger.shared.info("Starting voice recording for edit mode", source: "ContentView")
-                TranscriptionSoundPlayer.shared.playStartSound()
-                Task {
-                    await self.asr.start()
-                }
-            },
-            isDictateRecordingProvider: {
-                self.dictation.activeRecordingMode == .dictate
-            },
-            isPromptModeRecordingProvider: {
-                self.dictation.activeRecordingMode == .promptMode
-            },
-            isCommandRecordingProvider: {
-                self.dictation.activeRecordingMode == .command
-            },
-            isRewriteRecordingProvider: {
-                self.dictation.activeRecordingMode == .edit
-            },
-            isShortcutCaptureActiveProvider: {
-                self.isRecordingAnyShortcutCapture
-            }
-        )
-
-        self.hotkeyManagerInitialized = self.hotkeyManager?.validateEventTapHealth() ?? false
-
-        self.hotkeyManager?.setHotkeyMode(self.hotkeyMode)
-
-        // Set cancel callback for Escape key handling (closes transient UI, resets recording state)
-        // Returns true if it handled something (so GlobalHotkeyManager knows to consume the event)
-        self.hotkeyManager?.setCancelCallback {
-            var handled = false
-
-            // Close expanded command notch if visible (highest priority)
-            if NotchOverlayManager.shared.isCommandOutputExpanded {
-                DebugLogger.shared.debug("Cancel callback: closing expanded command notch", source: "ContentView")
-                NotchOverlayManager.shared.hideExpandedCommandOutput()
-                handled = true
-            }
-
-            // Reset recording mode flags
-            if self.dictation.activeRecordingMode != .none {
-                self.dictation.cancelPrewarmDictationIfNeeded()
-                self.dictation.clearActiveRecordingMode()
-                handled = true
-            }
-
-            // Close rewrite mode if open. Command Mode stays open so Escape can cancel voice capture without leaving the tool.
-            if self.selectedSidebarItem == .rewriteMode {
-                DebugLogger.shared.debug("Cancel callback: closing mode view", source: "ContentView")
-                DispatchQueue.main.async {
-                    self.selectedSidebarItem = .welcome
-                }
-                handled = true
-            }
-
-            return handled
-        }
-
-        // Re-insert the most recent transcription on demand (no clipboard involved).
-        self.hotkeyManager?.setPasteLastTranscriptionCallback {
-            self.dictation.pasteLastDictationFromHistory()
-        }
-
-        // Monitor initialization status
-        Task {
-            // Give some time for initialization
-            try? await Task.sleep(nanoseconds: 3_000_000_000) // 3 seconds
-
-            await MainActor.run {
-                self.hotkeyManagerInitialized = self.hotkeyManager?.validateEventTapHealth() ?? false
-                DebugLogger.shared.debug("Initial hotkey manager health check: \(self.hotkeyManagerInitialized)", source: "ContentView")
-
-                // If still not initialized and accessibility is enabled, try reinitializing
-                if !self.hotkeyManagerInitialized && self.accessibilityEnabled {
-                    self.hotkeyManagerInitialized = self.hotkeyManager?.validateEventTapHealth() ?? false
-                    DebugLogger.shared.debug("Initial hotkey manager health check: \(self.hotkeyManagerInitialized)", source: "ContentView")
-
-                    // If still not initialized and accessibility is enabled, try reinitializing
-                    if !self.hotkeyManagerInitialized && self.accessibilityEnabled {
-                        DebugLogger.shared.debug("Hotkey manager not healthy, attempting reinitalization", source: "ContentView")
-                        self.hotkeyManager?.reinitialize()
-                    }
-                }
-            }
-        }
-    }
-
-    @discardableResult
-    private func handleCancelShortcut() -> Bool {
-        var handled = false
-
-        if NotchOverlayManager.shared.isCommandOutputExpanded {
-            DebugLogger.shared.debug("Cancel shortcut: closing expanded command notch", source: "ContentView")
-            NotchOverlayManager.shared.hideExpandedCommandOutput()
-            NotchOverlayManager.shared.onCommandOutputDismiss?()
-            handled = true
-        }
-
-        if self.asr.isRunning {
-            DebugLogger.shared.debug("Cancel shortcut: cancelling ASR recording", source: "ContentView")
-            Task { await self.asr.stopWithoutTranscription() }
-            self.dictation.cancelPrewarmDictationIfNeeded()
-            handled = true
-        }
-
-        if NotchOverlayManager.shared.isBottomOverlayVisible || NotchOverlayManager.shared.isOverlayVisible {
-            DebugLogger.shared.debug("Cancel shortcut: hiding recording overlay", source: "ContentView")
-            NotchOverlayManager.shared.hide()
-            handled = true
-        }
-
-        if self.selectedSidebarItem == .rewriteMode {
-            DebugLogger.shared.debug("Cancel shortcut: closing mode view", source: "ContentView")
-            let isOnboarded = self.asr.isAsrReady || self.asr.modelsExistOnDisk
-            self.selectedSidebarItem = isOnboarded ? .preferences : .welcome
-            handled = true
-        }
-
-        return handled
     }
 
     // MARK: - Model Management Helpers
@@ -2535,7 +2277,7 @@ extension ContentView {
                         self.finishAccessibilityPermissionFlow()
 
                         guard !UserDefaults.standard.bool(forKey: self.hasAutoRestartedForAccessibilityKey) else {
-                            self.hotkeyManager?.reinitialize()
+                            self.dictation.reinitializeHotkeys()
                             return
                         }
 
@@ -2706,14 +2448,7 @@ private extension ContentView {
         self.savedProviders = SettingsStore.shared.savedProviders
         self.selectedProviderID = SettingsStore.shared.selectedProviderID
 
-        self.hotkeyManager?.updatePrimaryShortcuts(self.primaryDictationShortcuts)
-        self.hotkeyManager?.updatePromptModeShortcut(self.promptModeHotkeyShortcut)
-        self.hotkeyManager?.updatePromptModeShortcutEnabled(self.isPromptModeShortcutEnabled)
-        self.hotkeyManager?.updatePromptShortcutAssignments(SettingsStore.shared.dictationPromptShortcutAssignments())
-        self.hotkeyManager?.updateCommandModeShortcut(self.commandModeHotkeyShortcut)
-        self.hotkeyManager?.updateCommandModeShortcutEnabled(self.isCommandModeShortcutEnabled)
-        self.hotkeyManager?.updateRewriteModeShortcut(self.rewriteModeHotkeyShortcut)
-        self.hotkeyManager?.updateRewriteModeShortcutEnabled(self.isRewriteModeShortcutEnabled)
+        self.dictation.applyShortcutSettings()
 
         self.currentProvider = self.providerKey(for: self.selectedProviderID)
         if let saved = self.savedProviders.first(where: { $0.id == self.selectedProviderID }) {
