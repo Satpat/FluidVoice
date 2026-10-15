@@ -24,17 +24,36 @@ nonisolated struct MeetAIFluidAudioEmbedder: MeetAISpeakerEmbedding {
 
     /// Decoding and CoreML run off the caller's actor.
     @concurrent static func compute(turns: [MeetingTranscriptSegment], session: MeetingSession, sessionDirectory: URL) async throws -> [Float]? {
-        var audio: [Float] = []
-        for turn in turns {
-            try Task.checkCancellation()
-            let slices = try MeetingSegmentPlaybackPlan.slices(session: session, segment: turn, directory: sessionDirectory)
-            for slice in slices {
-                audio += try MeetAIAudioDecoder.load16kMono(url: slice.url, start: slice.start, end: slice.end)
-            }
+        let audio = try self.turnAudio(for: turns) {
+            try MeetingSegmentPlaybackPlan.slices(session: session, segment: $0, directory: sessionDirectory)
         }
         let clips = self.clips(from: audio)
         guard !clips.isEmpty else { return nil }
         return MeetAISpeakerMath.centroid(try await self.embed(clips: clips))
+    }
+
+    /// Concatenated 16 kHz audio for `turns`. A turn whose slices cannot be resolved or decoded is
+    /// skipped (logged) so one unplayable segment cannot block the speaker's whole profile.
+    static func turnAudio(
+        for turns: [MeetingTranscriptSegment],
+        slices: (MeetingTranscriptSegment) throws -> [MeetingSegmentPlaybackPlan.Slice]
+    ) throws -> [Float] {
+        var audio: [Float] = []
+        for turn in turns {
+            try Task.checkCancellation()
+            do {
+                var turnSamples: [Float] = []
+                for slice in try slices(turn) {
+                    turnSamples += try MeetAIAudioDecoder.load16kMono(url: slice.url, start: slice.start, end: slice.end)
+                }
+                audio += turnSamples
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                DebugLogger.shared.warning("MeetAI skipped an unplayable turn: \(error.localizedDescription)", source: "MeetAI")
+            }
+        }
+        return audio
     }
 
     static func clips(from audio: [Float]) -> [[Float]] {

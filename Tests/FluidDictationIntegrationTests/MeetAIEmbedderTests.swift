@@ -35,4 +35,33 @@ final class MeetAIEmbedderTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(same, MeetAISpeakerProfileStore.matchThreshold)
         XCTAssertLessThan(different, MeetAISpeakerProfileStore.matchThreshold)
     }
+
+    private func twoTurnSession() -> MeetingSession {
+        MeetAIFixtures.session(
+            speakers: [("Ann", false)],
+            lines: [.init(speaker: 0, start: 0, end: 1, text: "bad"), .init(speaker: 0, start: 1, end: 2, text: "good")]
+        )
+    }
+
+    func testTurnAudioSkipsUnplayableTurnAndKeepsGoodOne() throws {
+        let directory = try MeetAIFixtures.tempDirectory(self)
+        let session = self.twoTurnSession()
+        let chunks = try MeetAISyntheticSessionBuilder.writeChunks(samples: [Float](repeating: 0.25, count: 16_000), kind: .microphone, sessionDirectory: directory)
+        let url = directory.appendingPathComponent(chunks[0].relativeFilePath)
+        let expected = try MeetAIAudioDecoder.load16kMono(url: url, start: 0, end: 1)
+        let bad = session.transcriptSegments[0].id
+        let audio = try MeetAIFluidAudioEmbedder.turnAudio(for: session.transcriptSegments) { turn in
+            if turn.id == bad { throw MeetingSegmentPlaybackError.unavailable }
+            return [MeetingSegmentPlaybackPlan.Slice(url: url, start: 0, end: 1)]
+        }
+        XCTAssertFalse(expected.isEmpty)
+        XCTAssertEqual(audio, expected)
+    }
+
+    func testTurnAudioPropagatesCancellation() {
+        let session = self.twoTurnSession()
+        XCTAssertThrowsError(try MeetAIFluidAudioEmbedder.turnAudio(for: session.transcriptSegments) { _ in throw CancellationError() }) {
+            XCTAssertTrue($0 is CancellationError)
+        }
+    }
 }
