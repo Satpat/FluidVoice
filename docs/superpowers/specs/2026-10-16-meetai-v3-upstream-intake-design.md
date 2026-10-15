@@ -275,7 +275,7 @@ Spike code stays labelled spike until both pass. Then it becomes the builder plu
 
 ### 8.5 Migration dry run on a copy of real data
 
-Run the migrator in a test harness against a temporary copy of `MeetingRecordings/` and `SpeakerProfiles/`, with the store root injected. Expected: 109 imported, 4 skipped with reasons, 27 profiles copied. The report goes in the PR.
+Run the migrator in a test harness against a temporary copy of `MeetingRecordings/` and `SpeakerProfiles/`, with the store root injected. Expected: 105 imported, 8 skipped with reasons (113 folders: 105 with speech, 4 'No speech detected', 4 without transcript.md), 27 profiles copied. The report goes in the PR.
 
 ### 8.6 Before the first real launch of the v3 build
 
