@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		C9FD40FFD73E22C593B5BA9A /* MeetAIQATests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AF7A287948779B0E71DE9731 /* MeetAIQATests.swift */; };
 		A5E2448DC6DD9D808B0C6DC0 /* MeetAISummaryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 46D2DFE8516388D7288A5B14 /* MeetAISummaryTests.swift */; };
 		595AB4730100576152AED313 /* MeetAINamingTitleTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9E328D22934C8E43B1E9EDA /* MeetAINamingTitleTests.swift */; };
 		9369D361FCFA68F24FC3B478 /* MeetAISessionProcessorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 515C24DFA560B0C6B5BB2FE8 /* MeetAISessionProcessorTests.swift */; };
@@ -190,6 +191,7 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		AF7A287948779B0E71DE9731 /* MeetAIQATests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeetAIQATests.swift; sourceTree = "<group>"; };
 		46D2DFE8516388D7288A5B14 /* MeetAISummaryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeetAISummaryTests.swift; sourceTree = "<group>"; };
 		A9E328D22934C8E43B1E9EDA /* MeetAINamingTitleTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeetAINamingTitleTests.swift; sourceTree = "<group>"; };
 		515C24DFA560B0C6B5BB2FE8 /* MeetAISessionProcessorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeetAISessionProcessorTests.swift; sourceTree = "<group>"; };
@@ -454,6 +456,7 @@
 				C0DE89000000000000000001 /* SettingsNavigationStateTests.swift */,
 				343B29013F4441D6A797D12D /* LLMClientRequestBodyTests.swift */,
 				980330F3CE464336ADCE3E23 /* TemperatureSupportTests.swift */,
+				AF7A287948779B0E71DE9731 /* MeetAIQATests.swift */,
 				46D2DFE8516388D7288A5B14 /* MeetAISummaryTests.swift */,
 				A9E328D22934C8E43B1E9EDA /* MeetAINamingTitleTests.swift */,
 				515C24DFA560B0C6B5BB2FE8 /* MeetAISessionProcessorTests.swift */,
@@ -842,6 +845,7 @@
 				C0DE89000000000000000002 /* SettingsNavigationStateTests.swift in Sources */,
 				86CAA2D4EF18433096185602 /* LLMClientRequestBodyTests.swift in Sources */,
 				272BFB5CB271489892CAE50C /* TemperatureSupportTests.swift in Sources */,
+				C9FD40FFD73E22C593B5BA9A /* MeetAIQATests.swift in Sources */,
 				A5E2448DC6DD9D808B0C6DC0 /* MeetAISummaryTests.swift in Sources */,
 				595AB4730100576152AED313 /* MeetAINamingTitleTests.swift in Sources */,
 				9369D361FCFA68F24FC3B478 /* MeetAISessionProcessorTests.swift in Sources */,

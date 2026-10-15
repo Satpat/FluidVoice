@@ -52,6 +52,8 @@ extension View {
 enum MeetingDocumentSection: Hashable {
     case transcript
     case summary
+    /// MeetAI H2: Q&A over a finished meeting.
+    case ask
 }
 
 /// Meeting titles use the system's editorial face; controls retain the app's native type.
@@ -74,12 +76,16 @@ struct MeetingDocumentTabs: View {
     var primaryTitle = "Transcript"
     var primaryIcon = "text.alignleft"
     var isEnabled = true
+    var showsAsk = false
     @Environment(\.theme) private var theme
 
     var body: some View {
         HStack(spacing: self.theme.metrics.spacing.sm) {
             self.tab(self.primaryTitle, section: .transcript, icon: self.primaryIcon)
             self.tab("Meet Summary", section: .summary, icon: "sparkles")
+            if self.showsAsk {
+                self.tab("Ask", section: .ask, icon: "bubble.left.and.text.bubble.right")
+            }
             Spacer(minLength: 0)
         }
         .overlay(alignment: .bottom) {
