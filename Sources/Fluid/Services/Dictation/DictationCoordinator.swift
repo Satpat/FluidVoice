@@ -4,7 +4,7 @@ import Foundation
 
 /// Owns the dictation runtime: recording-session state, the start → transcribe
 /// → AI → format → type flow, the command/rewrite voice routes, history actions
-/// and (from P3) the global hotkey manager. Previously all of this lived inside
+/// and the global hotkey manager. Previously all of this lived inside
 /// ContentView, a SwiftUI view. Created lazily by AppServices; ContentView only
 /// binds UI to it.
 @MainActor
@@ -305,12 +305,6 @@ final class DictationCoordinator: ObservableObject {
         let onboardingPlaygroundStep = 4
         return !self.settings.onboardingCompleted &&
             self.settings.onboardingCurrentStep == onboardingPlaygroundStep
-    }
-
-    var isOnboardingSandboxRouteActive: Bool {
-        let onboardingAIEnhancementStep = 5
-        return self.isOnboardingVoicePlaygroundStepActive ||
-            (!self.settings.onboardingCompleted && self.settings.onboardingCurrentStep == onboardingAIEnhancementStep)
     }
 
     func currentDictationOutputRouteForHotkeyStop() -> DictationOutputRoute {

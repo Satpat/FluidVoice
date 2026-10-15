@@ -1650,17 +1650,9 @@ struct ContentView: View {
 
     // NOTE: Thinking token filtering is now handled by LLMClient.stripThinkingTags()
 
-    // MARK: - Modular AI Processing
-
     // MARK: - Streaming Response Handler (DEPRECATED - Now handled by LLMClient)
 
     // This method is no longer used - LLMClient.call() handles streaming internally
-
-    // MARK: - Stop and Process Transcription
-
-    // MARK: - Rewrite Mode Voice Processing
-
-    // MARK: - Command Mode Voice Processing
 
     // MARK: - ASR Model Management
 

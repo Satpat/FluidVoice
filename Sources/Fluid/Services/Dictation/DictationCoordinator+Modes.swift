@@ -2,7 +2,7 @@ import AppKit
 import Foundation
 
 // Command/rewrite voice routes, live mode switches, prompt configuration and
-// Private AI prewarm for the dictation flow. Moved verbatim from ContentView.
+// Private AI prewarm for the dictation flow. Moved verbatim from ContentView. (applyDictationPromptConfiguration additionally reports provider changes to the view through DictationHostBridge.providerSelectionDidChange)
 
 extension DictationCoordinator {
     func processRewriteWithVoiceInstruction(

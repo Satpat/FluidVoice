@@ -332,9 +332,9 @@ Also: `TypingService.virtualKeyCode` uses `DispatchQueue.main.sync` from a worke
 
 ## 1.10 Tech debt snapshot
 
-- Largest files (lines): SettingsStore 4917 · ContentView 4458 · ASRService 3951 · BottomOverlayView 3286 · AISettingsView+AIConfiguration 2758 · WelcomeView 2669 · SettingsView 2611.
+- Largest files (lines): SettingsStore 4917 · ContentView 4458 (baseline; 2519 after the DictationCoordinator refactor, see §2.9) · ASRService 3951 · BottomOverlayView 3286 · AISettingsView+AIConfiguration 2758 · WelcomeView 2669 · SettingsView 2611.
 - Dead code: `Networking/AIProvider.swift`, `Networking/FunctionCallingProvider.swift`.
-- `DictationPostProcessingService` near-duplicates `ContentView.processTextWithAI` (used only by the Local API).
+- `DictationPostProcessingService` near-duplicates `ContentView.processTextWithAI` (used only by the Local API). (baseline — resolved: both now call `DictationAIProcessor`, see §2.9)
 - `.qwen3Asr` routes to the Parakeet provider with no Qwen-specific code.
 - Meeting history in a 50-entry UserDefaults list: older meetings vanish from the Meetings list while their folders remain.
 
@@ -569,16 +569,16 @@ xcodebuild test -project Fluid.xcodeproj -scheme Fluid -destination 'platform=ma
 | 10 | Session-wide 600 s timeout | Dedicated long session | `5c92f93` |
 | — | Resampler tail dropped (found by new tests) | Drain converter at EOF | `187ec54` |
 
-## 2.9 Roadmap (not done in this pass)
+## 2.9 Roadmap
 
 Ordered by value ÷ risk:
 
-1. ~~**Move dictation orchestration out of `ContentView`.**~~ **Done** in `dadabd6..fd7cf35` on `meetai-v2-hardening`. `DictationCoordinator` is owned by `AppServices`, `DictationAIProcessor` replaces `ContentView.processTextWithAI`, and `DictationPostProcessingService` is now a thin Local API adapter over it. `ContentView` went from 4458 to 2519 lines. Follow-up: SettingsView still binds to ContentView shortcut `@State` editor copies.
+1. ~~**Move dictation orchestration out of `ContentView`.**~~ **Done** in `dadabd6..3903bc7` on `meetai-v2-hardening`. `DictationCoordinator` is owned by `AppServices`, `DictationAIProcessor` replaces `ContentView.processTextWithAI`, and `DictationPostProcessingService` is now a thin Local API adapter over it. `ContentView` went from 4458 to 2519 lines. Follow-up: SettingsView still binds to ContentView shortcut `@State` editor copies.
 2. **`TypingService` thread safety.** Remove `DispatchQueue.main.sync` from `virtualKeyCode`, and synchronise `isCurrentlyTyping`.
 3. **Keychain read per API-key access.** Cache `providerAPIKeys` in memory and invalidate on write (29 call sites).
 4. **Meeting index from disk.** List meetings from `MeetingRecordings/*/session.json` instead of the UserDefaults history blob, which also removes the need for the history-cap exception.
 5. **Live transcriber VAD on main.** Route `MeetingLiveTranscriber.tick`'s `splitOnSilence`/`lastSilenceCut` through an `@concurrent` engine call.
 6. **ASR provider isolation.** Meeting ASR calls the provider directly, so it can overlap live dictation. Route it through `ASRService.transcriptionExecutor`.
-7. **Split the large files** (`SettingsStore` 4.9k, `ContentView` 4.4k, `ASRService` 3.9k lines) along the seams above.
+7. **Split the large files** (`SettingsStore` 4.9k, `ContentView` 2.5k, `ASRService` 3.9k lines) along the seams above.
 8. **Swift 6 language mode** once the remaining ~75 isolation warnings are cleared.
 9. **`.qwen3Asr`** routes to the Parakeet provider with no Qwen-specific code. Implement it or hide it.
