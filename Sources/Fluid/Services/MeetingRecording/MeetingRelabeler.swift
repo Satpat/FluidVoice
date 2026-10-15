@@ -14,6 +14,10 @@ enum MeetingRelabeler {
         let clean = map.filter { !$0.key.isEmpty && !$0.value.isEmpty && $0.key != $0.value }
         guard !clean.isEmpty else { return false }
 
+        let folderName = folder.lastPathComponent
+        guard MeetingFolderActivity.shared.begin(folderName) else { return false }
+        defer { MeetingFolderActivity.shared.end(folderName) }
+
         // 1) transcript.md — replace the "] <label>:" token on each line.
         let transcriptURL = folder.appendingPathComponent("transcript.md")
         var relabelledTranscript: String?
@@ -47,7 +51,7 @@ enum MeetingRelabeler {
         // 4) regenerate the summary from the relabelled transcript so names are
         //    reflected there too, then the title from that summary (best-effort).
         if let mergedText = relabelledTranscript ?? (try? String(contentsOf: transcriptURL, encoding: .utf8)),
-           let body = try? await MeetingTranscriptPipeline.generateSummaryBody(mergedText: Self.plainTranscript(mergedText)) {
+           let body = try? await MeetingTranscriptPipeline.generateSummaryBody(mergedText: MeetingTranscriptPipeline.plainTranscript(mergedText)) {
             try? MeetingTranscriptPipeline.writeSummary(body: body, displayName: folder.lastPathComponent, folder: folder)
 
             let startedAt = ISO8601DateFormatter.meetingFileSafe.date(from: folder.lastPathComponent)
@@ -78,14 +82,5 @@ enum MeetingRelabeler {
             return line
         }
         return updated.joined(separator: "\n")
-    }
-
-    /// Strip Markdown header/bold so the summary model sees plain lines.
-    private static func plainTranscript(_ markdown: String) -> String {
-        markdown
-            .components(separatedBy: "\n")
-            .filter { $0.contains("]") && $0.contains(":") }
-            .map { $0.replacingOccurrences(of: "**", with: "") }
-            .joined(separator: "\n")
     }
 }

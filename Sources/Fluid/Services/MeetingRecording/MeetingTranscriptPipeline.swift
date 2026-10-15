@@ -30,6 +30,23 @@ final class MeetingTranscriptPipeline: ObservableObject {
     @Published var summaryError: String?
     @Published var meetingTitle: String?
 
+    /// Session-folder name of the recording currently being processed by
+    /// this instance (nil when idle). Lets views tie progress UI to a
+    /// specific meeting row.
+    @Published var processingFolderName: String?
+
+    /// Shared instance for history re-transcribes. Sidebar navigation
+    /// recreates MeetingsView (and any @StateObject in it), so a per-view
+    /// pipeline loses its progress and button-disabling state mid-run;
+    /// the shared instance keeps them visible wherever the user navigates.
+    private static var sharedReprocessorInstance: MeetingTranscriptPipeline?
+    static func sharedReprocessor(asrService: ASRService) -> MeetingTranscriptPipeline {
+        if let existing = sharedReprocessorInstance { return existing }
+        let created = MeetingTranscriptPipeline(asrService: asrService)
+        sharedReprocessorInstance = created
+        return created
+    }
+
     private let asrService: ASRService
 
     /// Speaker label for the microphone track. The mic is provably the local
@@ -47,13 +64,21 @@ final class MeetingTranscriptPipeline: ObservableObject {
     /// into the session folder.
     @discardableResult
     func process(_ artifacts: MeetingRecordingArtifacts) async throws -> URL {
+        let folderName = artifacts.folder.lastPathComponent
+        guard MeetingFolderActivity.shared.begin(folderName) else {
+            throw MeetingRecordingError("This meeting is already being processed.")
+        }
+
         self.isProcessing = true
+        self.processingFolderName = folderName
         self.error = nil
         self.progress = 0.0
         let startTime = Date()
 
         defer {
+            MeetingFolderActivity.shared.end(folderName)
             isProcessing = false
+            processingFolderName = nil
             progress = 0.0
         }
 
@@ -158,6 +183,8 @@ final class MeetingTranscriptPipeline: ObservableObject {
             Self.writeTitle(titleLine, folder: artifacts.folder)
             self.meetingTitle = titleLine
 
+            Self.deleteAudioIfConfigured(artifacts)
+
             self.currentStatus = "Complete!"
             self.progress = 1.0
             self.transcriptURL = transcriptURL
@@ -165,6 +192,19 @@ final class MeetingTranscriptPipeline: ObservableObject {
         } catch {
             self.error = error.localizedDescription
             throw error
+        }
+    }
+
+    /// Delete a meeting's raw audio once it's been transcribed (and
+    /// best-effort summarised), if the user has that enabled. The transcript
+    /// and summary are kept; only system.wav/mic.wav go. Best-effort: a
+    /// failed delete doesn't fail the pipeline. This makes Re-transcribe
+    /// unavailable for the meeting going forward (see
+    /// MeetingReprocessor.artifacts, which checks the files still exist).
+    private static func deleteAudioIfConfigured(_ artifacts: MeetingRecordingArtifacts) {
+        guard SettingsStore.shared.deleteMeetingAudioAfterTranscription else { return }
+        for url in [artifacts.systemAudio, artifacts.microphone] {
+            try? FileManager.default.removeItem(at: url)
         }
     }
 
@@ -192,22 +232,18 @@ final class MeetingTranscriptPipeline: ObservableObject {
     }
 
     /// Generate the summary body (Markdown) from a merged transcript. Reused
-    /// by the pipeline and by in-place relabelling.
-    static func generateSummaryBody(mergedText: String) async throws -> String {
+    /// by the pipeline, in-place relabelling, and summary-only regeneration.
+    static func generateSummaryBody(
+        mergedText: String,
+        style: MeetingSummaryStyle = .current
+    ) async throws -> String {
         func systemPrompt(_ transcript: String) -> String {
             """
             You summarise meetings. Below is a machine-generated transcript of a meeting between \
             the user (labelled "Me") and the other participants (labelled "Them", or named/"Them 1"/\
             "Them 2"/... when individual speakers were distinguished); timestamps are \
             minutes:seconds from the start and the transcription may contain recognition errors — \
-            infer the intended meaning where obvious. Write a concise summary in Markdown with \
-            these sections, omitting any section with nothing to say:
-
-            ## Overview — 1-3 sentences on what the meeting was about.
-            ## Key points — bullet list of the substantive points discussed.
-            ## Decisions — bullet list of decisions reached.
-            ## Action items — bullet list; note who owns each when clear.
-            ## Open questions — bullet list of unresolved items.
+            infer the intended meaning where obvious. \(style.formatInstructions)
 
             Transcript:
             \(transcript)
@@ -215,7 +251,7 @@ final class MeetingTranscriptPipeline: ObservableObject {
         }
         let result = try await MeetingAIClient.completeAboutTranscript(
             transcript: mergedText,
-            turns: [MeetingAIClient.Turn(role: "user", content: "Summarise this meeting.")],
+            turns: [MeetingAIClient.Turn(role: "user", content: style.userPrompt)],
             systemPrompt: systemPrompt
         )
         let trimmed = result.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -229,6 +265,37 @@ final class MeetingTranscriptPipeline: ObservableObject {
         let summaryURL = folder.appendingPathComponent("summary.md")
         let document = "# Meeting summary — \(displayName)\n\n\(body)\n"
         try document.write(to: summaryURL, atomically: true, encoding: .utf8)
+    }
+
+    /// Regenerate summary.md for an already-processed meeting from its
+    /// transcript.md, without re-running transcription or diarization.
+    static func regenerateSummary(folder: URL, style: MeetingSummaryStyle = .current) async throws {
+        let folderName = folder.lastPathComponent
+        guard MeetingFolderActivity.shared.begin(folderName) else {
+            throw MeetingRecordingError("This meeting is already being processed.")
+        }
+        defer { MeetingFolderActivity.shared.end(folderName) }
+
+        let transcriptURL = folder.appendingPathComponent("transcript.md")
+        guard let markdown = try? String(contentsOf: transcriptURL, encoding: .utf8) else {
+            throw MeetingRecordingError("No transcript found for this meeting.")
+        }
+        let plain = Self.plainTranscript(markdown)
+        guard !plain.isEmpty else {
+            throw MeetingRecordingError("The transcript for this meeting is empty.")
+        }
+        let body = try await Self.generateSummaryBody(mergedText: plain, style: style)
+        try Self.writeSummary(body: body, displayName: folder.lastPathComponent, folder: folder)
+    }
+
+    /// Strip Markdown header/bold from transcript.md so the summary model
+    /// sees plain "[MM:SS] Speaker: ..." lines.
+    static func plainTranscript(_ markdown: String) -> String {
+        markdown
+            .components(separatedBy: "\n")
+            .filter { $0.contains("]") && $0.contains(":") }
+            .map { $0.replacingOccurrences(of: "**", with: "") }
+            .joined(separator: "\n")
     }
 
     // MARK: - Meeting title
@@ -284,7 +351,18 @@ final class MeetingTranscriptPipeline: ObservableObject {
 
         for (index, utterance) in utterances.enumerated() {
             let slice = Array(samples[utterance.startSample..<utterance.endSample])
-            let result = try await provider.transcribe(slice)
+            let result: ASRTranscriptionResult
+            do {
+                result = try await provider.transcribe(slice)
+            } catch {
+                // One bad utterance shouldn't abort a long recording's
+                // transcription — skip it and keep going.
+                DebugLogger.shared.warning(
+                    "Skipping unusable utterance (\(slice.count) samples): \(error.localizedDescription)",
+                    source: "MeetingTranscriptPipeline"
+                )
+                continue
+            }
             let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
             if !text.isEmpty {
                 segments.append(MeetingSegment(
@@ -378,8 +456,21 @@ final class MeetingTranscriptPipeline: ObservableObject {
     ) async -> SpeakerResolution {
         let result: DiarizationResult
         do {
+            // The offline (pyannote community-1) pipeline was tried here as a
+            // fix for cross-talk fragmenting one speaker into duplicate labels,
+            // since it clusters globally and excludes overlapping-speech
+            // frames from embedding extraction. Measured on an actual noisy
+            // single-mic room recording it was worse, not better: at every
+            // clustering threshold from 0.3 to 0.9 it collapsed the entire
+            // 38-minute, ~6-person conversation into one speaker. The
+            // streaming clusterer at least partially separates people; a
+            // slightly higher threshold (0.75 vs. the library default 0.7)
+            // measurably drops the smallest spurious clusters without yet
+            // triggering the same collapse (which starts around 0.8 on this
+            // recording).
+            let config = DiarizerConfig(clusteringThreshold: 0.75)
             let models = try await DiarizerModels.downloadIfNeeded()
-            let diarizer = DiarizerManager()
+            let diarizer = DiarizerManager(config: config)
             diarizer.initialize(models: models)
             defer { diarizer.cleanup() }
             result = try diarizer.performCompleteDiarization(samples, sampleRate: 16_000)
@@ -391,7 +482,19 @@ final class MeetingTranscriptPipeline: ObservableObject {
             return SpeakerResolution(segments: segments, embeddingByLabel: [:])
         }
 
-        let speakerSegments = result.segments
+        // Drop clusters that are almost certainly noise/cross-talk blips
+        // rather than a real speaker: on a real recording these consistently
+        // show up as one- or two-segment clusters totalling only a couple of
+        // seconds, regardless of clustering threshold. Left in, they mint a
+        // "Them N" identity that never actually gets assigned to any
+        // transcribed line (no utterance overlaps them enough to be
+        // "dominant"), so they only clutter speakers.json and the naming UI.
+        let minSpeakerDuration = 2.0
+        var durationById: [String: Double] = [:]
+        for segment in result.segments {
+            durationById[segment.speakerId, default: 0] += Double(segment.endTimeSeconds - segment.startTimeSeconds)
+        }
+        let speakerSegments = result.segments.filter { (durationById[$0.speakerId] ?? 0) >= minSpeakerDuration }
         let speakerIds = speakerSegments.map(\.speakerId)
         let distinctSpeakers = Set(speakerIds)
         guard !distinctSpeakers.isEmpty else {
@@ -624,9 +727,11 @@ final class MeetingTranscriptPipeline: ObservableObject {
             let paddedEnd = min(endSample, samples.count)
             if paddedEnd - start >= minUtteranceSamples {
                 // Hard-cap long utterances so single segments stay well under
-                // provider limits.
+                // provider limits. Stop cutting once the remainder would be
+                // shorter than the minimum utterance length, so the trailing
+                // chunk is never a sub-1s slice the ASR provider rejects.
                 var chunkStart = start
-                while paddedEnd - chunkStart > maxUtteranceSamples {
+                while paddedEnd - chunkStart > maxUtteranceSamples + minUtteranceSamples {
                     utterances.append(Utterance(startSample: chunkStart, endSample: chunkStart + maxUtteranceSamples))
                     chunkStart += maxUtteranceSamples
                 }

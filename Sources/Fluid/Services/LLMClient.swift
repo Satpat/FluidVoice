@@ -41,8 +41,17 @@ enum LLMError: Error, LocalizedError {
         case .timedOut:
             return "Network error: request timed out."
         case .cannotFindHost:
+            if let hostPort = Self.failingHostPort(of: urlError) {
+                return "Network error: could not find API host \(hostPort)."
+            }
             return "Network error: could not find API host."
         case .cannotConnectToHost:
+            if let hostPort = Self.failingHostPort(of: urlError) {
+                if Self.isPrivateHost(urlError) {
+                    return "Local AI server at \(hostPort) is not running. Start it (or check your provider under AI Enhancement), then try again."
+                }
+                return "Network error: could not connect to API host \(hostPort)."
+            }
             return "Network error: could not connect to API host."
         case .networkConnectionLost:
             return "Network error: connection dropped during the request."
@@ -51,6 +60,25 @@ enum LLMError: Error, LocalizedError {
         default:
             return "Network error: \(urlError.localizedDescription)"
         }
+    }
+
+    private static func failingURL(of urlError: URLError) -> URL? {
+        (urlError.userInfo[NSURLErrorFailingURLErrorKey] as? URL)
+            ?? urlError.failureURLString.flatMap { URL(string: $0) }
+    }
+
+    /// "host" or "host:port" of the URL that failed, for error messages.
+    private static func failingHostPort(of urlError: URLError) -> String? {
+        guard let url = self.failingURL(of: urlError), let host = url.host else { return nil }
+        guard let port = url.port else { return host }
+        return "\(host):\(port)"
+    }
+
+    /// Whether the failed request targeted a loopback/private-network host,
+    /// i.e. a local LLM server the user runs themselves.
+    private static func isPrivateHost(_ urlError: URLError) -> Bool {
+        guard let urlString = self.failingURL(of: urlError)?.absoluteString else { return false }
+        return LLMClient.isLocalEndpoint(urlString)
     }
 }
 
@@ -71,7 +99,10 @@ final class LLMClient {
     private init() {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = Self.defaultTimeoutSeconds
-        config.timeoutIntervalForResource = Self.defaultTimeoutSeconds * 2 // Allow extra time for resource loading
+        // Resource timeout is session-wide and CANNOT be overridden by
+        // request.timeoutInterval, so it must exceed the largest per-request
+        // timeout any caller configures (meeting summaries use 180s).
+        config.timeoutIntervalForResource = 600
         self.session = URLSession(configuration: config)
     }
 
@@ -951,7 +982,7 @@ final class LLMClient {
     }
 
     /// Check if a URL is a local/private endpoint
-    private func isLocalEndpoint(_ urlString: String) -> Bool {
+    nonisolated static func isLocalEndpoint(_ urlString: String) -> Bool {
         guard let url = URL(string: urlString),
               let host = url.host else { return false }
 

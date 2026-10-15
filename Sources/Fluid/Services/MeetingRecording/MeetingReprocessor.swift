@@ -17,13 +17,19 @@ enum MeetingReprocessor {
     static let reprocessAllOnLaunchKey = "MeetAIReprocessAllOnLaunch"
 
     /// Reconstruct artifacts from a session folder. Prefers session.json;
-    /// falls back to the conventional file names when it is absent.
+    /// falls back to the conventional file names when it is absent. Returns
+    /// nil if the audio files it points to don't actually exist on disk —
+    /// e.g. deleted after transcription — even when session.json itself is
+    /// still present, since the manifest alone doesn't guarantee the audio
+    /// it describes still does.
     static func artifacts(inFolder folder: URL) -> MeetingRecordingArtifacts? {
         let manifestURL = folder.appendingPathComponent("session.json")
         if let data = try? Data(contentsOf: manifestURL) {
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601
             if let artifacts = try? decoder.decode(MeetingRecordingArtifacts.self, from: data) {
+                guard FileManager.default.fileExists(atPath: artifacts.systemAudio.path),
+                      FileManager.default.fileExists(atPath: artifacts.microphone.path) else { return nil }
                 return artifacts
             }
         }

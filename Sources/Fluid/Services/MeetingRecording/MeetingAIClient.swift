@@ -57,10 +57,23 @@ enum MeetingAIClient {
         turns: [Turn],
         systemPrompt: (String) -> String
     ) async throws -> String {
-        var budgetTokens = Self.contextBudgetTokens(for: Self.resolveProvider())
+        let resolvedProvider = Self.resolveProvider()
+        var budgetTokens = Self.contextBudgetTokens(for: resolvedProvider)
         let overheadTokens = Self.approxTokens(systemPrompt(""))
             + turns.reduce(0) { $0 + Self.approxTokens($1.content) }
             + 1024 // response reserve
+
+        // Local/custom endpoints (llama-server, Ollama, ...) don't advertise
+        // a real context limit up front — the starting budget above is an
+        // optimistic "unbounded" guess and the true window is only learned
+        // from a "too long" error. Give those far more halvings to actually
+        // converge on it: a long transcript against a small real window (a
+        // few thousand tokens) can need many more than 3 halvings. Local
+        // retries are free and fast, so this only costs latency. Paid remote
+        // providers stay capped at a few tries so a persistently-overflowing
+        // prompt doesn't rack up API calls.
+        let isLocal = ModelRepository.shared.isLocalEndpoint(resolvedProvider.baseURL)
+        let maxAttempts = isLocal ? 20 : 4
 
         var attempt = 0
         while true {
@@ -75,8 +88,12 @@ enum MeetingAIClient {
                     || message.contains("too long")
                     || message.contains("maximum length")
                     || message.contains("token limit")
-                guard isContextOverflow, attempt < 4, transcriptBudget > 512 else { throw error }
-                budgetTokens /= 2
+                guard isContextOverflow, attempt < maxAttempts, transcriptBudget > 512 else { throw error }
+                // Halve what was actually sent, not the abstract budget — the
+                // effectively-unbounded starting budget would otherwise stay
+                // above the transcript size for every allowed attempt and the
+                // same oversized prompt would be re-sent verbatim.
+                budgetTokens = min(budgetTokens, overheadTokens + Self.approxTokens(fitted)) / 2
             }
         }
     }
@@ -116,6 +133,20 @@ enum MeetingAIClient {
             messages.append(["role": turn.role, "content": turn.content])
         }
 
+        // Mirror CommandModeService/RewriteModeService: forward the user's
+        // configured reasoning_effort (or equivalent) for this model, e.g.
+        // "medium" thinking on a gpt-5.x model. Without this, meeting
+        // summaries silently ignored the setting entirely.
+        let reasoningConfig = SettingsStore.shared.getReasoningConfig(forModel: resolved.model, provider: resolved.providerID)
+        var extraParams: [String: Any] = [:]
+        if let rConfig = reasoningConfig, rConfig.isEnabled {
+            if rConfig.parameterName == "enable_thinking" {
+                extraParams = [rConfig.parameterName: rConfig.parameterValue == "true"]
+            } else {
+                extraParams = [rConfig.parameterName: rConfig.parameterValue]
+            }
+        }
+
         var config = LLMClient.Config(
             messages: messages,
             model: resolved.model,
@@ -124,7 +155,7 @@ enum MeetingAIClient {
             streaming: false,
             tools: [],
             temperature: SettingsStore.shared.isTemperatureUnsupported(resolved.model) ? nil : 0.3,
-            extraParameters: [:]
+            extraParameters: extraParams
         )
         config.timeoutSeconds = 180
 

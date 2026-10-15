@@ -54,6 +54,12 @@ case "${PROFILE}" in
         fi
         rm -rf /Applications/FluidVoice.app
         ditto "${APP_PATH}" /Applications/FluidVoice.app
+        # ditto preserves the source bundle's timestamps, and the top-level
+        # .app folder's mtime doesn't bump on incremental rebuilds (only its
+        # direct child, Contents/, exists already) — so without this, Finder
+        # keeps showing whatever date the bundle folder was first created,
+        # not the last install.
+        touch /Applications/FluidVoice.app
         echo "Installed /Applications/FluidVoice.app"
         ;;
     fi|private|dev|full)

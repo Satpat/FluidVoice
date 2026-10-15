@@ -36,8 +36,11 @@ struct MeetingRecorderCard: View {
     }
 
     private func stopRecording() {
-        self.session.stop()
+        let artifacts = self.session.stop()
         Task { await MeetingLiveTranscriber.shared.finish() }
+        if let artifacts {
+            self.transcribe(artifacts)
+        }
     }
 
     var body: some View {
@@ -204,8 +207,10 @@ struct MeetingRecorderCard: View {
                     .disabled(self.pipeline.isProcessing)
                 }
 
-                Button("Show in Finder") {
-                    NSWorkspace.shared.activateFileViewerSelecting([artifacts.systemAudio, artifacts.microphone])
+                if FileManager.default.fileExists(atPath: artifacts.systemAudio.path) {
+                    Button("Show in Finder") {
+                        NSWorkspace.shared.activateFileViewerSelecting([artifacts.systemAudio, artifacts.microphone])
+                    }
                 }
 
                 Button("New Recording") {
@@ -261,7 +266,7 @@ struct MeetingRecorderCard: View {
                     }
 
                     ScrollView {
-                        Text(LocalizedStringKey(summary))
+                        MarkdownText(markdown: summary)
                             .font(.callout)
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)

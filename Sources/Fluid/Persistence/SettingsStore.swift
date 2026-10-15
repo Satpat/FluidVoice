@@ -1303,6 +1303,23 @@ final class SettingsStore: ObservableObject {
         }
     }
 
+    /// Delete a meeting's raw audio (system.wav/mic.wav) once it has been
+    /// fully transcribed and summarised (default: ON). The transcript and
+    /// summary are kept; deleting the audio saves disk space but permanently
+    /// removes the ability to Re-transcribe that meeting later, since
+    /// Re-transcribe re-runs ASR/diarization on the original audio.
+    var deleteMeetingAudioAfterTranscription: Bool {
+        get {
+            let value = self.defaults.object(forKey: Keys.deleteMeetingAudioAfterTranscription)
+            if value == nil { return true }
+            return self.defaults.bool(forKey: Keys.deleteMeetingAudioAfterTranscription)
+        }
+        set {
+            objectWillChange.send()
+            self.defaults.set(newValue, forKey: Keys.deleteMeetingAudioAfterTranscription)
+        }
+    }
+
     /// Anonymous analytics toggle (default: ON). Uses default-true semantics so existing installs
     /// upgrading to a version that includes analytics do not silently default to OFF.
     var shareAnonymousAnalytics: Bool {
@@ -4439,6 +4456,7 @@ private extension SettingsStore {
     enum Keys {
         static let enableAIProcessing = "EnableAIProcessing"
         static let showMainWindowAtLoginLaunch = "ShowMainWindowAtLoginLaunch"
+        static let deleteMeetingAudioAfterTranscription = "DeleteMeetingAudioAfterTranscription"
         static let dictationPromptOff = "DictationPromptOff"
         static let enableDebugLogs = "EnableDebugLogs"
         static let availableAIModels = "AvailableAIModels"

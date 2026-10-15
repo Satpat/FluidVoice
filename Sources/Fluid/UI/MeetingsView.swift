@@ -8,15 +8,24 @@ struct MeetingsView: View {
     let asrService: ASRService
     @ObservedObject private var fileHistoryStore = FileTranscriptionHistoryStore.shared
     @State private var expandedEntryID: FileTranscriptionEntry.ID?
-    @StateObject private var reprocessPipeline: MeetingTranscriptPipeline
+    // Shared instance: sidebar navigation recreates this view, and a
+    // per-view pipeline mid-run would leave the fresh view showing no
+    // progress with Re-transcribe re-enabled — inviting a duplicate run.
+    @ObservedObject private var reprocessPipeline: MeetingTranscriptPipeline
     @ObservedObject private var speakerStore = SpeakerProfileStore.shared
-    @State private var reprocessingFolder: String?
+    // Ground truth for button-disable state: shared across process()/
+    // regenerateSummary()/relabel() so it can't go stale on view recreation
+    // (see MeetingFolderActivity).
+    @ObservedObject private var folderActivity = MeetingFolderActivity.shared
     @State private var speakerNameInputs: [String: String] = [:]
+    @State private var summarizingFolder: String?
+    @State private var summaryErrorsByFolder: [String: String] = [:]
+    @AppStorage(MeetingSummaryStyle.defaultsKey) private var summaryStyleID = MeetingSummaryStyle.standard.rawValue
     @Environment(\.theme) private var theme
 
     init(asrService: ASRService) {
         self.asrService = asrService
-        _reprocessPipeline = StateObject(wrappedValue: MeetingTranscriptPipeline(asrService: asrService))
+        _reprocessPipeline = ObservedObject(wrappedValue: MeetingTranscriptPipeline.sharedReprocessor(asrService: asrService))
     }
 
     /// Meeting transcripts are stored in the shared file-transcription
@@ -143,7 +152,7 @@ struct MeetingsView: View {
                             .textFieldStyle(.roundedBorder)
                         Button("Save & apply") { self.nameSpeaker(entry: entry, label: label) }
                             .disabled(
-                                self.reprocessPipeline.isProcessing
+                                self.folderActivity.isBusy(self.folderName(for: entry))
                                     || (self.speakerNameInputs[self.nameKey(entry, label)] ?? "")
                                     .trimmingCharacters(in: .whitespaces).isEmpty
                             )
@@ -192,19 +201,33 @@ struct MeetingsView: View {
         }
 
         self.speakerNameInputs[key] = nil
-        self.reprocessingFolder = self.folderName(for: entry)
         Task {
-            defer { self.reprocessingFolder = nil }
             await MeetingRelabeler.relabel(folder: folder, historyEntryID: entry.id, map: [label: name])
+        }
+    }
+
+    /// Regenerate summary.md only, from the existing transcript, with the
+    /// currently selected summary style — much cheaper than Re-transcribe.
+    private func regenerateSummary(entry: FileTranscriptionEntry) {
+        let folder = self.recordingFolder(for: entry)
+        let folderName = self.folderName(for: entry)
+        self.summarizingFolder = folderName
+        self.summaryErrorsByFolder[folderName] = nil
+        Task {
+            defer { self.summarizingFolder = nil }
+            do {
+                try await MeetingTranscriptPipeline.regenerateSummary(folder: folder)
+            } catch {
+                self.summaryErrorsByFolder[folderName] = error.localizedDescription
+                DebugLogger.shared.error("Summary regeneration failed: \(error)", source: "MeetingsView")
+            }
         }
     }
 
     private func reprocess(entry: FileTranscriptionEntry) {
         let folder = self.recordingFolder(for: entry)
         guard let artifacts = MeetingReprocessor.artifacts(inFolder: folder) else { return }
-        self.reprocessingFolder = self.folderName(for: entry)
         Task {
-            defer { self.reprocessingFolder = nil }
             do {
                 _ = try await self.reprocessPipeline.process(artifacts)
             } catch {
@@ -266,11 +289,42 @@ struct MeetingsView: View {
 
                 self.nameSpeakersSection(entry: entry)
 
-                if self.reprocessingFolder == self.folderName(for: entry), self.reprocessPipeline.isProcessing {
+                if self.reprocessPipeline.processingFolderName == self.folderName(for: entry) {
                     VStack(alignment: .leading, spacing: 6) {
                         ProgressView(value: self.reprocessPipeline.progress)
                             .progressViewStyle(.linear)
                         Text(self.reprocessPipeline.currentStatus)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    .padding(.horizontal, 12)
+                }
+
+                if self.summarizingFolder == self.folderName(for: entry) {
+                    HStack(spacing: 6) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Summarising (\(MeetingSummaryStyle.current.displayName))...")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    .padding(.horizontal, 12)
+                } else if let summaryError = self.summaryErrorsByFolder[self.folderName(for: entry)] {
+                    Text("Summary failed: \(summaryError)")
+                        .font(.caption)
+                        .foregroundColor(.orange)
+                        .padding(.horizontal, 12)
+                } else if self.folderActivity.isBusy(self.folderName(for: entry)),
+                          self.reprocessPipeline.processingFolderName != self.folderName(for: entry) {
+                    // Fallback for operations with no dedicated progress text
+                    // (rename), and for one resumed after this view was
+                    // recreated mid-run (the specific instance/@State above
+                    // reset, but the shared busy flag didn't). Excludes
+                    // reprocessing, which already has its own block above.
+                    HStack(spacing: 6) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Working...")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
@@ -293,10 +347,29 @@ struct MeetingsView: View {
                     Button(action: { self.reprocess(entry: entry) }) {
                         Label("Re-transcribe", systemImage: "arrow.clockwise")
                     }
-                    .disabled(self.reprocessPipeline.isProcessing || !self.canReprocess(entry))
+                    .disabled(self.folderActivity.isBusy(self.folderName(for: entry)) || !self.canReprocess(entry))
                     .help(self.canReprocess(entry)
                         ? "Re-run transcription, speaker labels, and summary with the current pipeline"
                         : "Original audio for this meeting was not found")
+                    Menu {
+                        Picker("Style", selection: self.$summaryStyleID) {
+                            ForEach(MeetingSummaryStyle.allCases) { style in
+                                Text(style.displayName).tag(style.rawValue)
+                            }
+                        }
+                        Divider()
+                        Button(action: { self.regenerateSummary(entry: entry) }) {
+                            Label("Regenerate summary", systemImage: "arrow.clockwise")
+                        }
+                    } label: {
+                        Label("Summarise", systemImage: "sparkles")
+                    }
+                    .fixedSize()
+                    .disabled(
+                        self.folderActivity.isBusy(self.folderName(for: entry))
+                            || self.summarizingFolder == self.folderName(for: entry)
+                    )
+                    .help("Regenerate this meeting's summary from its transcript with the selected style")
                     Spacer()
                     Button(action: {
                         NSPasteboard.general.clearContents()

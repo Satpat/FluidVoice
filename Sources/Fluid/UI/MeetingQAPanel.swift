@@ -114,7 +114,7 @@ struct MeetingQAPanel: View {
                 .font(.caption2)
                 .fontWeight(.semibold)
                 .foregroundColor(message.role == .user ? Color.fluidGreen : .secondary)
-            Text(message.text)
+            MarkdownText(markdown: message.text)
                 .font(.callout)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
