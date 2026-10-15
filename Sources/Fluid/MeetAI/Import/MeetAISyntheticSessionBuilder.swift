@@ -137,6 +137,7 @@ nonisolated enum MeetAISyntheticSessionBuilder {
                 throw BuildError.writeFailed(error.localizedDescription)
             }
             let data = try Data(contentsOf: url)
+            let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
             chunks.append(MeetingAudioChunk(
                 id: UUID(),
                 sequence: sequence,
@@ -144,14 +145,14 @@ nonisolated enum MeetAISyntheticSessionBuilder {
                 presentationStart: self.milliseconds(Double(offset) / self.sampleRate),
                 presentationEnd: self.milliseconds(Double(end) / self.sampleRate),
                 discontinuities: [],
-                sha256: SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined(),
+                sha256: hash,
                 byteCount: Int64(data.count),
                 finalizationState: .finalized,
                 audioSchemaVersion: 2,
                 captureAnalysisAsset: MeetingAudioAsset(
                     role: .captureAnalysis, encoding: .linearPCMFloat32CAFV1, presence: .ready,
                     relativeFilePath: relativePath, byteCount: Int64(data.count),
-                    sha256: SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined(),
+                    sha256: hash,
                     sampleRate: self.sampleRate, channelCount: 1, frameCount: Int64(end - offset)
                 )
             ))
@@ -159,6 +160,12 @@ nonisolated enum MeetAISyntheticSessionBuilder {
             sequence += 1
         }
         return chunks
+    }
+
+    /// `writeChunks` off the caller's actor: an hour of audio is hundreds of MB to write and hash,
+    /// which must not run on the main actor (spec §5.5).
+    @concurrent static func writeChunksAsync(samples: [Float], kind: MeetingAudioTrackKind, sessionDirectory: URL) async throws -> [MeetingAudioChunk] {
+        try self.writeChunks(samples: samples, kind: kind, sessionDirectory: sessionDirectory)
     }
 
     static func attach(

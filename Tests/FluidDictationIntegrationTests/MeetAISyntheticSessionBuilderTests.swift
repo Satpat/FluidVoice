@@ -52,6 +52,15 @@ final class MeetAISyntheticSessionBuilderTests: XCTestCase {
         XCTAssertEqual(Double(decoded.count), 10 * 16_000, accuracy: 64)
     }
 
+    func testWriteChunksAsyncMatchesSyncOutput() async throws {
+        let samples = self.sine(seconds: 70)
+        let syncChunks = try MeetAISyntheticSessionBuilder.writeChunks(samples: samples, kind: .microphone, sessionDirectory: try self.tempDirectory())
+        let asyncChunks = try await MeetAISyntheticSessionBuilder.writeChunksAsync(samples: samples, kind: .microphone, sessionDirectory: try self.tempDirectory())
+        XCTAssertEqual(asyncChunks.map(\.sha256), syncChunks.map(\.sha256))
+        XCTAssertEqual(asyncChunks.map(\.relativeFilePath), syncChunks.map(\.relativeFilePath))
+        XCTAssertEqual(asyncChunks.map(\.captureAnalysisAsset?.sha256), syncChunks.map(\.sha256))
+    }
+
     func testDecoderReadsARange() throws {
         let directory = try self.tempDirectory()
         let chunks = try MeetAISyntheticSessionBuilder.writeChunks(samples: self.sine(seconds: 5), kind: .microphone, sessionDirectory: directory)

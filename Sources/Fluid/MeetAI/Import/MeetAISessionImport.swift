@@ -21,7 +21,7 @@ enum MeetAISessionImport {
         do {
             let directory = try await store.sessionDirectory(for: session.id)
             for track in tracks {
-                let chunks = try MeetAISyntheticSessionBuilder.writeChunks(samples: track.samples, kind: track.kind, sessionDirectory: directory)
+                let chunks = try await MeetAISyntheticSessionBuilder.writeChunksAsync(samples: track.samples, kind: track.kind, sessionDirectory: directory)
                 MeetAISyntheticSessionBuilder.attach(chunks, kind: track.kind, echoProtection: track.echoProtection, to: &session)
             }
             try await store.save(session)
