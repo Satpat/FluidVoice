@@ -95,6 +95,12 @@ final class MeetAISessionProcessor: ObservableObject {
         if self.deps.settings.speakerMatching, let updated = await self.applyProfileMatches(session) {
             session = updated
         }
+        if self.deps.settings.autoName, let updated = await self.applyLLMNames(session) {
+            session = updated
+        }
+        if let updated = await self.applyTitle(session) {
+            session = updated
+        }
     }
 
     func handleCorrection(sessionID: MeetingSessionID) async {
@@ -109,6 +115,9 @@ final class MeetAISessionProcessor: ObservableObject {
                 }
             }
             try await self.deps.sidecars.saveSpeakers(records, for: sessionID)
+            if result.renamedSpeakers {
+                await self.refreshTitleAfterRename(sessionID: sessionID)
+            }
         } catch {
             DebugLogger.shared.warning("MeetAI correction handling failed: \(error.localizedDescription)", source: "MeetAI")
         }
@@ -152,6 +161,66 @@ final class MeetAISessionProcessor: ObservableObject {
     }
 
     // MARK: Helpers
+
+    func applyLLMNames(_ session: MeetingSession) async -> MeetingSession? {
+        let candidates = session.activeSpeakers.filter { !$0.isLocalUser && MeetAITranscript.isDefaultSpeakerName($0.displayName) }
+        guard !candidates.isEmpty, !MeetAITranscript.turns(for: session).isEmpty else { return nil }
+        let labels = Set(candidates.map(\.displayName))
+        let taken = Set(session.activeSpeakers.filter { !labels.contains($0.displayName) }.map { $0.displayName.lowercased() })
+        do {
+            let reply = try await self.deps.llm.completeAboutTranscript(
+                transcript: MeetAITranscript.text(for: session),
+                turns: [MeetAILLMTurn(role: "user", content: "Return the speaker-name JSON.")],
+                systemPrompt: MeetAISpeakerNamer.systemPrompt(labels: labels.sorted(), localLabel: MeetAITranscript.localUserLabel(in: session))
+            )
+            let parsed = MeetAISpeakerNamer.parseNameMap(from: reply, validLabels: labels)
+            let counts = Dictionary(grouping: parsed.values, by: { $0.lowercased() }).mapValues(\.count)
+            let map = parsed.filter { counts[$0.value.lowercased()] == 1 && !taken.contains($0.value.lowercased()) }
+            guard !map.isEmpty else { return nil }
+            var records = try await self.deps.sidecars.speakers(for: session.id)
+            var names: [SessionSpeakerID: String] = [:]
+            for speaker in candidates {
+                guard let name = map[speaker.displayName] else { continue }
+                names[speaker.id] = name
+                records[speaker.id, default: MeetAISpeakerRecord()].nameSource = .llm
+                records[speaker.id, default: MeetAISpeakerRecord()].lastAppliedName = name
+            }
+            try await self.deps.sidecars.saveSpeakers(records, for: session.id)
+            return try await self.mutate { try await $0.renameSpeakers(sessionID: session.id, names: names) }
+        } catch {
+            DebugLogger.shared.warning("MeetAI speaker naming skipped: \(error.localizedDescription)", source: "MeetAI")
+            return nil
+        }
+    }
+
+    func applyTitle(_ session: MeetingSession) async -> MeetingSession? {
+        do {
+            var meta = try await self.deps.sidecars.meta(for: session.id)
+            guard MeetAITitler.ownsTitle(session: session, meta: meta) else {
+                if meta.titleSource != .user {
+                    meta.titleSource = .user
+                    try await self.deps.sidecars.saveMeta(meta, for: session.id)
+                }
+                return nil
+            }
+            guard !MeetAITranscript.turns(for: session).isEmpty else { return nil }
+            let context = String(MeetAITranscript.text(for: session).prefix(4_000))
+            let raw = try await self.deps.llm.complete(systemPrompt: MeetAITitler.systemPrompt, turns: [MeetAILLMTurn(role: "user", content: context)])
+            guard let title = MeetAITitler.clean(raw), title != session.title else { return nil }
+            meta.titleSource = .llm
+            meta.lastLLMTitle = title
+            try await self.deps.sidecars.saveMeta(meta, for: session.id)
+            return try await self.mutate { try await $0.renameSession(sessionID: session.id, to: title) }
+        } catch {
+            DebugLogger.shared.warning("MeetAI title skipped: \(error.localizedDescription)", source: "MeetAI")
+            return nil
+        }
+    }
+
+    func refreshTitleAfterRename(sessionID: MeetingSessionID) async {
+        guard let session = await self.load(sessionID) else { return }
+        _ = await self.applyTitle(session)
+    }
 
     func load(_ id: MeetingSessionID) async -> MeetingSession? {
         do { return try await self.deps.loadSession(id) } catch { return nil }
