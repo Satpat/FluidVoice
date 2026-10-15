@@ -552,7 +552,7 @@ final class AIEnhancementSettingsViewModel: ObservableObject {
     }
 
     func isLocalEndpoint(_ urlString: String) -> Bool {
-        return ModelRepository.shared.isLocalEndpoint(urlString)
+        EndpointClassifier.isLocal(urlString)
     }
 
     func hasReasoningConfigForCurrentModel() -> Bool {
@@ -850,7 +850,6 @@ final class AIEnhancementSettingsViewModel: ObservableObject {
         // Build request body (different format for Anthropic)
         let requestDict: [String: Any]
         let provKey = self.providerKey(for: providerID)
-        let reasoningConfig = self.settings.getReasoningConfig(forModel: trimmedModel, provider: provKey)
 
         if usesResponsesAPI {
             var dict: [String: Any] = [
@@ -860,15 +859,7 @@ final class AIEnhancementSettingsViewModel: ObservableObject {
                 "max_output_tokens": 50,
             ]
 
-            if let config = reasoningConfig, config.isEnabled {
-                if config.parameterName == "reasoning_effort" {
-                    dict["reasoning"] = ["effort": config.parameterValue]
-                } else if config.parameterName == "enable_thinking" {
-                    dict[config.parameterName] = config.parameterValue == "true"
-                } else {
-                    dict[config.parameterName] = config.parameterValue
-                }
-            }
+            dict.merge(self.settings.reasoningExtraParameters(forModel: trimmedModel, provider: provKey, responsesAPI: true)) { $1 }
             requestDict = dict
         } else if isAnthropic {
             // Anthropic API format
@@ -891,13 +882,7 @@ final class AIEnhancementSettingsViewModel: ObservableObject {
                 dict["max_tokens"] = 50
             }
 
-            if let config = reasoningConfig, config.isEnabled {
-                if config.parameterName == "enable_thinking" {
-                    dict[config.parameterName] = config.parameterValue == "true"
-                } else {
-                    dict[config.parameterName] = config.parameterValue
-                }
-            }
+            dict.merge(self.settings.reasoningExtraParameters(forModel: trimmedModel, provider: provKey)) { $1 }
             requestDict = dict
         }
 

@@ -78,7 +78,7 @@ enum LLMError: Error, LocalizedError {
     /// i.e. a local LLM server the user runs themselves.
     private static func isPrivateHost(_ urlError: URLError) -> Bool {
         guard let urlString = self.failingURL(of: urlError)?.absoluteString else { return false }
-        return LLMClient.isLocalEndpoint(urlString)
+        return EndpointClassifier.isLocal(urlString)
     }
 }
 
@@ -95,14 +95,24 @@ final class LLMClient {
 
     /// URLSession configured with appropriate timeouts
     private let session: URLSession
+    /// For callers that raise `Config.timeoutSeconds` above the default (e.g.
+    /// meeting summaries, 180 s). A session's resource timeout caps every
+    /// request on it and can't be raised per request, so long requests get
+    /// their own session instead of loosening the cap for all dictation,
+    /// rewrite and command calls.
+    private lazy var longSession: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = Self.defaultTimeoutSeconds
+        config.timeoutIntervalForResource = Self.longResourceTimeoutSeconds
+        return URLSession(configuration: config)
+    }()
+
+    static let longResourceTimeoutSeconds: TimeInterval = 600
 
     private init() {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = Self.defaultTimeoutSeconds
-        // Resource timeout is session-wide and CANNOT be overridden by
-        // request.timeoutInterval, so it must exceed the largest per-request
-        // timeout any caller configures (meeting summaries use 180s).
-        config.timeoutIntervalForResource = 600
+        config.timeoutIntervalForResource = Self.defaultTimeoutSeconds * 2 // Allow extra time for resource loading
         self.session = URLSession(configuration: config)
     }
 
@@ -491,12 +501,18 @@ final class LLMClient {
         return input
     }
 
+    /// The shared session, or the long-resource one when the request asks
+    /// for a longer timeout than the shared session's resource cap allows.
+    private func session(for request: URLRequest) -> URLSession {
+        request.timeoutInterval > Self.defaultTimeoutSeconds ? self.longSession : self.session
+    }
+
     // MARK: - Non-Streaming Response
 
     private func processNonStreaming(request: URLRequest) async throws -> Response {
         DebugLogger.shared.debug("LLMClient: Making non-streaming request to \(request.url?.absoluteString ?? "unknown")", source: "LLMClient")
 
-        let (data, response) = try await self.session.data(for: request)
+        let (data, response) = try await self.session(for: request).data(for: request)
 
         if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
             let errText = String(data: data, encoding: .utf8) ?? "Unknown error"
@@ -525,7 +541,7 @@ final class LLMClient {
     private func processResponsesStreaming(request: URLRequest, config: Config) async throws -> Response {
         DebugLogger.shared.debug("LLMClient: Starting Responses streaming request to \(request.url?.absoluteString ?? "unknown")", source: "LLMClient")
 
-        let (bytes, response) = try await self.session.bytes(for: request)
+        let (bytes, response) = try await self.session(for: request).bytes(for: request)
 
         if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
             var errorData = Data()
@@ -628,7 +644,7 @@ final class LLMClient {
     private func processStreaming(request: URLRequest, config: Config) async throws -> Response {
         DebugLogger.shared.debug("LLMClient: Starting streaming request to \(request.url?.absoluteString ?? "unknown")", source: "LLMClient")
 
-        let (bytes, response) = try await self.session.bytes(for: request)
+        let (bytes, response) = try await self.session(for: request).bytes(for: request)
 
         // Check for HTTP errors
         if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
@@ -979,47 +995,6 @@ final class LLMClient {
         default:
             return false
         }
-    }
-
-    /// Check if a URL is a local/private endpoint
-    nonisolated static func isLocalEndpoint(_ urlString: String) -> Bool {
-        guard let url = URL(string: urlString),
-              let host = url.host else { return false }
-
-        let hostLower = host.lowercased()
-
-        // Localhost
-        if hostLower == "localhost" || hostLower == "127.0.0.1" {
-            return true
-        }
-
-        // 127.x.x.x
-        if hostLower.hasPrefix("127.") {
-            return true
-        }
-
-        // 10.x.x.x (Private Class A)
-        if hostLower.hasPrefix("10.") {
-            return true
-        }
-
-        // 192.168.x.x (Private Class C)
-        if hostLower.hasPrefix("192.168.") {
-            return true
-        }
-
-        // 172.16.x.x - 172.31.x.x (Private Class B)
-        if hostLower.hasPrefix("172.") {
-            let components = hostLower.split(separator: ".")
-            if components.count >= 2,
-               let secondOctet = Int(components[1]),
-               secondOctet >= 16 && secondOctet <= 31
-            {
-                return true
-            }
-        }
-
-        return false
     }
 
     // MARK: - Logging Helpers

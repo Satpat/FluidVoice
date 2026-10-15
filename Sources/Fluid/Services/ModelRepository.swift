@@ -137,21 +137,6 @@ final class ModelRepository {
         }
     }
 
-    /// Check if a URL represents a local endpoint (localhost, local IP)
-    func isLocalEndpoint(_ urlString: String) -> Bool {
-        guard let url = URL(string: urlString), let host = url.host else { return false }
-        let hostLower = host.lowercased()
-        if hostLower == "localhost" || hostLower == "127.0.0.1" { return true }
-        if hostLower.hasPrefix("127.") || hostLower.hasPrefix("10.") || hostLower.hasPrefix("192.168.") { return true }
-        if hostLower.hasPrefix("172.") {
-            let components = hostLower.split(separator: ".")
-            if components.count >= 2, let secondOctet = Int(components[1]), secondOctet >= 16 && secondOctet <= 31 {
-                return true
-            }
-        }
-        return false
-    }
-
     /// Returns the list of built-in providers for UI pickers
     /// - Parameter includeAppleIntelligence: Whether to include Apple Intelligence
     /// - Parameter appleIntelligenceAvailable: Whether Apple Intelligence is available on this device

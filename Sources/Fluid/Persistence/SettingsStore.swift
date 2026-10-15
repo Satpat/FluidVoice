@@ -1522,7 +1522,7 @@ final class SettingsStore: ObservableObject {
             baseURL = ModelRepository.shared.defaultBaseURL(for: providerID)
         }
 
-        let isLocal = ModelRepository.shared.isLocalEndpoint(baseURL)
+        let isLocal = EndpointClassifier.isLocal(baseURL)
 
         // 3. Check for API key and selected model
         let key = self.canonicalProviderKey(for: providerID)
@@ -2603,6 +2603,22 @@ final class SettingsStore: ObservableObject {
     }
 
     /// Get reasoning config for a specific model, with smart defaults for known models
+    /// Request-body parameters for the model's enabled reasoning config, e.g.
+    /// `["reasoning_effort": "low"]` or `["enable_thinking": true]` (DeepSeek
+    /// takes a boolean). Empty when reasoning is off for this model.
+    /// `responsesAPI` maps `reasoning_effort` to the OpenAI Responses API's
+    /// nested `reasoning: {effort:}` shape.
+    func reasoningExtraParameters(forModel model: String, provider: String, responsesAPI: Bool = false) -> [String: Any] {
+        guard let config = self.getReasoningConfig(forModel: model, provider: provider), config.isEnabled else { return [:] }
+        if responsesAPI, config.parameterName == "reasoning_effort" {
+            return ["reasoning": ["effort": config.parameterValue]]
+        }
+        if config.parameterName == "enable_thinking" {
+            return [config.parameterName: config.parameterValue == "true"]
+        }
+        return [config.parameterName: config.parameterValue]
+    }
+
     func getReasoningConfig(forModel model: String, provider: String) -> ModelReasoningConfig? {
         let key = "\(provider):\(model)"
 
@@ -3399,7 +3415,7 @@ final class SettingsStore: ObservableObject {
 
         let baseURL = self.providerBaseURLForVerification(for: trimmed)
         let apiKey = (self.getAPIKey(for: trimmed) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        guard ModelRepository.shared.isLocalEndpoint(baseURL) || !apiKey.isEmpty else { return false }
+        guard EndpointClassifier.isLocal(baseURL) || !apiKey.isEmpty else { return false }
 
         return self.providerFingerprint(baseURL: baseURL, apiKey: apiKey) == stored
     }

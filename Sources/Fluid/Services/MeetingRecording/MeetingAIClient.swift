@@ -58,13 +58,8 @@ enum MeetingAIClient {
         systemPrompt: (String) -> String
     ) async throws -> String {
         let resolvedProvider = Self.resolveProvider()
-        var budgetTokens = Self.contextBudgetTokens(for: resolvedProvider)
-        let overheadTokens = Self.approxTokens(systemPrompt(""))
-            + turns.reduce(0) { $0 + Self.approxTokens($1.content) }
-            + 1024 // response reserve
-
         // Local/custom endpoints (llama-server, Ollama, ...) don't advertise
-        // a real context limit up front — the starting budget above is an
+        // a real context limit up front — the starting budget is an
         // optimistic "unbounded" guess and the true window is only learned
         // from a "too long" error. Give those far more halvings to actually
         // converge on it: a long transcript against a small real window (a
@@ -72,8 +67,31 @@ enum MeetingAIClient {
         // retries are free and fast, so this only costs latency. Paid remote
         // providers stay capped at a few tries so a persistently-overflowing
         // prompt doesn't rack up API calls.
-        let isLocal = ModelRepository.shared.isLocalEndpoint(resolvedProvider.baseURL)
-        let maxAttempts = isLocal ? 20 : 4
+        let isLocal = EndpointClassifier.isLocal(resolvedProvider.baseURL)
+        return try await Self.completeFittingContext(
+            transcript: transcript,
+            turns: turns,
+            systemPrompt: systemPrompt,
+            startingBudgetTokens: Self.contextBudgetTokens(for: resolvedProvider),
+            maxAttempts: isLocal ? 20 : 4,
+            complete: { try await Self.complete(systemPrompt: $0, turns: $1) }
+        )
+    }
+
+    /// The trim-and-retry loop behind `completeAboutTranscript`, with the
+    /// completion call injected so the budget policy is testable.
+    static func completeFittingContext(
+        transcript: String,
+        turns: [Turn],
+        systemPrompt: (String) -> String,
+        startingBudgetTokens: Int,
+        maxAttempts: Int,
+        complete: (String, [Turn]) async throws -> String
+    ) async throws -> String {
+        var budgetTokens = startingBudgetTokens
+        let overheadTokens = Self.approxTokens(systemPrompt(""))
+            + turns.reduce(0) { $0 + Self.approxTokens($1.content) }
+            + 1024 // response reserve
 
         var attempt = 0
         while true {
@@ -81,14 +99,9 @@ enum MeetingAIClient {
             let transcriptBudget = max(512, budgetTokens - overheadTokens)
             let fitted = Self.trimmedTranscript(transcript, maxTokens: transcriptBudget)
             do {
-                return try await Self.complete(systemPrompt: systemPrompt(fitted), turns: turns)
+                return try await complete(systemPrompt(fitted), turns)
             } catch {
-                let message = error.localizedDescription.lowercased()
-                let isContextOverflow = message.contains("context")
-                    || message.contains("too long")
-                    || message.contains("maximum length")
-                    || message.contains("token limit")
-                guard isContextOverflow, attempt < maxAttempts, transcriptBudget > 512 else { throw error }
+                guard Self.isContextOverflow(error), attempt < maxAttempts, transcriptBudget > 512 else { throw error }
                 // Halve what was actually sent, not the abstract budget — the
                 // effectively-unbounded starting budget would otherwise stay
                 // above the transcript size for every allowed attempt and the
@@ -96,6 +109,15 @@ enum MeetingAIClient {
                 budgetTokens = min(budgetTokens, overheadTokens + Self.approxTokens(fitted)) / 2
             }
         }
+    }
+
+    /// Whether a provider error means the prompt exceeded its context window.
+    static func isContextOverflow(_ error: Error) -> Bool {
+        let message = error.localizedDescription.lowercased()
+        return message.contains("context")
+            || message.contains("too long")
+            || message.contains("maximum length")
+            || message.contains("token limit")
     }
 
     static func complete(systemPrompt: String, turns: [Turn]) async throws -> String {
@@ -117,7 +139,7 @@ enum MeetingAIClient {
         guard !resolved.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw MeetingRecordingError("No AI model selected. Configure one under AI Enhancement.")
         }
-        let isLocal = ModelRepository.shared.isLocalEndpoint(resolved.baseURL)
+        let isLocal = EndpointClassifier.isLocal(resolved.baseURL)
         if !isLocal, resolved.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             throw MeetingRecordingError("Missing API key for \(resolved.providerID). Configure it under AI Enhancement.")
         }
@@ -137,15 +159,7 @@ enum MeetingAIClient {
         // configured reasoning_effort (or equivalent) for this model, e.g.
         // "medium" thinking on a gpt-5.x model. Without this, meeting
         // summaries silently ignored the setting entirely.
-        let reasoningConfig = SettingsStore.shared.getReasoningConfig(forModel: resolved.model, provider: resolved.providerID)
-        var extraParams: [String: Any] = [:]
-        if let rConfig = reasoningConfig, rConfig.isEnabled {
-            if rConfig.parameterName == "enable_thinking" {
-                extraParams = [rConfig.parameterName: rConfig.parameterValue == "true"]
-            } else {
-                extraParams = [rConfig.parameterName: rConfig.parameterValue]
-            }
-        }
+        let extraParams = SettingsStore.shared.reasoningExtraParameters(forModel: resolved.model, provider: resolved.providerID)
 
         var config = LLMClient.Config(
             messages: messages,

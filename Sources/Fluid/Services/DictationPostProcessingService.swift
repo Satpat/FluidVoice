@@ -98,17 +98,12 @@ final class DictationPostProcessingService {
             throw AIProcessingError.missingModel(provider: resolved.providerKey)
         }
 
-        let isLocal = ModelRepository.shared.isLocalEndpoint(resolved.baseURL)
+        let isLocal = EndpointClassifier.isLocal(resolved.baseURL)
         if !isLocal, resolved.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             throw AIProcessingError.missingAPIKey(provider: resolved.providerKey)
         }
 
-        var extraParams: [String: Any] = [:]
-        if let config = settings.getReasoningConfig(forModel: resolved.model, provider: resolved.providerKey), config.isEnabled {
-            extraParams[config.parameterName] = config.parameterName == "enable_thinking"
-                ? (config.parameterValue == "true")
-                : config.parameterValue
-        }
+        let extraParams = settings.reasoningExtraParameters(forModel: resolved.model, provider: resolved.providerKey)
 
         var messages: [[String: Any]] = []
         if !systemPrompt.isEmpty {

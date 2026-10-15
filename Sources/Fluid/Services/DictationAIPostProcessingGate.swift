@@ -50,7 +50,7 @@ enum DictationAIPostProcessingGate {
 
         let baseURL = self.baseURL(for: providerID, settings: settings)
         let apiKey = (settings.getAPIKey(for: providerID) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        guard self.isLocalEndpoint(baseURL) || !apiKey.isEmpty else { return false }
+        guard EndpointClassifier.isLocal(baseURL) || !apiKey.isEmpty else { return false }
 
         return self.providerFingerprint(baseURL: baseURL, apiKey: apiKey) == storedFingerprint
     }
@@ -94,20 +94,4 @@ enum DictationAIPostProcessingGate {
             settings.selectedProviderID == PrivateAIProviderFeature.shared.providerID
     }
 
-    static func isLocalEndpoint(_ urlString: String) -> Bool {
-        guard let url = URL(string: urlString), let host = url.host else { return false }
-        let hostLower = host.lowercased()
-
-        if hostLower == "localhost" || hostLower == "127.0.0.1" { return true }
-        if hostLower.hasPrefix("127.") || hostLower.hasPrefix("10.") || hostLower.hasPrefix("192.168.") { return true }
-
-        if hostLower.hasPrefix("172.") {
-            let components = hostLower.split(separator: ".")
-            if components.count >= 2, let secondOctet = Int(components[1]), secondOctet >= 16 && secondOctet <= 31 {
-                return true
-            }
-        }
-
-        return false
-    }
 }

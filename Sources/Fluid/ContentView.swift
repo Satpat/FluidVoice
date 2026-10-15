@@ -1943,7 +1943,7 @@ struct ContentView: View {
         }
 
         // Skip API key validation for local endpoints
-        let isLocal = self.isLocalEndpoint(derivedBaseURL)
+        let isLocal = EndpointClassifier.isLocal(derivedBaseURL)
         let apiKey = storedProviderAPIKeys[derivedCurrentProvider] ?? ""
 
         if !isLocal {
@@ -1992,22 +1992,9 @@ struct ContentView: View {
         // Get reasoning config for this model (uses per-model settings or auto-detection)
         // This handles custom parameters like reasoning_effort, enable_thinking, etc.
         let providerKey = self.providerKey(for: currentSelectedProviderID)
-        let reasoningConfig = SettingsStore.shared.getReasoningConfig(forModel: derivedSelectedModel, provider: providerKey)
-
-        // Build extra parameters from reasoning config
-        var extraParams: [String: Any] = [:]
-        if let config = reasoningConfig, config.isEnabled {
-            if config.parameterName == "enable_thinking" {
-                // DeepSeek uses boolean
-                extraParams = [config.parameterName: config.parameterValue == "true"]
-            } else {
-                // OpenAI/Groq use string values (reasoning_effort, etc.)
-                extraParams = [config.parameterName: config.parameterValue]
-            }
-            DebugLogger.shared.debug(
-                "Added reasoning param: \(config.parameterName)=\(config.parameterValue)",
-                source: "ContentView"
-            )
+        let extraParams = SettingsStore.shared.reasoningExtraParameters(forModel: derivedSelectedModel, provider: providerKey)
+        if !extraParams.isEmpty {
+            DebugLogger.shared.debug("Added reasoning params: \(extraParams)", source: "ContentView")
         }
 
         // Build messages array. For dictation enhancement the whole prompt +
@@ -3622,10 +3609,6 @@ extension ContentView {
             properties["override_empty"] = overrideEmpty
         }
         return properties
-    }
-
-    private func isLocalEndpoint(_ urlString: String) -> Bool {
-        ModelRepository.shared.isLocalEndpoint(urlString)
     }
 
     private func currentDictationShortcutSlot(for mode: ActiveRecordingMode) -> SettingsStore.DictationShortcutSlot? {
