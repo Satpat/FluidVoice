@@ -101,6 +101,37 @@ final class MeetAISessionProcessor: ObservableObject {
         if let updated = await self.applyTitle(session) {
             session = updated
         }
+        if self.deps.settings.autoSummarize {
+            await self.generateSummaryIfMissing(session)
+        }
+    }
+
+    func generateSummaryIfMissing(_ session: MeetingSession) async {
+        do {
+            guard try await self.deps.sidecars.summary(for: session.id) == nil else { return }
+        } catch {
+            return
+        }
+        await self.writeSummary(session, style: self.deps.settings.summaryStyle)
+    }
+
+    /// Summary tab's Generate/Regenerate. Runs in the session's queue.
+    func regenerateSummary(sessionID: MeetingSessionID, style: MeetAISummaryStyle) async {
+        await self.enqueue(sessionID) { processor in
+            guard let session = await processor.load(sessionID) else { return }
+            await processor.writeSummary(session, style: style)
+        }.value
+    }
+
+    private func writeSummary(_ session: MeetingSession, style: MeetAISummaryStyle) async {
+        do {
+            let record = try await MeetAISummarizer.generate(session: session, style: style, llm: self.deps.llm)
+            try await self.deps.sidecars.saveSummary(record, for: session.id)
+            self.summaryErrors[session.id] = nil
+        } catch {
+            self.summaryErrors[session.id] = error.localizedDescription
+            DebugLogger.shared.warning("MeetAI summary failed: \(error.localizedDescription)", source: "MeetAI")
+        }
     }
 
     func handleCorrection(sessionID: MeetingSessionID) async {

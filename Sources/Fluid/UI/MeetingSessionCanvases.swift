@@ -438,7 +438,8 @@ struct MeetingResultCanvas: View {
                 }
 
                 if self.documentSection == .summary {
-                    MeetingSummaryView(session: self.session, asrService: self.summaryASRService, isQuiescent: self.isQuiescent)
+                    // MeetAI H2: summaries through the user's AI provider (spec §6.4).
+                    MeetAISummaryView(session: self.session)
                         .id("\(self.session.id)-\(self.session.updatedAt)")
                 } else {
                     if !activeSpeakers.isEmpty {
