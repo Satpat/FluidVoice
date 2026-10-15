@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		F6FD0650C1A04388F3C2F92B /* DictationAIProcessorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A74CFC2AB9DD387F8C1F58B3 /* DictationAIProcessorTests.swift */; };
 		2326D458EE90D9A5E61D4805 /* FluidAudioSmokeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B65D9DC15CA71973B74330FB /* FluidAudioSmokeTests.swift */; };
 		0C42B7FA03A6EC05386972E2 /* LLMHelpersTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C74FBAA05F53C779EA93A8C9 /* LLMHelpersTests.swift */; };
 		48222D396085EA66BF805CC4 /* MarkdownTextTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AFC5A5E1473CFCEC3A2BCA95 /* MarkdownTextTests.swift */; };
@@ -36,6 +37,7 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		A74CFC2AB9DD387F8C1F58B3 /* DictationAIProcessorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DictationAIProcessorTests.swift; sourceTree = "<group>"; };
 		B65D9DC15CA71973B74330FB /* FluidAudioSmokeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FluidAudioSmokeTests.swift; sourceTree = "<group>"; };
 		C74FBAA05F53C779EA93A8C9 /* LLMHelpersTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LLMHelpersTests.swift; sourceTree = "<group>"; };
 		AFC5A5E1473CFCEC3A2BCA95 /* MarkdownTextTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownTextTests.swift; sourceTree = "<group>"; };
@@ -118,6 +120,7 @@
 				7C91B0022F42AA0100C0DEF0 /* HotkeyShortcutTests.swift */,
 				343B29013F4441D6A797D12D /* LLMClientRequestBodyTests.swift */,
 				980330F3CE464336ADCE3E23 /* TemperatureSupportTests.swift */,
+				A74CFC2AB9DD387F8C1F58B3 /* DictationAIProcessorTests.swift */,
 				B65D9DC15CA71973B74330FB /* FluidAudioSmokeTests.swift */,
 				C74FBAA05F53C779EA93A8C9 /* LLMHelpersTests.swift */,
 				AFC5A5E1473CFCEC3A2BCA95 /* MarkdownTextTests.swift */,
@@ -278,6 +281,7 @@
 				7C91B0012F42AA0100C0DEF0 /* HotkeyShortcutTests.swift in Sources */,
 				86CAA2D4EF18433096185602 /* LLMClientRequestBodyTests.swift in Sources */,
 				272BFB5CB271489892CAE50C /* TemperatureSupportTests.swift in Sources */,
+				F6FD0650C1A04388F3C2F92B /* DictationAIProcessorTests.swift in Sources */,
 				2326D458EE90D9A5E61D4805 /* FluidAudioSmokeTests.swift in Sources */,
 				0C42B7FA03A6EC05386972E2 /* LLMHelpersTests.swift in Sources */,
 				48222D396085EA66BF805CC4 /* MarkdownTextTests.swift in Sources */,
