@@ -22,8 +22,8 @@ final class MeetAISpeakerTests: XCTestCase {
     func testEnrollUpdatesByNameAndPersistsForkFormat() throws {
         let file = try MeetAIFixtures.tempDirectory(self).appendingPathComponent("SpeakerProfiles/profiles.json")
         let store = MeetAISpeakerProfileStore(fileURL: file)
-        let first = store.enroll(name: "Sam", embedding: self.vector(0.1))
-        let second = store.enroll(name: " sam ", embedding: self.vector(0.12))
+        let first = try XCTUnwrap(store.enroll(name: "Sam", embedding: self.vector(0.1)))
+        let second = try XCTUnwrap(store.enroll(name: " sam ", embedding: self.vector(0.12)))
         XCTAssertEqual(first.id, second.id)
         XCTAssertEqual(store.profiles.count, 1)
         XCTAssertEqual(store.profiles[0].sampleCount, 2)
@@ -31,6 +31,33 @@ final class MeetAISpeakerTests: XCTestCase {
         XCTAssertEqual(reloaded.profiles, store.profiles)
         let json = try String(contentsOf: file, encoding: .utf8)
         XCTAssertTrue(json.contains("\"sampleCount\""))
+    }
+
+    func testEnrollRejectsInvalidInputWithoutChange() throws {
+        let file = try MeetAIFixtures.tempDirectory(self).appendingPathComponent("profiles.json")
+        let store = MeetAISpeakerProfileStore(fileURL: file)
+        let original = try XCTUnwrap(store.enroll(name: "Sam", embedding: self.vector(0.1)))
+        XCTAssertNil(store.enroll(name: "  ", embedding: self.vector(0.1)))
+        XCTAssertNil(store.enroll(name: "Sam", embedding: []))
+        XCTAssertNil(store.enroll(name: "Sam", embedding: self.vector(0.1, dims: 128)))
+        XCTAssertNil(store.enroll(name: "New", embedding: self.vector(0.1, dims: 128)))
+        var nonFinite = self.vector(0.1)
+        nonFinite[3] = .nan
+        XCTAssertNil(store.enroll(name: "Sam", embedding: nonFinite))
+        XCTAssertEqual(store.profiles, [original])
+    }
+
+    func testCorruptProfilesFileIsMovedAsideNotOverwritten() throws {
+        let dir = try MeetAIFixtures.tempDirectory(self)
+        let file = dir.appendingPathComponent("profiles.json")
+        let junk = Data("{ not json".utf8)
+        try junk.write(to: file)
+        let store = MeetAISpeakerProfileStore(fileURL: file)
+        XCTAssertTrue(store.profiles.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
+        let aside = try FileManager.default.contentsOfDirectory(atPath: dir.path).filter { $0.hasPrefix("profiles.json.unreadable-") }
+        XCTAssertEqual(aside.count, 1)
+        XCTAssertEqual(try Data(contentsOf: dir.appendingPathComponent(aside[0])), junk)
     }
 
     func testCopyLegacyProfilesOnlyWhenMissing() throws {

@@ -25,6 +25,7 @@ nonisolated struct MeetAISpeakerProfile: Codable, Identifiable, Equatable, Senda
 final class MeetAISpeakerProfileStore: ObservableObject {
     static let shared = MeetAISpeakerProfileStore(fileURL: MeetAIPaths.standard().profilesFile)
     static let matchThreshold: Float = 0.7
+    static let embeddingDimensions = 256
 
     @Published private(set) var profiles: [MeetAISpeakerProfile] = []
     private let fileURL: URL
@@ -35,9 +36,13 @@ final class MeetAISpeakerProfileStore: ObservableObject {
     }
 
     @discardableResult
-    func enroll(name: String, embedding: [Float]) -> MeetAISpeakerProfile {
+    func enroll(name: String, embedding: [Float]) -> MeetAISpeakerProfile? {
         let clean = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty,
+              embedding.count == Self.embeddingDimensions,
+              embedding.allSatisfy({ $0.isFinite }) else { return nil }
         if let index = self.profiles.firstIndex(where: { $0.name.lowercased() == clean.lowercased() }) {
+            guard self.profiles[index].embedding.count == embedding.count else { return nil }
             var profile = self.profiles[index]
             profile.embedding = MeetAISpeakerMath.updatedCentroid(profile.embedding, count: profile.sampleCount, adding: embedding)
             profile.sampleCount += 1
@@ -89,7 +94,22 @@ final class MeetAISpeakerProfileStore: ObservableObject {
         guard let data = try? Data(contentsOf: self.fileURL) else { return }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        self.profiles = (try? decoder.decode([MeetAISpeakerProfile].self, from: data)) ?? []
+        do {
+            self.profiles = try decoder.decode([MeetAISpeakerProfile].self, from: data)
+        } catch {
+            self.profiles = []
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.dateFormat = "yyyyMMdd-HHmmss"
+            let aside = self.fileURL.deletingLastPathComponent()
+                .appendingPathComponent("\(self.fileURL.lastPathComponent).unreadable-\(formatter.string(from: Date()))")
+            DebugLogger.shared.warning("Speaker profiles unreadable (\(error.localizedDescription)); moving to \(aside.lastPathComponent)", source: "MeetAI")
+            do {
+                try FileManager.default.moveItem(at: self.fileURL, to: aside)
+            } catch {
+                DebugLogger.shared.warning("Moving unreadable speaker profiles aside failed: \(error.localizedDescription)", source: "MeetAI")
+            }
+        }
     }
 
     private func save() {
