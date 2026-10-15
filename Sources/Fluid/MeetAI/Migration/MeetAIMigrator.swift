@@ -89,7 +89,6 @@ final class MeetAIMigrator: ObservableObject {
 
     private func migrate(folder: String, url: URL) async throws -> MeetingSessionID? {
         let id = Self.sessionID(forFolder: folder)
-        if try await self.store.load(id: id) != nil { return id }
         guard let markdown = try? String(contentsOf: url.appendingPathComponent("transcript.md"), encoding: .utf8) else {
             throw SkipReason(message: "No transcript.md")
         }
@@ -106,13 +105,20 @@ final class MeetAIMigrator: ObservableObject {
             ? "Meeting \(startedAt.formatted(date: .abbreviated, time: .shortened))"
             : MeetAILegacyTranscriptParser.stripTitleSuffix(rawTitle)
 
-        let session = MeetAISyntheticSessionBuilder.transcriptOnlySession(
-            id: id, title: title, startedAt: startedAt, endedAt: endedAt,
-            speakers: parsed.speakers, segments: parsed.segments, audioDeletedAt: endedAt
-        )
-        try await self.store.create(session)
+        // Sidecars are reconciled whether the session is new or left over from an interrupted or failed run.
+        let session: MeetingSession
+        if let existing = try await self.store.load(id: id) {
+            session = existing
+        } else {
+            session = MeetAISyntheticSessionBuilder.transcriptOnlySession(
+                id: id, title: title, startedAt: startedAt, endedAt: endedAt,
+                speakers: parsed.speakers, segments: parsed.segments, audioDeletedAt: endedAt
+            )
+            try await self.store.create(session)
+        }
 
-        if let summary = try? String(contentsOf: url.appendingPathComponent("summary.md"), encoding: .utf8) {
+        if try await self.sidecars.summary(for: id) == nil,
+           let summary = try? String(contentsOf: url.appendingPathComponent("summary.md"), encoding: .utf8) {
             let body = summary.components(separatedBy: "\n")
                 .drop { $0.hasPrefix("# Meeting summary") || $0.trimmingCharacters(in: .whitespaces).isEmpty }
                 .joined(separator: "\n")
@@ -137,8 +143,12 @@ final class MeetAIMigrator: ObservableObject {
                 lastAppliedName: isNamed ? speaker.displayName : nil
             )
         }
-        try await self.sidecars.saveSpeakers(records, for: id)
-        try await self.sidecars.saveMeta(MeetAIMetaRecord(titleSource: .llm, lastLLMTitle: title), for: id)
+        if try await self.sidecars.speakers(for: id).isEmpty {
+            try await self.sidecars.saveSpeakers(records, for: id)
+        }
+        if try await self.sidecars.meta(for: id) == MeetAIMetaRecord() {
+            try await self.sidecars.saveMeta(MeetAIMetaRecord(titleSource: .llm, lastLLMTitle: title), for: id)
+        }
         return id
     }
 
