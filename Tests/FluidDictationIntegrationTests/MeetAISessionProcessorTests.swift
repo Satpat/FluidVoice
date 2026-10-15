@@ -8,6 +8,7 @@ final class FakeMutator: MeetAISessionMutating {
     var deleted = false
     var renameCalls: [[SessionSpeakerID: String]] = []
     var titleCalls: [String] = []
+    var titleError: Error?
 
     init(_ session: MeetingSession) { self.session = session }
 
@@ -21,6 +22,7 @@ final class FakeMutator: MeetAISessionMutating {
 
     func renameSession(sessionID: MeetingSessionID, to title: String) async throws -> MeetingSession {
         if self.deleted { throw MeetingCoordinatorError.noActiveMeeting }
+        if let titleError { throw titleError }
         self.titleCalls.append(title)
         self.session.title = title
         self.session.defaultTitleBase = nil
@@ -59,6 +61,31 @@ final class FakeLLM: MeetAILLMCompleting {
     func descriptor() -> MeetAIProviderDescriptor { MeetAIProviderDescriptor(providerID: "fake", modelID: "fake-1") }
 }
 
+/// Runs `beforeReply` once (the user acting while the LLM call is in flight), then replies in order.
+@MainActor
+final class HookLLM: MeetAILLMCompleting {
+    var replies: [String]
+    var beforeReply: (@MainActor () throws -> Void)?
+
+    init(replies: [String], beforeReply: (@MainActor () throws -> Void)? = nil) {
+        self.replies = replies
+        self.beforeReply = beforeReply
+    }
+
+    func complete(systemPrompt: String, turns: [MeetAILLMTurn]) async throws -> String {
+        let hook = self.beforeReply
+        self.beforeReply = nil
+        try hook?()
+        return self.replies.isEmpty ? "" : self.replies.removeFirst()
+    }
+
+    func completeAboutTranscript(transcript: String, turns: [MeetAILLMTurn], systemPrompt: (String) -> String) async throws -> String {
+        try await self.complete(systemPrompt: systemPrompt(transcript), turns: turns)
+    }
+
+    func descriptor() -> MeetAIProviderDescriptor { MeetAIProviderDescriptor(providerID: "fake", modelID: "fake-1") }
+}
+
 nonisolated struct SlowEmbedder: MeetAISpeakerEmbedding {
     let vector: [Float]
     func embedding(for turns: [MeetingTranscriptSegment], session: MeetingSession, sessionDirectory: URL) async throws -> [Float]? {
@@ -79,14 +106,26 @@ final class MeetAISessionProcessorTests: XCTestCase {
         let sidecars: MeetAISidecarStore
         let profiles: MeetAISpeakerProfileStore
         let settings: MeetAISettings
-        let llm: FakeLLM
+        let llm: any MeetAILLMCompleting
     }
 
-    private func harness(session: MeetingSession, embeddings: [String: [Float]] = [:], llm providedLLM: FakeLLM? = nil, embedder: (any MeetAISpeakerEmbedding)? = nil) throws -> Harness {
-        let llm = providedLLM ?? FakeLLM()
+    private func harness(
+        session: MeetingSession,
+        embeddings: [String: [Float]] = [:],
+        llm providedLLM: (any MeetAILLMCompleting)? = nil,
+        embedder: (any MeetAISpeakerEmbedding)? = nil,
+        seedProfiles: [MeetAISpeakerProfile] = []
+    ) throws -> Harness {
+        let llm: any MeetAILLMCompleting = providedLLM ?? FakeLLM()
         let root = try MeetAIFixtures.tempDirectory(self)
         let paths = MeetAIPaths(supportRoot: root)
         let sidecars = MeetAISidecarStore(paths: paths)
+        if !seedProfiles.isEmpty {
+            let encoder = JSONEncoder()
+            encoder.dateEncodingStrategy = .iso8601
+            try FileManager.default.createDirectory(at: paths.profilesFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try encoder.encode(seedProfiles).write(to: paths.profilesFile)
+        }
         let profiles = MeetAISpeakerProfileStore(fileURL: paths.profilesFile)
         let defaults = UserDefaults(suiteName: "meetai-tests-\(UUID().uuidString)")!
         let settings = MeetAISettings(defaults: defaults)
@@ -217,5 +256,93 @@ final class MeetAISessionProcessorTests: XCTestCase {
         XCTAssertEqual(records[session.speakers[2].id]?.nameSource, .user)
         XCTAssertEqual(records[session.speakers[2].id]?.lastAppliedName, "Priya")
         XCTAssertNotNil(records[session.speakers[2].id]?.embedding)
+    }
+
+    // MARK: F1 — never overwrite a user edit made during a MeetAI LLM call
+
+    func testUserRenameDuringNamingCallIsKeptAndEnrolled() async throws {
+        let session = self.twoSpeakerSession()
+        let speaker1 = session.speakers[1].id
+        var mutatorRef: FakeMutator?
+        let llm = HookLLM(replies: ["{\"Speaker 1\": \"Bob\"}", ""]) {
+            try mutatorRef?.session.renameSpeaker(id: speaker1, to: "Alice")
+        }
+        let h = try self.harness(session: session, embeddings: ["alpha": self.vector(0.1)], llm: llm)
+        mutatorRef = h.mutator
+        h.settings.autoName = true
+        await h.processor.sessionDidComplete(session)
+        await h.processor.enqueue(session.id) { _ in }.value
+        XCTAssertEqual(h.mutator.session.speakers[1].displayName, "Alice", "user rename survives the LLM reply")
+        XCTAssertTrue(h.mutator.renameCalls.isEmpty)
+        let records = try await h.sidecars.speakers(for: session.id)
+        XCTAssertNotEqual(records[speaker1]?.nameSource, .llm)
+        XCTAssertNotEqual(records[speaker1]?.lastAppliedName, "Bob")
+        // The user's queued H6 correction now sees a user rename and enrols the voice.
+        await h.processor.handleCorrection(sessionID: session.id)
+        XCTAssertEqual(h.profiles.profiles.map(\.name), ["Alice"])
+        let after = try await h.sidecars.speakers(for: session.id)
+        XCTAssertEqual(after[speaker1]?.nameSource, .user)
+    }
+
+    func testUserTitleEditDuringTitleCallIsKept() async throws {
+        let session = self.twoSpeakerSession()
+        var mutatorRef: FakeMutator?
+        let llm = HookLLM(replies: ["LLM Title"]) {
+            mutatorRef?.session.title = "User title"
+            mutatorRef?.session.defaultTitleBase = nil
+        }
+        let h = try self.harness(session: session, llm: llm)
+        mutatorRef = h.mutator
+        h.settings.speakerMatching = false
+        await h.processor.runAutomation(sessionID: session.id)
+        XCTAssertEqual(h.mutator.session.title, "User title")
+        XCTAssertTrue(h.mutator.titleCalls.isEmpty)
+        let meta = try await h.sidecars.meta(for: session.id)
+        XCTAssertEqual(meta.titleSource, .user)
+        XCTAssertNil(meta.lastLLMTitle)
+    }
+
+    func testFailedProfileRenameRollsBackRecords() async throws {
+        let session = self.twoSpeakerSession()
+        let h = try self.harness(session: session, embeddings: ["alpha": self.vector(0.1)])
+        _ = h.profiles.enroll(name: "Sam", embedding: self.vector(0.1))
+        h.mutator.busyFailures = 50
+        await h.processor.sessionDidComplete(session)
+        await h.processor.enqueue(session.id) { _ in }.value
+        XCTAssertEqual(h.mutator.session.speakers[1].displayName, "Speaker 1")
+        let records = try await h.sidecars.speakers(for: session.id)
+        let record = try XCTUnwrap(records[session.speakers[1].id])
+        XCTAssertNil(record.nameSource)
+        XCTAssertNil(record.lastAppliedName)
+        XCTAssertNil(record.matchedProfileID)
+        XCTAssertNotNil(record.embedding, "rollback keeps the captured embedding")
+    }
+
+    func testFailedTitleRenameRollsBackMeta() async throws {
+        let session = self.twoSpeakerSession()
+        let h = try self.harness(session: session, llm: FakeLLM(replies: ["LLM Title"]))
+        h.settings.speakerMatching = false
+        h.mutator.titleError = MeetingCoordinatorError.noActiveMeeting
+        await h.processor.runAutomation(sessionID: session.id)
+        XCTAssertTrue(h.mutator.titleCalls.isEmpty)
+        let meta = try await h.sidecars.meta(for: session.id)
+        XCTAssertEqual(meta, MeetAIMetaRecord())
+    }
+
+    // MARK: F8 — profile names are trimmed before they are applied
+
+    func testProfileNameIsTrimmedBeforeApplying() async throws {
+        let session = self.twoSpeakerSession()
+        let h = try self.harness(
+            session: session,
+            embeddings: ["alpha": self.vector(0.1)],
+            seedProfiles: [MeetAISpeakerProfile(name: "  Sam \n", embedding: self.vector(0.1))]
+        )
+        XCTAssertEqual(h.profiles.profiles.first?.name, "  Sam \n")
+        await h.processor.sessionDidComplete(session)
+        await h.processor.enqueue(session.id) { _ in }.value
+        XCTAssertEqual(h.mutator.renameCalls.first?[session.speakers[1].id], "Sam")
+        let records = try await h.sidecars.speakers(for: session.id)
+        XCTAssertEqual(records[session.speakers[1].id]?.lastAppliedName, "Sam")
     }
 }

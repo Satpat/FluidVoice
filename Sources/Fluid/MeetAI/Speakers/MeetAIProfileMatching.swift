@@ -21,7 +21,7 @@ nonisolated enum MeetAIProfileMatching {
             guard let embedding = records[speaker.id]?.embedding else { continue }
             let query = MeetAISpeakerMath.normalize(embedding)
             var top: Decision?
-            for profile in profiles where !usedNames.contains(profile.name.lowercased()) {
+            for profile in profiles where !usedNames.contains(profile.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) {
                 let score = MeetAISpeakerMath.dot(query, profile.embedding)
                 if score >= threshold, score > (top?.score ?? -1) {
                     top = Decision(speakerID: speaker.id, profile: profile, score: score)

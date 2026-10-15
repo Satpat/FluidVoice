@@ -173,21 +173,65 @@ final class MeetAISessionProcessor: ObservableObject {
 
     func applyProfileMatches(_ session: MeetingSession) async -> MeetingSession? {
         do {
-            var records = try await self.deps.sidecars.speakers(for: session.id)
+            let records = try await self.deps.sidecars.speakers(for: session.id)
             let decisions = MeetAIProfileMatching.decide(session: session, records: records, profiles: self.deps.profiles.profiles)
-            guard !decisions.isEmpty else { return nil }
+            var proposals: [SessionSpeakerID: NameProposal] = [:]
             for decision in decisions {
-                records[decision.speakerID, default: MeetAISpeakerRecord()].matchedProfileID = decision.profile.id
-                records[decision.speakerID, default: MeetAISpeakerRecord()].nameSource = .profile
-                records[decision.speakerID, default: MeetAISpeakerRecord()].lastAppliedName = decision.profile.name
+                let name = decision.profile.name.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !name.isEmpty else { continue }
+                proposals[decision.speakerID] = NameProposal(name: name, expectedLabel: nil, source: .profile, profileID: decision.profile.id)
             }
-            // Saved before renaming so the H6 echo of this rename is recognised as MeetAI's own.
-            try await self.deps.sidecars.saveSpeakers(records, for: session.id)
-            let names = Dictionary(uniqueKeysWithValues: decisions.map { ($0.speakerID, $0.profile.name) })
-            return try await self.mutate { try await $0.renameSpeakers(sessionID: session.id, names: names) }
+            guard !proposals.isEmpty else { return nil }
+            return try await self.applyNames(sessionID: session.id, proposals: proposals)
         } catch {
             DebugLogger.shared.warning("MeetAI profile matching failed: \(error.localizedDescription)", source: "MeetAI")
             return nil
+        }
+    }
+
+    /// A rename MeetAI wants to make. It stays valid only while the speaker still carries
+    /// `expectedLabel` (or, when nil, any default label): a user rename in between wins (spec §5.3).
+    struct NameProposal {
+        let name: String
+        let expectedLabel: String?
+        let source: MeetAINameSource
+        let profileID: String?
+    }
+
+    /// Re-reads the session on every attempt and drops proposals whose speaker the user renamed
+    /// meanwhile. Records are written immediately before the rename (so its H6 echo is recognised as
+    /// MeetAI's own) and rolled back if the rename throws.
+    func applyNames(sessionID: MeetingSessionID, proposals: [SessionSpeakerID: NameProposal]) async throws -> MeetingSession? {
+        try await self.mutate { mutator in
+            guard let current = try await self.deps.loadSession(sessionID) else { return nil }
+            var names: [SessionSpeakerID: String] = [:]
+            for speaker in current.activeSpeakers where !speaker.isLocalUser {
+                guard let proposal = proposals[speaker.id] else { continue }
+                let stillOurs = proposal.expectedLabel.map { $0 == speaker.displayName }
+                    ?? MeetAITranscript.isDefaultSpeakerName(speaker.displayName)
+                if stillOurs { names[speaker.id] = proposal.name }
+            }
+            let taken = Set(current.activeSpeakers.filter { names[$0.id] == nil }.map { $0.displayName.lowercased() })
+            names = names.filter { !taken.contains($0.value.lowercased()) }
+            guard !names.isEmpty else { return nil }
+
+            let previous = try await self.deps.sidecars.speakers(for: sessionID)
+            var records = previous
+            for (id, name) in names {
+                guard let proposal = proposals[id] else { continue }
+                if let profileID = proposal.profileID {
+                    records[id, default: MeetAISpeakerRecord()].matchedProfileID = profileID
+                }
+                records[id, default: MeetAISpeakerRecord()].nameSource = proposal.source
+                records[id, default: MeetAISpeakerRecord()].lastAppliedName = name
+            }
+            try await self.deps.sidecars.saveSpeakers(records, for: sessionID)
+            do {
+                return try await mutator.renameSpeakers(sessionID: sessionID, names: names)
+            } catch {
+                await self.rollBack("speaker records") { try await self.deps.sidecars.saveSpeakers(previous, for: sessionID) }
+                throw error
+            }
         }
     }
 
@@ -207,17 +251,13 @@ final class MeetAISessionProcessor: ObservableObject {
             let parsed = MeetAISpeakerNamer.parseNameMap(from: reply, validLabels: labels)
             let counts = Dictionary(grouping: parsed.values, by: { $0.lowercased() }).mapValues(\.count)
             let map = parsed.filter { counts[$0.value.lowercased()] == 1 && !taken.contains($0.value.lowercased()) }
-            guard !map.isEmpty else { return nil }
-            var records = try await self.deps.sidecars.speakers(for: session.id)
-            var names: [SessionSpeakerID: String] = [:]
+            var proposals: [SessionSpeakerID: NameProposal] = [:]
             for speaker in candidates {
                 guard let name = map[speaker.displayName] else { continue }
-                names[speaker.id] = name
-                records[speaker.id, default: MeetAISpeakerRecord()].nameSource = .llm
-                records[speaker.id, default: MeetAISpeakerRecord()].lastAppliedName = name
+                proposals[speaker.id] = NameProposal(name: name, expectedLabel: speaker.displayName, source: .llm, profileID: nil)
             }
-            try await self.deps.sidecars.saveSpeakers(records, for: session.id)
-            return try await self.mutate { try await $0.renameSpeakers(sessionID: session.id, names: names) }
+            guard !proposals.isEmpty else { return nil }
+            return try await self.applyNames(sessionID: session.id, proposals: proposals)
         } catch {
             DebugLogger.shared.warning("MeetAI speaker naming skipped: \(error.localizedDescription)", source: "MeetAI")
             return nil
@@ -226,25 +266,51 @@ final class MeetAISessionProcessor: ObservableObject {
 
     func applyTitle(_ session: MeetingSession) async -> MeetingSession? {
         do {
-            var meta = try await self.deps.sidecars.meta(for: session.id)
-            guard MeetAITitler.ownsTitle(session: session, meta: meta) else {
-                if meta.titleSource != .user {
-                    meta.titleSource = .user
-                    try await self.deps.sidecars.saveMeta(meta, for: session.id)
-                }
-                return nil
-            }
+            guard try await self.ownsTitleElseMarkUser(session) else { return nil }
             guard !MeetAITranscript.turns(for: session).isEmpty else { return nil }
             let context = String(MeetAITranscript.text(for: session).prefix(4_000))
             let raw = try await self.deps.llm.complete(systemPrompt: MeetAITitler.systemPrompt, turns: [MeetAILLMTurn(role: "user", content: context)])
-            guard let title = MeetAITitler.clean(raw), title != session.title else { return nil }
-            meta.titleSource = .llm
-            meta.lastLLMTitle = title
-            try await self.deps.sidecars.saveMeta(meta, for: session.id)
-            return try await self.mutate { try await $0.renameSession(sessionID: session.id, to: title) }
+            guard let title = MeetAITitler.clean(raw) else { return nil }
+            // The LLM call can take minutes: re-check ownership on the current session on every attempt.
+            return try await self.mutate { mutator in
+                guard let current = try await self.deps.loadSession(session.id),
+                      try await self.ownsTitleElseMarkUser(current),
+                      title != current.title
+                else { return nil }
+                let previous = try await self.deps.sidecars.meta(for: session.id)
+                var meta = previous
+                meta.titleSource = .llm
+                meta.lastLLMTitle = title
+                try await self.deps.sidecars.saveMeta(meta, for: session.id)
+                do {
+                    return try await mutator.renameSession(sessionID: session.id, to: title)
+                } catch {
+                    await self.rollBack("title meta") { try await self.deps.sidecars.saveMeta(previous, for: session.id) }
+                    throw error
+                }
+            }
         } catch {
             DebugLogger.shared.warning("MeetAI title skipped: \(error.localizedDescription)", source: "MeetAI")
             return nil
+        }
+    }
+
+    /// False (and the title recorded as the user's) once the user has edited it (spec §6.3).
+    private func ownsTitleElseMarkUser(_ session: MeetingSession) async throws -> Bool {
+        var meta = try await self.deps.sidecars.meta(for: session.id)
+        guard !MeetAITitler.ownsTitle(session: session, meta: meta) else { return true }
+        if meta.titleSource != .user {
+            meta.titleSource = .user
+            try await self.deps.sidecars.saveMeta(meta, for: session.id)
+        }
+        return false
+    }
+
+    private func rollBack(_ what: String, _ restore: () async throws -> Void) async {
+        do {
+            try await restore()
+        } catch {
+            DebugLogger.shared.warning("MeetAI could not roll back \(what): \(error.localizedDescription)", source: "MeetAI")
         }
     }
 
@@ -258,7 +324,7 @@ final class MeetAISessionProcessor: ObservableObject {
     }
 
     /// Retries while the coordinator is busy; any other error (e.g. a deleted session) propagates.
-    func mutate(_ body: @MainActor (any MeetAISessionMutating) async throws -> MeetingSession) async throws -> MeetingSession {
+    func mutate<T>(_ body: @MainActor (any MeetAISessionMutating) async throws -> T) async throws -> T {
         var attempt = 0
         while true {
             do {
