@@ -41,13 +41,33 @@ struct MeetAIKnownSpeakersView: View {
         let profile: MeetAISpeakerProfile
         let commit: (String) -> Void
         @State private var name = ""
+        @FocusState private var focused: Bool
 
         var body: some View {
             TextField("Name", text: self.$name)
                 .textFieldStyle(.roundedBorder)
                 .frame(maxWidth: 220)
+                .focused(self.$focused)
+                .accessibilityLabel("Name for \(self.profile.name)")
                 .onAppear { self.name = self.profile.name }
-                .onSubmit { self.commit(self.name) }
+                .onSubmit { self.commitIfChanged() }
+                .onChange(of: self.focused) { _, isFocused in
+                    if !isFocused { self.commitIfChanged() }
+                }
+                .onChange(of: self.profile.name) { _, new in
+                    if !self.focused { self.name = new }
+                }
+                .onDisappear { self.commitIfChanged() }
+        }
+
+        private func commitIfChanged() {
+            let trimmed = self.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty, trimmed != self.profile.name {
+                self.commit(trimmed)
+            }
+            // Snap back to the stored name so a rejected (empty) edit does not linger.
+            let stored = MeetAISpeakerProfileStore.shared.profiles.first { $0.id == self.profile.id }?.name
+            self.name = stored ?? self.profile.name
         }
     }
 }
