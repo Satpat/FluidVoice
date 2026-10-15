@@ -68,7 +68,7 @@ enum MeetingRelabeler {
     /// e.g. "[00:12] Them 1: hi" or "**[00:12] Them 1:** hi". Only the label
     /// token is replaced, never body text, and longer labels are applied first
     /// so "Them 1" is matched before "Them".
-    private static func applyToTranscript(_ text: String, map: [String: String]) -> String {
+    static func applyToTranscript(_ text: String, map: [String: String]) -> String {
         let ordered = map.sorted { $0.key.count > $1.key.count }
         let lines = text.components(separatedBy: "\n")
         let updated = lines.map { line -> String in
