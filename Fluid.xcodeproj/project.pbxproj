@@ -7,6 +7,9 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		C816B628B2F31EC0B6CC0FEC /* MeetAIReasoningModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2C4D337E1D31DA71C54D4A3E /* MeetAIReasoningModelTests.swift */; };
+		163B761765AA6DF4FD9C45B2 /* FluidAudioSmokeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 796E039E0E99122C2CA5D96B /* FluidAudioSmokeTests.swift */; };
+		877000A6BBED1A75E9EA3898 /* MarkdownTextTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 804BB4AA7026A61338E81762 /* MarkdownTextTests.swift */; };
 		B43F794EEEFA0FFD3980108E /* MeetAIBuildFlagsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 21CC6B02CB92BD78703DA2A2 /* MeetAIBuildFlagsTests.swift */; };
 		AD1030000000000000000004 /* HoldToMutePresentationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD1030000000000000000003 /* HoldToMutePresentationTests.swift */; };
 		AD1030000000000000000002 /* HoldToMuteTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD1030000000000000000001 /* HoldToMuteTests.swift */; };
@@ -178,6 +181,9 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		2C4D337E1D31DA71C54D4A3E /* MeetAIReasoningModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeetAIReasoningModelTests.swift; sourceTree = "<group>"; };
+		796E039E0E99122C2CA5D96B /* FluidAudioSmokeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FluidAudioSmokeTests.swift; sourceTree = "<group>"; };
+		804BB4AA7026A61338E81762 /* MarkdownTextTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownTextTests.swift; sourceTree = "<group>"; };
 		21CC6B02CB92BD78703DA2A2 /* MeetAIBuildFlagsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeetAIBuildFlagsTests.swift; sourceTree = "<group>"; };
 		AD1030000000000000000003 /* HoldToMutePresentationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HoldToMutePresentationTests.swift; sourceTree = "<group>"; };
 		AD1030000000000000000001 /* HoldToMuteTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HoldToMuteTests.swift; sourceTree = "<group>"; };
@@ -430,6 +436,9 @@
 				C0DE89000000000000000001 /* SettingsNavigationStateTests.swift */,
 				343B29013F4441D6A797D12D /* LLMClientRequestBodyTests.swift */,
 				980330F3CE464336ADCE3E23 /* TemperatureSupportTests.swift */,
+				2C4D337E1D31DA71C54D4A3E /* MeetAIReasoningModelTests.swift */,
+				796E039E0E99122C2CA5D96B /* FluidAudioSmokeTests.swift */,
+				804BB4AA7026A61338E81762 /* MarkdownTextTests.swift */,
 				21CC6B02CB92BD78703DA2A2 /* MeetAIBuildFlagsTests.swift */,
 				A11A00000000000000000001 /* AnalyticsDatabaseTests.swift */,
 				2E9B00000000000000000006 /* ZeppelinDataLayerTests.swift */,
@@ -806,6 +815,9 @@
 				C0DE89000000000000000002 /* SettingsNavigationStateTests.swift in Sources */,
 				86CAA2D4EF18433096185602 /* LLMClientRequestBodyTests.swift in Sources */,
 				272BFB5CB271489892CAE50C /* TemperatureSupportTests.swift in Sources */,
+				C816B628B2F31EC0B6CC0FEC /* MeetAIReasoningModelTests.swift in Sources */,
+				163B761765AA6DF4FD9C45B2 /* FluidAudioSmokeTests.swift in Sources */,
+				877000A6BBED1A75E9EA3898 /* MarkdownTextTests.swift in Sources */,
 				B43F794EEEFA0FFD3980108E /* MeetAIBuildFlagsTests.swift in Sources */,
 				A11A00000000000000000002 /* AnalyticsDatabaseTests.swift in Sources */,
 				2E9B00000000000000000007 /* ZeppelinDataLayerTests.swift in Sources */,
