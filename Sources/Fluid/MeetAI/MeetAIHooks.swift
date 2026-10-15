@@ -12,6 +12,11 @@ enum MeetAIHooks {
     /// finishes or `timeout` elapses, whichever is first. Never throws.
     static func runSessionDidComplete(_ session: MeetingSession, timeout: Duration = completionTimeout) async {
         guard let handler = self.sessionDidComplete else { return }
+        let started = ContinuousClock.now
+        defer {
+            let ms = Int((ContinuousClock.now - started) / .milliseconds(1))
+            DebugLogger.shared.info("MeetAI H1 took \(ms) ms", source: "MeetAI")
+        }
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             let gate = OnceGate(continuation)
             Task { @MainActor in

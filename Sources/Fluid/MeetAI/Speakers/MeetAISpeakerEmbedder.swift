@@ -7,6 +7,20 @@ nonisolated protocol MeetAISpeakerEmbedding: Sendable {
     func embedding(for turns: [MeetingTranscriptSegment], session: MeetingSession, sessionDirectory: URL) async throws -> [Float]?
 }
 
+/// Lock-protected, lazily filled key → value cache. A failed load is not cached. Two first callers
+/// racing may both load; the later result wins (harmless for an immutable model).
+nonisolated final class MeetAIValueCache<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [String: Value] = [:]
+
+    func value(for key: String, load: () async throws -> Value) async throws -> Value {
+        if let cached = self.lock.withLock({ self.values[key] }) { return cached }
+        let value = try await load()
+        self.lock.withLock { self.values[key] = value }
+        return value
+    }
+}
+
 nonisolated enum MeetAIEmbeddingError: LocalizedError {
     case unsupportedModel
     var errorDescription: String? { "The speaker voice model has an unsupported input format." }
@@ -63,20 +77,33 @@ nonisolated struct MeetAIFluidAudioEmbedder: MeetAISpeakerEmbedding {
         }
     }
 
+    struct LoadedModel {
+        let model: MLModel
+        let maskFrames: Int
+    }
+
+    /// The WeSpeaker model stays loaded after first use: H1 is awaited inside upstream's completion
+    /// path, so reloading CoreML on every meeting would lengthen the coordinator's busy window.
+    static let modelCache = MeetAIValueCache<LoadedModel>()
+
     @concurrent static func embed(clips: [[Float]]) async throws -> [[Float]] {
         try await MeetingModelResidencyCoordinator.ordinary(owner: "meetai-speakers", modelID: ModelNames.Diarizer.embeddingFile) {
-            let models = try await DownloadUtils.loadModels(
-                .diarizer,
-                modelNames: [ModelNames.Diarizer.embeddingFile],
-                directory: DiarizerModels.defaultModelsDirectory().deletingLastPathComponent(),
-                computeUnits: .cpuAndNeuralEngine
-            )
-            guard let model = models[ModelNames.Diarizer.embeddingFile],
-                  let maskFrames = model.modelDescription.inputDescriptionsByName["mask"]?.multiArrayConstraint?.shape.last?.intValue,
-                  (1...4096).contains(maskFrames)
-            else { throw MeetAIEmbeddingError.unsupportedModel }
-            let extractor = EmbeddingExtractor(embeddingModel: model)
-            let mask = [Float](repeating: 1, count: maskFrames)
+            let directory = DiarizerModels.defaultModelsDirectory().deletingLastPathComponent()
+            let loaded = try await self.modelCache.value(for: directory.appendingPathComponent(ModelNames.Diarizer.embeddingFile).path) {
+                let models = try await DownloadUtils.loadModels(
+                    .diarizer,
+                    modelNames: [ModelNames.Diarizer.embeddingFile],
+                    directory: directory,
+                    computeUnits: .cpuAndNeuralEngine
+                )
+                guard let model = models[ModelNames.Diarizer.embeddingFile],
+                      let maskFrames = model.modelDescription.inputDescriptionsByName["mask"]?.multiArrayConstraint?.shape.last?.intValue,
+                      (1...4096).contains(maskFrames)
+                else { throw MeetAIEmbeddingError.unsupportedModel }
+                return LoadedModel(model: model, maskFrames: maskFrames)
+            }
+            let extractor = EmbeddingExtractor(embeddingModel: loaded.model)
+            let mask = [Float](repeating: 1, count: loaded.maskFrames)
             var embeddings: [[Float]] = []
             for clip in clips {
                 try Task.checkCancellation()

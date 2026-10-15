@@ -330,6 +330,7 @@ Each commit builds and keeps the test suite green before the next one starts.
 | Future upstream releases change hook-point code | Hooks are six one-line edits listed in §5.2 and in `docs/MEETAI.md`, so conflicts are small and findable |
 | Upstream's first-run settings migration changes user settings | Backup before first launch (§8.6) |
 | H1 delays upstream's audio sweep | 30 s timeout; only the embedding step is awaited |
+| H1 keeps upstream's coordinator busy (renames/new recording blocked) for the embedding duration, up to 30 s | Mitigated by caching the model; timeout to be revisited after measuring in §8.7 check #3 (`MeetAI H1 took … ms` in the debug log) |
 
 ## 11. Baseline (recorded 2026-10-16 on `v1.6.11`, before any change)
 

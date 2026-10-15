@@ -10,6 +10,22 @@ final class MeetAIEmbedderTests: XCTestCase {
         XCTAssertTrue(MeetAIFluidAudioEmbedder.clips(from: [Float](repeating: 0, count: 40_000)).isEmpty)
     }
 
+    func testValueCacheLoadsOncePerKeyAndDoesNotCacheFailures() async throws {
+        let cache = MeetAIValueCache<Int>()
+        var loads = 0
+        let first = try await cache.value(for: "a") { loads += 1; return 7 }
+        let second = try await cache.value(for: "a") { loads += 1; return 8 }
+        XCTAssertEqual([first, second], [7, 7])
+        XCTAssertEqual(loads, 1)
+        do {
+            _ = try await cache.value(for: "b") { throw MeetAIEmbeddingError.unsupportedModel }
+            XCTFail("expected the load error")
+        } catch {}
+        let retried = try await cache.value(for: "b") { loads += 1; return 9 }
+        XCTAssertEqual(retried, 9)
+        XCTAssertEqual(loads, 2)
+    }
+
     /// Opt-in (downloads/loads the diarizer embedding model): TEST_RUNNER_MEETAI_MODEL_TESTS=1
     func testSameVoiceMatchesAndDifferentVoicesDoNot() async throws {
         guard ProcessInfo.processInfo.environment["MEETAI_MODEL_TESTS"] == "1" else { throw XCTSkip("model test") }
