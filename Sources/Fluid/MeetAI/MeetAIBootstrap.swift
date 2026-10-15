@@ -18,7 +18,10 @@ enum MeetAIBootstrap {
         _ = MeetAISpeakerProfileStore.shared.copyLegacyProfilesIfNeeded(from: paths.legacyProfilesFile)
         MeetAIHooks.sessionDidComplete = { session in await MeetAISessionProcessor.shared.sessionDidComplete(session) }
         MeetAIHooks.sessionCorrected = { session in MeetAISessionProcessor.shared.sessionCorrected(session) }
-        Task { await self.sweepOrphanedSidecars() }
+        Task {
+            await self.sweepOrphanedSidecars()
+            await MeetAIMigrator.shared.run()
+        }
     }
 
     /// Data-loss guard: a session is live if it loaded, or its folder exists, or the lookup failed.

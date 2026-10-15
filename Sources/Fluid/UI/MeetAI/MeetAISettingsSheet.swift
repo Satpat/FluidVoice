@@ -2,6 +2,7 @@ import SwiftUI
 
 struct MeetAISettingsSheet: View {
     @ObservedObject private var settings = MeetAISettings.shared
+    @ObservedObject private var migrator = MeetAIMigrator.shared
     @Environment(\.dismiss) private var dismiss
     @Environment(\.theme) private var theme
 
@@ -24,6 +25,18 @@ struct MeetAISettingsSheet: View {
                 Section("Known speakers") {
                     MeetAIKnownSpeakersView()
                 }
+                Section("Meetings from the previous MeetAI version") {
+                    Text("Imported \(self.count(.done)) · skipped \(self.count(.skipped)) · failed \(self.count(.failed))")
+                    ForEach(self.folders { $0.status != .done }, id: \.self) { folder in
+                        Text("\(self.migrator.entries[folder]?.status.rawValue.capitalized ?? ""): \(folder) — \(self.migrator.entries[folder]?.reason ?? "")")
+                            .font(self.theme.typography.caption)
+                            .foregroundStyle(self.theme.palette.secondaryText)
+                    }
+                    Button(self.migrator.isRunning ? "Importing…" : "Re-run migration") {
+                        Task { await self.migrator.run(retryFailed: true) }
+                    }
+                    .disabled(self.migrator.isRunning)
+                }
             }
             .formStyle(.grouped)
             HStack {
@@ -33,5 +46,14 @@ struct MeetAISettingsSheet: View {
         }
         .padding(self.theme.metrics.spacing.xl)
         .frame(minWidth: 520, minHeight: 480)
+        .task { self.migrator.loadEntries() }
+    }
+
+    private func count(_ status: MeetAIMigrationEntry.Status) -> Int {
+        self.migrator.entries.values.filter { $0.status == status }.count
+    }
+
+    private func folders(where predicate: (MeetAIMigrationEntry) -> Bool) -> [String] {
+        self.migrator.entries.filter { predicate($0.value) }.map(\.key).sorted()
     }
 }
