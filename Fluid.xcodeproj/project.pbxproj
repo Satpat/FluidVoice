@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		48222D396085EA66BF805CC4 /* MarkdownTextTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AFC5A5E1473CFCEC3A2BCA95 /* MarkdownTextTests.swift */; };
 		103D814ADF343ABB618D5E1D /* MeetingPipelineTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1682F3A093BD6278297C00FE /* MeetingPipelineTests.swift */; };
 		272BFB5CB271489892CAE50C /* TemperatureSupportTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 980330F3CE464336ADCE3E23 /* TemperatureSupportTests.swift */; };
 		7C078DA52E3B386A00FB7CAC /* FluidAudio in Frameworks */ = {isa = PBXBuildFile; productRef = 7C078DA42E3B386A00FB7CAC /* FluidAudio */; };
@@ -33,6 +34,7 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		AFC5A5E1473CFCEC3A2BCA95 /* MarkdownTextTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownTextTests.swift; sourceTree = "<group>"; };
 		1682F3A093BD6278297C00FE /* MeetingPipelineTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeetingPipelineTests.swift; sourceTree = "<group>"; };
 		343B29013F4441D6A797D12D /* LLMClientRequestBodyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LLMClientRequestBodyTests.swift; sourceTree = "<group>"; };
 		7C078D8F2E3B339200FB7CAC /* FluidVoice Debug.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "FluidVoice Debug.app"; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -112,6 +114,7 @@
 				7C91B0022F42AA0100C0DEF0 /* HotkeyShortcutTests.swift */,
 				343B29013F4441D6A797D12D /* LLMClientRequestBodyTests.swift */,
 				980330F3CE464336ADCE3E23 /* TemperatureSupportTests.swift */,
+				AFC5A5E1473CFCEC3A2BCA95 /* MarkdownTextTests.swift */,
 				1682F3A093BD6278297C00FE /* MeetingPipelineTests.swift */,
 			);
 			path = FluidDictationIntegrationTests;
@@ -269,6 +272,7 @@
 				7C91B0012F42AA0100C0DEF0 /* HotkeyShortcutTests.swift in Sources */,
 				86CAA2D4EF18433096185602 /* LLMClientRequestBodyTests.swift in Sources */,
 				272BFB5CB271489892CAE50C /* TemperatureSupportTests.swift in Sources */,
+				48222D396085EA66BF805CC4 /* MarkdownTextTests.swift in Sources */,
 				103D814ADF343ABB618D5E1D /* MeetingPipelineTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

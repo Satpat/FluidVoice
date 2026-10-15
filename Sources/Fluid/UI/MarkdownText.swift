@@ -6,10 +6,13 @@ import SwiftUI
 struct MarkdownText: View {
     let markdown: String
 
-    private struct Block: Identifiable {
+    struct Block: Identifiable {
         let id: Int
         let kind: PresentationIntent.Kind?
         let isOrdered: Bool
+        /// Number of enclosing lists: 0 for top-level text, 1 for a
+        /// top-level list item, 2 for a nested sub-bullet, ...
+        let depth: Int
         let text: AttributedString
     }
 
@@ -32,12 +35,12 @@ struct MarkdownText: View {
         return computed
     }
 
-    private static func parse(_ markdown: String) -> [Block] {
+    static func parse(_ markdown: String) -> [Block] {
         guard let attributed = try? AttributedString(
             markdown: markdown,
             options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .full)
         ) else {
-            return [Block(id: 0, kind: nil, isOrdered: false, text: AttributedString(markdown))]
+            return [Block(id: 0, kind: nil, isOrdered: false, depth: 0, text: AttributedString(markdown))]
         }
 
         var result: [Block] = []
@@ -45,31 +48,56 @@ struct MarkdownText: View {
         var currentText = AttributedString()
         var currentKind: PresentationIntent.Kind?
         var currentOrdered = false
+        var currentDepth = 0
 
         func flush() {
             guard !currentText.characters.isEmpty else { return }
-            result.append(Block(id: result.count, kind: currentKind, isOrdered: currentOrdered, text: currentText))
+            result.append(Block(
+                id: result.count,
+                kind: currentKind,
+                isOrdered: currentOrdered,
+                depth: currentDepth,
+                text: currentText
+            ))
             currentText = AttributedString()
         }
 
         for run in attributed.runs {
+            // Components are ordered innermost-first: a bullet's text run is
+            // [paragraph, listItem, unorderedList, (listItem, list, ...)]. The
+            // innermost component identifies the block; the first header or
+            // list item gives its kind, and the list right after that item
+            // says whether it is ordered.
             let components = run.presentationIntent?.components ?? []
             let identity = components.first?.identity
             if identity != currentIdentity {
                 flush()
                 currentIdentity = identity
-                currentKind = components.first?.kind
-                currentOrdered = components.contains {
-                    if case .orderedList = $0.kind { return true }
-                    return false
+                let kindIndex = components.firstIndex { component in
+                    switch component.kind {
+                    case .header, .listItem: return true
+                    default: return false
+                    }
                 }
+                currentKind = kindIndex.map { components[$0].kind } ?? components.first?.kind
+                currentOrdered = false
+                if let kindIndex, kindIndex + 1 < components.count,
+                   case .orderedList = components[kindIndex + 1].kind {
+                    currentOrdered = true
+                }
+                currentDepth = components.filter { component in
+                    switch component.kind {
+                    case .orderedList, .unorderedList: return true
+                    default: return false
+                    }
+                }.count
             }
             currentText += attributed[run.range]
         }
         flush()
 
         return result.isEmpty
-            ? [Block(id: 0, kind: nil, isOrdered: false, text: AttributedString(markdown))]
+            ? [Block(id: 0, kind: nil, isOrdered: false, depth: 0, text: AttributedString(markdown))]
             : result
     }
 
@@ -90,13 +118,14 @@ struct MarkdownText: View {
                 .fontWeight(.semibold)
         case .listItem(let ordinal):
             HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text(block.isOrdered ? "\(ordinal)." : "•")
+                Text(block.isOrdered ? "\(ordinal)." : (block.depth > 1 ? "◦" : "•"))
                     .foregroundColor(.secondary)
                 Text(block.text)
             }
-            .padding(.leading, 8)
+            .padding(.leading, CGFloat(8 + 16 * max(0, block.depth - 1)))
         default:
             Text(block.text)
+                .padding(.leading, CGFloat(16 * block.depth))
         }
     }
 
