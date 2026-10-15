@@ -330,3 +330,30 @@ Each commit builds and keeps the test suite green before the next one starts.
 | Future upstream releases change hook-point code | Hooks are six one-line edits listed in §5.2 and in `docs/MEETAI.md`, so conflicts are small and findable |
 | Upstream's first-run settings migration changes user settings | Backup before first launch (§8.6) |
 | H1 delays upstream's audio sweep | 30 s timeout; only the embedding step is awaited |
+
+## 11. Baseline (recorded 2026-10-16 on `v1.6.11`, before any change)
+
+Command: §8.1, run in this worktree with a scratch DerivedData.
+
+- Executed 2234 tests: 2184 passed, 39 skipped, **11 failed** (10 reported "unexpected"). Exit 65.
+- Known failing tests (environment-dependent, not touched by this work):
+  - `UpdateInstallationPipelineTests`: 9 tests failing with `invalidSignature(-67050)` (test-fixture code signing under an unsigned test build).
+  - `UpdateBundleValidatorTests.testDevelopmentFixtureAndInstalledPolicyPreserveExactMetadata`: "Temporary fixture signing exceeded its bounded timeout."
+  - `AudioRouteRecoveryIntegrationTests.testTwentyOrdinaryStartsAndStopsKeepRecoveryIdle`: expects `parakeet-tdt`, got `parakeet-tdt-v2` (reads local model settings).
+- Rule: after every commit, the failing set must be exactly these 11 (or a subset); no new failures.
+
+## 12. Plan-time amendments
+
+Facts found while writing the implementation plan that refine this spec:
+
+1. **Apple Intelligence provider is retired upstream** (`SettingsStore.purgeRetiredAppleIntelligenceState`). `MeetAILLM` has no Apple Intelligence branch; §5.4's 4096-token budget item is dropped. A selected Private AI provider produces a clear "not supported for meetings" error.
+2. **Segment audio** for embeddings comes from upstream's `MeetingSegmentPlaybackPlan.slices(session:segment:directory:)` (file URL + local offsets per segment), decoded to 16 kHz mono. Embeddings use the same calls as upstream's `MeetingProductionParakeetNemotronRuntime.speakerVoiceProfiles`: `EmbeddingExtractor` with `ModelNames.Diarizer.embeddingFile`, 3–10 s clips, 256-d output. The work runs under `MeetingModelResidencyCoordinator.ordinary(owner:modelID:work:)`.
+3. **H6 placement**: one call at the end of the coordinator's private `performCorrection` (which backs `renameSpeaker`, `renameSpeakers`, `mergeSpeakers`, `reassignSegment`, `nameUnknownSegment`, transcript edits). The handler is diff-based: a speaker counts as user-renamed only when its display name is not a default label and differs from the sidecar's `lastAppliedName`. MeetAI writes `lastAppliedName` *before* its own renames, so its renames never enrol voices. `speakers.json` records gain `lastAppliedName`.
+4. **Default speaker labels** are upstream's `Speaker N`, `Microphone Speaker N`, `Room Speaker`, `Meeting audio`, `Microphone / Unknown`, plus the fork's legacy `Them` / `Them N` (for migrated meetings).
+5. **Title ownership**: MeetAI owns a title while `session.defaultTitleBase != nil` (upstream clears it on any rename) or `session.title == meta.lastLLMTitle`. User title edits go through `renameSession`, which does not pass `performCorrection`, so ownership is checked whenever MeetAI considers retitling.
+6. **Synthetic audio sessions** write 16 kHz mono 16-bit WAV chunks (60 s) at `tracks/<kind>/NNNNNN.wav` in the legacy chunk shape (no `captureAnalysisAsset`), which upstream's materializer reads. They are saved in state `.interrupted` with `endedAt` set, so they satisfy `hasRetryableAudio` and upstream's recovery UI can retry them if MeetAI's own `retryProcessing` call fails. Microphone eras are marked `.acousticallyClosed` for single-track imports (no far-end audio exists) and `.legacyUnclassified` for Tier 2 fork recordings.
+7. **Migration session IDs are deterministic** (derived from the folder name), so an interrupted migration never creates duplicates.
+8. **Tier 2 re-processing UI** lives in the MeetAI settings sheet's migration section (one more hook point avoided). On success the transcript-only session is replaced; on failure the new session is deleted and the old one kept.
+9. **Upload formats**: whatever AVFoundation can decode (`.audio`, `.movie` UTTypes). Upstream's separate `.opus`/`.oga` decoder is not reused.
+10. **Install profile bundle ID**: upstream changed the Debug bundle ID to `com.FluidApp.app.debug` ("test: isolate debug preferences", `02a536ef`). `./build.sh install` overrides `PRODUCT_BUNDLE_IDENTIFIER=com.FluidApp.app` so the installed app keeps the user's settings, keychain API keys and permissions. Tests keep the isolated `.debug` ID. The first install of the Apple-Development-signed build may re-prompt for permissions once, because the current install is ad hoc signed.
+11. **Ported tests**: the fork's `gpt-7.2` reasoning-model case is dropped (upstream matches `gpt-5`/`gpt-6` only; changing that is out of scope). The fork's diarizer smoke test depended on fork-only code and is replaced by the model-backed embedder test.
