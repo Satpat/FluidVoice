@@ -17,17 +17,26 @@ enum MeetAIBootstrap {
         Task { await self.sweepOrphanedSidecars() }
     }
 
+    /// Data-loss guard: a session is live if it loaded, or its folder exists, or the lookup failed.
+    static func isSessionLive(
+        _ id: MeetingSessionID,
+        loadedIDs: Set<MeetingSessionID>,
+        directory: (MeetingSessionID) async throws -> URL?
+    ) async -> Bool {
+        if loadedIDs.contains(id) { return true }
+        do {
+            return try await directory(id) != nil
+        } catch {
+            return true
+        }
+    }
+
     static func sweepOrphanedSidecars() async {
         do {
             let ids = Set(try await MeetingSessionStore.shared.loadAll().map(\.id))
             // loadAll skips unreadable sessions, so also consult the directory: never delete on doubt.
             let removed = try await MeetAISidecarStore.shared.sweepOrphans { id in
-                if ids.contains(id) { return true }
-                do {
-                    return try await MeetingSessionStore.shared.existingSessionDirectory(for: id) != nil
-                } catch {
-                    return true
-                }
+                await self.isSessionLive(id, loadedIDs: ids) { try await MeetingSessionStore.shared.existingSessionDirectory(for: $0) }
             }
             if !removed.isEmpty {
                 DebugLogger.shared.info("Removed \(removed.count) orphaned MeetAI sidecars", source: "MeetAI")

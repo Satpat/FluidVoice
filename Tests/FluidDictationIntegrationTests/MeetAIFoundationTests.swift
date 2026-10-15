@@ -46,22 +46,44 @@ final class MeetAIFoundationTests: XCTestCase {
         let kept = UUID(), orphan = UUID()
         try await store.saveMeta(MeetAIMetaRecord(), for: kept)
         try await store.saveMeta(MeetAIMetaRecord(), for: orphan)
-        let unreadable = UUID(), throwing = UUID()
+        let unreadable = UUID(), lookupFails = UUID()
         try await store.saveMeta(MeetAIMetaRecord(), for: unreadable)
-        try await store.saveMeta(MeetAIMetaRecord(), for: throwing)
+        try await store.saveMeta(MeetAIMetaRecord(), for: lookupFails)
         let strayFolder = paths.sessionsDirectory.appendingPathComponent("not-a-uuid", isDirectory: true)
         try FileManager.default.createDirectory(at: strayFolder, withIntermediateDirectories: true)
         let strayFile = paths.sessionsDirectory.appendingPathComponent(UUID().uuidString)
         try Data("x".utf8).write(to: strayFile)
-        // `kept` is loaded; `unreadable` fails to load but its directory exists; `throwing` is treated as live.
-        let removed = try await store.sweepOrphans { id in id == kept || id == unreadable || id == throwing }
+        // `kept` is loaded; `unreadable` fails to load but its directory exists; `lookupFails` is treated as live.
+        let removed = try await store.sweepOrphans { id in id == kept || id == unreadable || id == lookupFails }
         XCTAssertEqual(removed, [orphan])
         XCTAssertTrue(FileManager.default.fileExists(atPath: paths.sessionDirectory(for: kept).path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: paths.sessionDirectory(for: orphan).path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: paths.sessionDirectory(for: unreadable).path))
-        XCTAssertTrue(FileManager.default.fileExists(atPath: paths.sessionDirectory(for: throwing).path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: paths.sessionDirectory(for: lookupFails).path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: strayFolder.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: strayFile.path))
+    }
+
+    func testIsSessionLiveAgainstRealStore() async throws {
+        let store = MeetingSessionStore(rootDirectory: try MeetAIFixtures.tempDirectory(self))
+        let session = MeetAIFixtures.session(speakers: [("You", true)], lines: [.init(speaker: 0, start: 0, end: 2, text: "Hi")])
+        try await store.create(session)
+        let directory = try await XCTUnwrapAsync(await store.existingSessionDirectory(for: session.id))
+        try FileManager.default.removeItem(at: directory.appendingPathComponent("session.json"))
+        let unreadableLoaded = try await store.load(id: session.id)
+        XCTAssertNil(unreadableLoaded)
+
+        let lookup: (MeetingSessionID) async throws -> URL? = { try await store.existingSessionDirectory(for: $0) }
+        let folderOnly = await MeetAIBootstrap.isSessionLive(session.id, loadedIDs: [], directory: lookup)
+        XCTAssertTrue(folderOnly)
+        let missing = await MeetAIBootstrap.isSessionLive(UUID(), loadedIDs: [], directory: lookup)
+        XCTAssertFalse(missing)
+        let loaded = UUID()
+        let loadedLive = await MeetAIBootstrap.isSessionLive(loaded, loadedIDs: [loaded], directory: { _ in nil })
+        XCTAssertTrue(loadedLive)
+        struct Boom: Error {}
+        let throwingLive = await MeetAIBootstrap.isSessionLive(UUID(), loadedIDs: [], directory: { _ in throw Boom() })
+        XCTAssertTrue(throwingLive)
     }
 
     // MARK: Transcript helpers
