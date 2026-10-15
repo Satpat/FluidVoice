@@ -351,15 +351,9 @@ final class RewriteModeService: ObservableObject {
         let isTemperatureUnsupported = settings.isTemperatureUnsupported(model)
 
         // Get reasoning config for this model (e.g., reasoning_effort, enable_thinking)
-        let reasoningConfig = settings.getReasoningConfig(forModel: model, provider: providerID)
-        var extraParams: [String: Any] = [:]
-        if let rConfig = reasoningConfig, rConfig.isEnabled {
-            if rConfig.parameterName == "enable_thinking" {
-                extraParams = [rConfig.parameterName: rConfig.parameterValue == "true"]
-            } else {
-                extraParams = [rConfig.parameterName: rConfig.parameterValue]
-            }
-            DebugLogger.shared.debug("Added reasoning param: \(rConfig.parameterName)=\(rConfig.parameterValue)", source: "RewriteModeService")
+        let extraParams = settings.reasoningExtraParameters(forModel: model, provider: providerID)
+        if !extraParams.isEmpty {
+            DebugLogger.shared.debug("Added reasoning params: \(extraParams)", source: "RewriteModeService")
         }
 
         // Build LLMClient configuration

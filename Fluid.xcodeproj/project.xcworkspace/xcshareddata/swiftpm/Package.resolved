@@ -1,15 +1,6 @@
 {
-  "originHash" : "064855d16f7e949cfc68503de53276b1c6192736444e73922fc77d0a6b315471",
+  "originHash" : "19881cf430cebddf67bdededee003ed83096eedc4529796cd89f0bc698df642f",
   "pins" : [
-    {
-      "identity" : "appupdater",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/mxcl/AppUpdater.git",
-      "state" : {
-        "revision" : "1b60169700489f16cfbe2feb6b1e32ca5c9464b8",
-        "version" : "1.1.1"
-      }
-    },
     {
       "identity" : "dynamicnotchkit",
       "kind" : "remoteSourceControl",
@@ -34,16 +25,7 @@
       "location" : "https://github.com/altic-dev/FluidAudio.git",
       "state" : {
         "branch" : "B/cohere-coreml-asr",
-        "revision" : "72625bbccf9f6c797a540a1f1cb66a4cb60753eb"
-      }
-    },
-    {
-      "identity" : "foundation",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/PromiseKit/Foundation",
-      "state" : {
-        "revision" : "985f17fa69ee0e5b7eb3ff9be87ffc4e05fc0927",
-        "version" : "3.4.0"
+        "revision" : "3fd63887eef1dc25edea8263ce4b44aa854d898b"
       }
     },
     {
@@ -52,16 +34,7 @@
       "location" : "https://github.com/ejbills/mediaremote-adapter",
       "state" : {
         "branch" : "master",
-        "revision" : "78aae86c03adab11a7b352211cc82381737cf854"
-      }
-    },
-    {
-      "identity" : "path.swift",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/mxcl/Path.swift",
-      "state" : {
-        "revision" : "8e355c28e9393c42e58b18c54cace2c42c98a616",
-        "version" : "1.4.1"
+        "revision" : "5b6afde3f501a3da567e23bf7f23d562938a1809"
       }
     },
     {
@@ -133,15 +106,6 @@
       "location" : "https://github.com/exPHAT/SwiftWhisper.git",
       "state" : {
         "revision" : "a192004db08de7c6eaa169eede77f1625e7d23fb",
-        "version" : "1.2.0"
-      }
-    },
-    {
-      "identity" : "version",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/mxcl/Version",
-      "state" : {
-        "revision" : "200046c93f6d5d78a6d72bfd9c0b27a95e9c0a2b",
         "version" : "1.2.0"
       }
     },

@@ -14,6 +14,7 @@ enum SimpleUpdateError: Error, LocalizedError {
     case codesignMismatch
     case rollbackUnavailable
     case rollbackRestoreFailed
+    case updatesDisabledInFork
 
     var errorDescription: String? {
         switch self {
@@ -28,6 +29,7 @@ enum SimpleUpdateError: Error, LocalizedError {
         case .codesignMismatch: return "Downloaded app’s code signature does not match current app."
         case .rollbackUnavailable: return "No rollback backup is available."
         case .rollbackRestoreFailed: return "Failed to restore a previous version."
+        case .updatesDisabledInFork: return "In-app updates are disabled in the MeetAI v2 fork. Pull upstream changes and rebuild instead."
         }
     }
 }
@@ -298,6 +300,10 @@ final class SimpleUpdater {
         repo: String,
         includePrerelease: Bool = false
     ) async throws {
+        guard MeetAIBuildFlags.updaterEnabled else {
+            throw SimpleUpdateError.updatesDisabledInFork
+        }
+
         let releases = try await self.fetchReleases(owner: owner, repo: repo)
 
         guard let latest = self.selectLatestRelease(

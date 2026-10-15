@@ -78,8 +78,9 @@ struct MeetingTranscriptionView: View {
                         self.dropErrorCard(message: message)
                     }
 
-                    // Recent transcriptions (persisted history)
-                    if !self.fileHistoryStore.entries.isEmpty {
+                    // Recent transcriptions (persisted history; meeting
+                    // recordings live in the Meetings tab)
+                    if !self.fileEntries.isEmpty {
                         Divider()
                             .padding(.vertical, 8)
                         self.recentTranscriptionsSection
@@ -341,6 +342,10 @@ struct MeetingTranscriptionView: View {
 
     // MARK: - Recent Transcriptions Section
 
+    private var fileEntries: [FileTranscriptionEntry] {
+        self.fileHistoryStore.entries.filter { !$0.fileName.hasPrefix("Meeting ") }
+    }
+
     private var recentTranscriptionsSection: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack {
@@ -358,7 +363,7 @@ struct MeetingTranscriptionView: View {
             }
 
             VStack(spacing: 8) {
-                ForEach(self.fileHistoryStore.entries) { entry in
+                ForEach(self.fileEntries) { entry in
                     self.recentEntryRow(entry: entry)
                 }
             }

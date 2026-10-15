@@ -1303,6 +1303,23 @@ final class SettingsStore: ObservableObject {
         }
     }
 
+    /// Delete a meeting's raw audio (system.wav/mic.wav) once it has been
+    /// transcribed *and* successfully summarised (default: OFF). The
+    /// transcript and summary are kept; deleting the audio saves disk space
+    /// but permanently removes the ability to Re-transcribe that meeting
+    /// later, since Re-transcribe re-runs ASR/diarization on the original
+    /// audio. Audio is never deleted when the transcript is empty or the
+    /// summary failed.
+    var deleteMeetingAudioAfterTranscription: Bool {
+        get {
+            self.defaults.bool(forKey: Keys.deleteMeetingAudioAfterTranscription)
+        }
+        set {
+            objectWillChange.send()
+            self.defaults.set(newValue, forKey: Keys.deleteMeetingAudioAfterTranscription)
+        }
+    }
+
     /// Anonymous analytics toggle (default: ON). Uses default-true semantics so existing installs
     /// upgrading to a version that includes analytics do not silently default to OFF.
     var shareAnonymousAnalytics: Bool {
@@ -1505,7 +1522,7 @@ final class SettingsStore: ObservableObject {
             baseURL = ModelRepository.shared.defaultBaseURL(for: providerID)
         }
 
-        let isLocal = ModelRepository.shared.isLocalEndpoint(baseURL)
+        let isLocal = EndpointClassifier.isLocal(baseURL)
 
         // 3. Check for API key and selected model
         let key = self.canonicalProviderKey(for: providerID)
@@ -2159,7 +2176,10 @@ final class SettingsStore: ObservableObject {
 
     var playgroundUsed: Bool {
         get { self.defaults.bool(forKey: Keys.playgroundUsed) }
-        set { self.defaults.set(newValue, forKey: Keys.playgroundUsed) }
+        set {
+            objectWillChange.send()
+            self.defaults.set(newValue, forKey: Keys.playgroundUsed)
+        }
     }
 
     var onboardingCompleted: Bool {
@@ -2586,6 +2606,22 @@ final class SettingsStore: ObservableObject {
     }
 
     /// Get reasoning config for a specific model, with smart defaults for known models
+    /// Request-body parameters for the model's enabled reasoning config, e.g.
+    /// `["reasoning_effort": "low"]` or `["enable_thinking": true]` (DeepSeek
+    /// takes a boolean). Empty when reasoning is off for this model.
+    /// `responsesAPI` maps `reasoning_effort` to the OpenAI Responses API's
+    /// nested `reasoning: {effort:}` shape.
+    func reasoningExtraParameters(forModel model: String, provider: String, responsesAPI: Bool = false) -> [String: Any] {
+        guard let config = self.getReasoningConfig(forModel: model, provider: provider), config.isEnabled else { return [:] }
+        if responsesAPI, config.parameterName == "reasoning_effort" {
+            return ["reasoning": ["effort": config.parameterValue]]
+        }
+        if config.parameterName == "enable_thinking" {
+            return [config.parameterName: config.parameterValue == "true"]
+        }
+        return [config.parameterName: config.parameterValue]
+    }
+
     func getReasoningConfig(forModel model: String, provider: String) -> ModelReasoningConfig? {
         let key = "\(provider):\(model)"
 
@@ -2657,12 +2693,24 @@ final class SettingsStore: ObservableObject {
         let modelLower = model.lowercased()
         return modelLower.hasPrefix("gpt-5") ||
             modelLower.contains("gpt-5.") ||
+            Self.isGPTGeneration5OrLater(modelLower) ||
             modelLower.hasPrefix("o1") ||
             modelLower.hasPrefix("o3") ||
             modelLower.hasPrefix("o4") ||
             modelLower.contains("gpt-oss") ||
             modelLower.hasPrefix("openai/") ||
             (modelLower.contains("deepseek") && modelLower.contains("reasoner"))
+    }
+
+    /// GPT-5 and every later OpenAI generation (gpt-6.1-sol, gpt-7-mini, ...)
+    /// are reasoning models, including behind a provider prefix such as
+    /// "azure/gpt-6.1". Parses the major version so new generations work
+    /// without another hard-coded entry.
+    private static func isGPTGeneration5OrLater(_ modelLower: String) -> Bool {
+        let name = modelLower.split(separator: "/").last.map(String.init) ?? modelLower
+        guard name.hasPrefix("gpt-") else { return false }
+        guard let major = Int(name.dropFirst("gpt-".count).prefix(while: \.isNumber)) else { return false }
+        return major >= 5
     }
 
     /// Whether the model rejects the `temperature` parameter.
@@ -3382,7 +3430,7 @@ final class SettingsStore: ObservableObject {
 
         let baseURL = self.providerBaseURLForVerification(for: trimmed)
         let apiKey = (self.getAPIKey(for: trimmed) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        guard ModelRepository.shared.isLocalEndpoint(baseURL) || !apiKey.isEmpty else { return false }
+        guard EndpointClassifier.isLocal(baseURL) || !apiKey.isEmpty else { return false }
 
         return self.providerFingerprint(baseURL: baseURL, apiKey: apiKey) == stored
     }
@@ -4439,6 +4487,7 @@ private extension SettingsStore {
     enum Keys {
         static let enableAIProcessing = "EnableAIProcessing"
         static let showMainWindowAtLoginLaunch = "ShowMainWindowAtLoginLaunch"
+        static let deleteMeetingAudioAfterTranscription = "DeleteMeetingAudioAfterTranscription"
         static let dictationPromptOff = "DictationPromptOff"
         static let enableDebugLogs = "EnableDebugLogs"
         static let availableAIModels = "AvailableAIModels"

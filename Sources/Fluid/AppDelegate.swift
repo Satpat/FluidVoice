@@ -49,11 +49,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             properties: ["accessibility_trusted": AXIsProcessTrusted()]
         )
 
-        // Check for updates automatically if enabled (initial check on launch)
-        self.checkForUpdatesAutomatically()
+        if MeetAIBuildFlags.updaterEnabled {
+            // Check for updates automatically if enabled (initial check on launch)
+            self.checkForUpdatesAutomatically()
 
-        // Schedule periodic update checks every hour while app is running
-        self.schedulePeriodicUpdateChecks()
+            // Schedule periodic update checks every hour while app is running
+            self.schedulePeriodicUpdateChecks()
+        }
 
         // Login Items can launch hidden; reveal the real SwiftUI window so ContentView startup runs.
         self.openMainWindowOnLaunch()

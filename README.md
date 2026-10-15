@@ -223,6 +223,14 @@ Run the build using the script: `./build.sh`
 ./build.sh
 ```
 
+To build and install straight into `/Applications/FluidVoice.app` (ad-hoc signed, no Apple Developer account or team needed):
+
+```bash
+./build.sh install
+```
+
+Re-run this after every change you want to try in the actual installed app — it always overwrites `/Applications/FluidVoice.app` with the latest build. If FluidVoice is running, quit and relaunch it afterward to pick up the new build (overwriting the app bundle while it's running is safe and won't interrupt an in-progress recording, but the already-running process keeps executing the old code until relaunched).
+
 ---
 
 ## Contributing

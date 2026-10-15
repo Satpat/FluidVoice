@@ -68,6 +68,17 @@ final class AppServices: ObservableObject {
         return service
     }
 
+    /// Dictation runtime (lazily initialized; attached by ContentView on appear)
+    private var _dictation: DictationCoordinator?
+    var dictation: DictationCoordinator {
+        if let existing = self._dictation {
+            return existing
+        }
+        let coordinator = DictationCoordinator()
+        self._dictation = coordinator
+        return coordinator
+    }
+
     private var cancellables = Set<AnyCancellable>()
 
     private init() {

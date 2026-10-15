@@ -60,4 +60,20 @@ final class TemperatureSupportTests: XCTestCase {
             )
         }
     }
+
+    // GPT-5 and every later OpenAI generation reject `max_tokens` (they need
+    // `max_completion_tokens`) and `temperature`. The check used to hard-code
+    // gpt-5, so gpt-6.x models failed the connection test with HTTP 400
+    // "Unsupported parameter: 'max_tokens'".
+    func testReasoningModel_laterGPTGenerations() {
+        let reasoning = ["gpt-6.1-sol", "gpt-6", "gpt-6-mini", "gpt-7.2", "openai/gpt-6.1", "azure/gpt-6.1-sol"]
+        for model in reasoning {
+            XCTAssertTrue(SettingsStore.shared.isReasoningModel(model), "\(model) needs max_completion_tokens")
+            XCTAssertTrue(SettingsStore.shared.isTemperatureUnsupported(model), "\(model) rejects temperature")
+        }
+        let chat = ["gpt-4.1", "gpt-4o", "gpt-4o-mini", "gpt-3.5-turbo", "chatgpt-4o-latest", "gpt-4.1-nano"]
+        for model in chat {
+            XCTAssertFalse(SettingsStore.shared.isReasoningModel(model), "\(model) still uses max_tokens")
+        }
+    }
 }
