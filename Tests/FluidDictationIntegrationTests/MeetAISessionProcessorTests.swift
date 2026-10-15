@@ -59,6 +59,14 @@ final class FakeLLM: MeetAILLMCompleting {
     func descriptor() -> MeetAIProviderDescriptor { MeetAIProviderDescriptor(providerID: "fake", modelID: "fake-1") }
 }
 
+nonisolated struct SlowEmbedder: MeetAISpeakerEmbedding {
+    let vector: [Float]
+    func embedding(for turns: [MeetingTranscriptSegment], session: MeetingSession, sessionDirectory: URL) async throws -> [Float]? {
+        try await Task.sleep(for: .milliseconds(150))
+        return self.vector
+    }
+}
+
 @MainActor
 final class MeetAISessionProcessorTests: XCTestCase {
     private func vector(_ seed: Float) -> [Float] {
@@ -74,7 +82,7 @@ final class MeetAISessionProcessorTests: XCTestCase {
         let llm: FakeLLM
     }
 
-    private func harness(session: MeetingSession, embeddings: [String: [Float]] = [:], llm providedLLM: FakeLLM? = nil) throws -> Harness {
+    private func harness(session: MeetingSession, embeddings: [String: [Float]] = [:], llm providedLLM: FakeLLM? = nil, embedder: (any MeetAISpeakerEmbedding)? = nil) throws -> Harness {
         let llm = providedLLM ?? FakeLLM()
         let root = try MeetAIFixtures.tempDirectory(self)
         let paths = MeetAIPaths(supportRoot: root)
@@ -89,7 +97,7 @@ final class MeetAISessionProcessorTests: XCTestCase {
             sidecars: sidecars,
             profiles: profiles,
             settings: settings,
-            embedder: FakeEmbedder(bySpeakerText: embeddings),
+            embedder: embedder ?? FakeEmbedder(bySpeakerText: embeddings),
             llm: llm,
             mutator: { mutator },
             loadSession: { _ in mutator.deleted ? nil : mutator.session },
@@ -194,5 +202,20 @@ final class MeetAISessionProcessorTests: XCTestCase {
         XCTAssertTrue(h.mutator.renameCalls.isEmpty)
         let records = try await h.sidecars.speakers(for: session.id)
         XCTAssertTrue(records.isEmpty)
+    }
+
+    func testCorrectionDuringEmbeddingCaptureIsNotOverwritten() async throws {
+        let session = self.twoSpeakerSession()
+        let h = try self.harness(session: session, embedder: SlowEmbedder(vector: self.vector(0.1)))
+        let completion = Task { await h.processor.sessionDidComplete(session) }
+        try await Task.sleep(for: .milliseconds(30))
+        try h.mutator.session.renameSpeaker(id: session.speakers[2].id, to: "Priya")
+        h.processor.sessionCorrected(h.mutator.session)
+        await completion.value
+        await h.processor.enqueue(session.id) { _ in }.value
+        let records = try await h.sidecars.speakers(for: session.id)
+        XCTAssertEqual(records[session.speakers[2].id]?.nameSource, .user)
+        XCTAssertEqual(records[session.speakers[2].id]?.lastAppliedName, "Priya")
+        XCTAssertNotNil(records[session.speakers[2].id]?.embedding)
     }
 }

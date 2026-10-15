@@ -57,7 +57,8 @@ final class MeetAISessionProcessor: ObservableObject {
     /// H1. Awaited (bounded) by the coordinator: only the audio-dependent step runs inline.
     func sessionDidComplete(_ session: MeetingSession) async {
         if self.deps.settings.speakerMatching {
-            await self.captureEmbeddings(session)
+            // Queued so its sidecar read-modify-write cannot race an H6 correction (spec 5.5).
+            await self.enqueue(session.id) { await $0.captureEmbeddings(session) }.value
         }
         self.enqueue(session.id) { await $0.runAutomation(sessionID: session.id) }
     }
