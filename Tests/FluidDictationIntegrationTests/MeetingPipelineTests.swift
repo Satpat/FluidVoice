@@ -46,6 +46,24 @@ final class MeetingPipelineTests: XCTestCase {
         XCTAssertEqual(Double(utterances.first?.startSample ?? 0) / 16_000, 3.3, accuracy: 0.05)
     }
 
+    func testSplitOnSilence_longUtteranceSplitsEvenlyUnderCap() {
+        for (seconds, expectedChunks) in [(31.0, 2), (60.5, 3), (89.0, 3), (29.0, 1)] {
+            let samples = self.silence(1) + self.tone(seconds) + self.silence(1)
+            let utterances = MeetingTranscriptPipeline.splitOnSilence(samples: samples, sampleRate: self.sampleRate)
+            XCTAssertEqual(utterances.count, expectedChunks, "\(seconds)s utterance")
+            for utterance in utterances {
+                let length = utterance.endSample - utterance.startSample
+                XCTAssertLessThanOrEqual(length, 30 * self.sampleRate, "\(seconds)s: chunk over the 30 s cap")
+                if expectedChunks > 1 {
+                    XCTAssertGreaterThanOrEqual(length, 15 * self.sampleRate - 1, "\(seconds)s: chunk too short")
+                }
+            }
+            for (a, b) in zip(utterances, utterances.dropFirst()) {
+                XCTAssertEqual(a.endSample, b.startSample, "chunks must be contiguous")
+            }
+        }
+    }
+
     func testSplitOnSilence_emptyInput() {
         XCTAssertTrue(MeetingTranscriptPipeline.splitOnSilence(samples: [], sampleRate: self.sampleRate).isEmpty)
     }

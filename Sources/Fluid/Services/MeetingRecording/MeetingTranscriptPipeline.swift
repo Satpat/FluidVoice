@@ -726,16 +726,21 @@ final class MeetingTranscriptPipeline: ObservableObject {
             guard let start = utteranceStart else { return }
             let paddedEnd = min(endSample, samples.count)
             if paddedEnd - start >= minUtteranceSamples {
-                // Hard-cap long utterances so single segments stay well under
-                // provider limits. Stop cutting once the remainder would be
-                // shorter than the minimum utterance length, so the trailing
-                // chunk is never a sub-1s slice the ASR provider rejects.
+                // Hard-cap long utterances so single segments stay within
+                // provider limits (Whisper-style models window at 30 s).
+                // Split into equal chunks rather than max-size chunks plus a
+                // remainder: every chunk is then <= maxUtterance and, when a
+                // split happens at all, >= maxUtterance / 2 — never a sub-1s
+                // tail the ASR provider rejects.
+                let length = paddedEnd - start
+                let chunkCount = (length + maxUtteranceSamples - 1) / maxUtteranceSamples
+                let chunkLength = length / chunkCount
                 var chunkStart = start
-                while paddedEnd - chunkStart > maxUtteranceSamples + minUtteranceSamples {
-                    utterances.append(Utterance(startSample: chunkStart, endSample: chunkStart + maxUtteranceSamples))
-                    chunkStart += maxUtteranceSamples
+                for index in 0..<chunkCount {
+                    let chunkEnd = index == chunkCount - 1 ? paddedEnd : chunkStart + chunkLength
+                    utterances.append(Utterance(startSample: chunkStart, endSample: chunkEnd))
+                    chunkStart = chunkEnd
                 }
-                utterances.append(Utterance(startSample: chunkStart, endSample: paddedEnd))
             }
             utteranceStart = nil
             silentWindows = 0
