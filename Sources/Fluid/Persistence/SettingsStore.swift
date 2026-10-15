@@ -2693,12 +2693,24 @@ final class SettingsStore: ObservableObject {
         let modelLower = model.lowercased()
         return modelLower.hasPrefix("gpt-5") ||
             modelLower.contains("gpt-5.") ||
+            Self.isGPTGeneration5OrLater(modelLower) ||
             modelLower.hasPrefix("o1") ||
             modelLower.hasPrefix("o3") ||
             modelLower.hasPrefix("o4") ||
             modelLower.contains("gpt-oss") ||
             modelLower.hasPrefix("openai/") ||
             (modelLower.contains("deepseek") && modelLower.contains("reasoner"))
+    }
+
+    /// GPT-5 and every later OpenAI generation (gpt-6.1-sol, gpt-7-mini, ...)
+    /// are reasoning models, including behind a provider prefix such as
+    /// "azure/gpt-6.1". Parses the major version so new generations work
+    /// without another hard-coded entry.
+    private static func isGPTGeneration5OrLater(_ modelLower: String) -> Bool {
+        let name = modelLower.split(separator: "/").last.map(String.init) ?? modelLower
+        guard name.hasPrefix("gpt-") else { return false }
+        guard let major = Int(name.dropFirst("gpt-".count).prefix(while: \.isNumber)) else { return false }
+        return major >= 5
     }
 
     /// Whether the model rejects the `temperature` parameter.
