@@ -6,7 +6,7 @@
 import AVFoundation
 import Foundation
 
-enum MeetingUploadImporter {
+nonisolated enum MeetingUploadImporter {
     /// Placeholder length for the "Me" track. Uploaded files are a single
     /// mixed-down recording with no isolated mic feed, so there is nothing
     /// to put on that track — a short silence keeps `MeetingRecordingArtifacts`
@@ -17,35 +17,47 @@ enum MeetingUploadImporter {
     /// like a recorded meeting (system.wav + mic.wav + session.json), so the
     /// rest of the app (MeetingTranscriptPipeline, MeetingReprocessor,
     /// MeetingsView) can't tell the difference from a live recording.
-    nonisolated static func importArtifacts(
+    ///
+    /// Runs off the main actor and streams the conversion one chunk at a
+    /// time, so a multi-hour upload never sits in memory as a whole.
+    @concurrent
+    static func importArtifacts(
         from sourceURL: URL,
+        baseDirectory: URL,
         importedAt: Date = Date()
-    ) throws -> MeetingRecordingArtifacts {
-        let samples = try MeetingTranscriptPipeline.loadSamples16kMono(url: sourceURL)
-        guard !samples.isEmpty else {
-            throw MeetingRecordingError("No audio detected in \(sourceURL.lastPathComponent).")
-        }
-
-        let baseDirectory = MeetingRecordingSession.defaultBaseDirectory()
+    ) async throws -> MeetingRecordingArtifacts {
         let folderName = ISO8601DateFormatter.meetingFileSafe.string(from: importedAt)
         let folder = baseDirectory.appendingPathComponent(folderName, isDirectory: true)
+        guard !FileManager.default.fileExists(atPath: folder.path) else {
+            throw MeetingRecordingError("A meeting folder named \(folderName) already exists; try again in a moment.")
+        }
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
 
         do {
             let systemURL = folder.appendingPathComponent("system.wav")
             let micURL = folder.appendingPathComponent("mic.wav")
-            try Self.writeWav(samples: samples, to: systemURL)
-            try Self.writeWav(samples: Self.micPlaceholderSamples, to: micURL)
 
-            let duration = Double(samples.count) / 16_000
+            let systemWriter = try Self.makeWavWriter(url: systemURL)
+            var sampleCount = 0
+            try MeetingProcessingEngine.forEach16kMonoChunk(url: sourceURL) { chunk in
+                try Self.write(chunk, to: systemWriter)
+                sampleCount += chunk.count
+            }
+            guard sampleCount > 0 else {
+                throw MeetingRecordingError("No audio detected in \(sourceURL.lastPathComponent).")
+            }
+            try Self.write(Self.micPlaceholderSamples, to: Self.makeWavWriter(url: micURL))
+
+            let duration = Double(sampleCount) / Double(MeetingProcessingEngine.sampleRate)
             let artifacts = MeetingRecordingArtifacts(
                 folder: folder,
                 systemAudio: systemURL,
                 microphone: micURL,
                 startedAt: importedAt,
-                endedAt: importedAt.addingTimeInterval(duration)
+                endedAt: importedAt.addingTimeInterval(duration),
+                sourceFileName: sourceURL.lastPathComponent
             )
-            Self.writeManifest(artifacts)
+            try Self.writeManifest(artifacts)
             return artifacts
         } catch {
             // Don't leave a half-written session folder (partial audio, no
@@ -57,58 +69,42 @@ enum MeetingUploadImporter {
 
     /// Mirrors MeetingRecordingSession's manifest write so re-transcribe and
     /// reprocess-all find imported meetings the same way as recorded ones.
-    private static func writeManifest(_ artifacts: MeetingRecordingArtifacts) {
+    private static func writeManifest(_ artifacts: MeetingRecordingArtifacts) throws {
         let manifestURL = artifacts.folder.appendingPathComponent("session.json")
-        do {
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            encoder.dateEncodingStrategy = .iso8601
-            let data = try encoder.encode(artifacts)
-            try data.write(to: manifestURL, options: .atomic)
-        } catch {
-            DebugLogger.shared.warning(
-                "MeetingUploadImporter: manifest write failed: \(error.localizedDescription)",
-                source: "MeetingUploadImporter"
-            )
-        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(artifacts).write(to: manifestURL, options: .atomic)
     }
 
-    /// Write 16kHz mono Float32 samples out as 16-bit PCM WAV, matching the
-    /// format MeetingMicRecorder/ProcessTapRecorder use for live recordings.
-    private static func writeWav(samples: [Float], to url: URL) throws {
-        guard let format = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32, sampleRate: 16_000, channels: 1, interleaved: false
-        ) else {
-            throw MeetingRecordingError("Failed to build 16k mono format.")
-        }
+    /// 16 kHz mono 16-bit PCM WAV, matching the format
+    /// MeetingMicRecorder/ProcessTapRecorder use for live recordings.
+    private static func makeWavWriter(url: URL) throws -> AVAudioFile {
         let settings: [String: Any] = [
             AVFormatIDKey: kAudioFormatLinearPCM,
-            AVSampleRateKey: 16_000,
+            AVSampleRateKey: MeetingProcessingEngine.sampleRate,
             AVNumberOfChannelsKey: 1,
             AVLinearPCMBitDepthKey: 16,
             AVLinearPCMIsFloatKey: false,
             AVLinearPCMIsBigEndianKey: false,
         ]
-        let file = try AVAudioFile(
-            forWriting: url, settings: settings, commonFormat: .pcmFormatFloat32, interleaved: false
-        )
+        return try AVAudioFile(forWriting: url, settings: settings, commonFormat: .pcmFormatFloat32, interleaved: false)
+    }
 
-        let chunkSize = 16_000 * 60 // 1 minute per write, matching loadSamples16kMono's read chunking
-        var offset = 0
-        while offset < samples.count {
-            let end = min(offset + chunkSize, samples.count)
-            let frameCount = AVAudioFrameCount(end - offset)
-            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else {
-                throw MeetingRecordingError("Failed to allocate WAV write buffer.")
-            }
-            buffer.frameLength = frameCount
-            if let channel = buffer.floatChannelData {
-                for i in 0..<Int(frameCount) {
-                    channel[0][i] = samples[offset + i]
-                }
-            }
-            try file.write(from: buffer)
-            offset = end
+    private static func write(_ samples: [Float], to file: AVAudioFile) throws {
+        guard !samples.isEmpty else { return }
+        guard let buffer = AVAudioPCMBuffer(
+            pcmFormat: file.processingFormat,
+            frameCapacity: AVAudioFrameCount(samples.count)
+        ) else {
+            throw MeetingRecordingError("Failed to allocate WAV write buffer.")
         }
+        buffer.frameLength = AVAudioFrameCount(samples.count)
+        if let channel = buffer.floatChannelData {
+            samples.withUnsafeBufferPointer { source in
+                channel[0].update(from: source.baseAddress!, count: samples.count)
+            }
+        }
+        try file.write(from: buffer)
     }
 }

@@ -124,9 +124,7 @@ final class SpeakerProfileStore: ObservableObject {
     // MARK: - Vector math
 
     static func normalize(_ vector: [Float]) -> [Float] {
-        let norm = vector.reduce(Float(0)) { $0 + $1 * $1 }.squareRoot()
-        guard norm > 0 else { return vector }
-        return vector.map { $0 / norm }
+        MeetingProcessingEngine.normalize(vector)
     }
 
     static func dot(_ a: [Float], _ b: [Float]) -> Float {

@@ -12,14 +12,16 @@ extension MeetingRecordingSession {
 struct MeetingRecorderCard: View {
     @State private var session = MeetingRecordingSession.shared
     @ObservedObject private var liveTranscriber = MeetingLiveTranscriber.shared
-    @StateObject private var pipeline: MeetingTranscriptPipeline
+    // Shared so an in-flight transcription's progress survives the card
+    // being recreated by sidebar navigation.
+    @ObservedObject private var pipeline: MeetingTranscriptPipeline
     @Environment(\.theme) private var theme
 
     private let asrService: ASRService
 
     init(asrService: ASRService) {
         self.asrService = asrService
-        _pipeline = StateObject(wrappedValue: MeetingTranscriptPipeline(asrService: asrService))
+        _pipeline = ObservedObject(wrappedValue: MeetingTranscriptPipeline.shared(.recorder, asrService: asrService))
     }
 
     private func startRecording() {

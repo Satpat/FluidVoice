@@ -3,20 +3,37 @@
 // Transcribes mic.wav ("Me") and system.wav ("Them") separately with the
 // active ASR provider, using silence-based utterance splitting so both
 // tracks can be interleaved by timestamp into one speaker-labelled
-// transcript. Output is written next to the recordings and registered in
-// the file-transcription history.
+// transcript. Writes transcript.md, summary.md, title.txt and speakers.json
+// next to the recordings and registers the meeting in the file-transcription
+// history.
+//
+// This class is the @MainActor coordinator: it publishes progress and owns
+// the steps that need main-actor state (ASR provider, voice profiles,
+// history store, AI calls). CPU-heavy stages — decode, VAD, diarization,
+// echo suppression, rendering — run off the main actor in
+// MeetingProcessingEngine.
 
-import AVFoundation
 import Combine
-import FluidAudio
 import Foundation
 
-struct MeetingSegment: Sendable, Identifiable {
+nonisolated struct MeetingSegment: Sendable, Identifiable {
     let id = UUID()
     let start: TimeInterval
     let end: TimeInterval
     let speaker: String
     let text: String
+}
+
+/// What a completed `MeetingTranscriptPipeline.process` produced.
+struct MeetingProcessingResult {
+    let transcriptURL: URL
+    /// FileTranscriptionHistoryStore entry for this meeting; nil when the
+    /// transcript is empty (the store doesn't keep empty entries).
+    let historyEntryID: UUID?
+    /// Plain "[MM:SS] Speaker: text" transcript; empty when no speech was found.
+    let mergedText: String
+    let title: String
+    let summaryError: String?
 }
 
 @MainActor
@@ -35,24 +52,32 @@ final class MeetingTranscriptPipeline: ObservableObject {
     /// specific meeting row.
     @Published var processingFolderName: String?
 
-    /// Shared instance for history re-transcribes. Sidebar navigation
-    /// recreates MeetingsView (and any @StateObject in it), so a per-view
-    /// pipeline loses its progress and button-disabling state mid-run;
-    /// the shared instance keeps them visible wherever the user navigates.
-    private static var sharedReprocessorInstance: MeetingTranscriptPipeline?
-    static func sharedReprocessor(asrService: ASRService) -> MeetingTranscriptPipeline {
-        if let existing = sharedReprocessorInstance { return existing }
+    /// Long-lived pipelines whose progress must survive SwiftUI view
+    /// recreation (sidebar navigation recreates MeetingsView and the
+    /// recorder card, and with them any @StateObject).
+    enum Role {
+        /// Transcribes a just-stopped live recording (MeetingRecorderCard).
+        case recorder
+        /// Re-transcribes meetings from the Meetings history.
+        case reprocessor
+    }
+
+    private static var sharedInstances: [Role: MeetingTranscriptPipeline] = [:]
+    static func shared(_ role: Role, asrService: ASRService) -> MeetingTranscriptPipeline {
+        if let existing = sharedInstances[role] { return existing }
         let created = MeetingTranscriptPipeline(asrService: asrService)
-        sharedReprocessorInstance = created
+        sharedInstances[role] = created
         return created
     }
 
     private let asrService: ASRService
 
-    /// Speaker label for the microphone track. The mic is provably the local
-    /// user, which is the whole point of recording two tracks.
-    static let micSpeakerLabel = "Me"
-    static let systemSpeakerLabel = "Them"
+    static let micSpeakerLabel = MeetingProcessingEngine.micSpeakerLabel
+    static let systemSpeakerLabel = MeetingProcessingEngine.systemSpeakerLabel
+
+    /// Consecutive per-utterance ASR failures after which the provider is
+    /// treated as broken rather than the audio as unusable.
+    private static let maxConsecutiveUtteranceFailures = 5
 
     init(asrService: ASRService) {
         self.asrService = asrService
@@ -60,26 +85,30 @@ final class MeetingTranscriptPipeline: ObservableObject {
 
     // MARK: - Entry point
 
-    /// Transcribe both tracks of a recording and write transcript.md/.json
-    /// into the session folder.
+    /// Transcribe both tracks of a recording and write transcript.md (plus
+    /// summary, title and speaker embeddings) into the session folder.
     @discardableResult
-    func process(_ artifacts: MeetingRecordingArtifacts) async throws -> URL {
+    func process(_ artifacts: MeetingRecordingArtifacts) async throws -> MeetingProcessingResult {
         let folderName = artifacts.folder.lastPathComponent
-        guard MeetingFolderActivity.shared.begin(folderName) else {
+        guard MeetingFolderActivity.shared.begin(folderName, .transcribing) else {
             throw MeetingRecordingError("This meeting is already being processed.")
         }
 
         self.isProcessing = true
         self.processingFolderName = folderName
         self.error = nil
+        self.summary = nil
+        self.summaryError = nil
+        self.meetingTitle = nil
         self.progress = 0.0
         let startTime = Date()
 
+        // Progress is deliberately not reset here: observers (e.g. the
+        // upload view) read the final 1.0 after the run completes.
         defer {
             MeetingFolderActivity.shared.end(folderName)
             isProcessing = false
             processingFolderName = nil
-            progress = 0.0
         }
 
         do {
@@ -92,42 +121,50 @@ final class MeetingTranscriptPipeline: ObservableObject {
                 throw MeetingRecordingError("Transcription provider not ready")
             }
 
+            // One track in memory at a time: the mic track's samples are
+            // released before the system track is decoded.
             self.currentStatus = "Transcribing your microphone track..."
-            let micSamples = try Self.loadSamples16kMono(url: artifacts.microphone)
             let micSegments = try await self.transcribeTrack(
-                samples: micSamples,
+                url: artifacts.microphone,
                 speaker: Self.micSpeakerLabel,
                 provider: provider,
                 progressRange: 0.05...0.4
-            )
+            ).segments
 
             self.currentStatus = "Transcribing the system-audio track..."
-            let systemSamples = try Self.loadSamples16kMono(url: artifacts.systemAudio)
-            var systemSegments = try await self.transcribeTrack(
-                samples: systemSamples,
-                speaker: Self.systemSpeakerLabel,
-                provider: provider,
-                progressRange: 0.4...0.75
-            )
-
             var embeddingByLabel: [String: [Float]] = [:]
-            if !systemSegments.isEmpty {
-                self.currentStatus = "Identifying speakers..."
-                self.progress = 0.8
-                let resolution = await Self.resolveSpeakers(to: systemSegments, samples: systemSamples)
-                systemSegments = resolution.segments
-                embeddingByLabel = resolution.embeddingByLabel
+            var systemSegments: [MeetingSegment]
+            do {
+                let track = try await self.transcribeTrack(
+                    url: artifacts.systemAudio,
+                    speaker: Self.systemSpeakerLabel,
+                    provider: provider,
+                    progressRange: 0.4...0.75
+                )
+                systemSegments = track.segments
+                if track.diarizable, !systemSegments.isEmpty {
+                    self.currentStatus = "Identifying speakers..."
+                    self.progress = 0.8
+                    let resolution = await Self.resolveSpeakers(to: systemSegments, samples: track.samples)
+                    systemSegments = resolution.segments
+                    embeddingByLabel = resolution.embeddingByLabel
+                }
             }
 
             self.currentStatus = "Merging tracks..."
             self.progress = 0.92
-            var merged = (micSegments + systemSegments).sorted { $0.start < $1.start }
-
             // Echo backstop: when recording with speakers + mic, the far-end
             // voice bleeds into the mic and duplicates onto the "Me" track.
             // Drop any mic segment that echoes a near-simultaneous system
             // segment so leaked audio never appears attributed to the user.
-            merged = Self.suppressEcho(in: merged)
+            let mergeResult = await MeetingProcessingEngine.mergeSuppressingEcho(mic: micSegments, system: systemSegments)
+            var merged = mergeResult.segments
+            if mergeResult.droppedEchoes > 0 {
+                DebugLogger.shared.info(
+                    "Echo suppression removed \(mergeResult.droppedEchoes) leaked mic segment(s)",
+                    source: "MeetingTranscriptPipeline"
+                )
+            }
 
             // Replace remaining "Them N" labels with real names when the
             // transcript reveals them (self-introductions, direct address).
@@ -143,64 +180,80 @@ final class MeetingTranscriptPipeline: ObservableObject {
             // Persist voice identities: enrol every speaker that ended up with
             // a real name (recognised from a profile, or discovered from the
             // transcript) so the same voice is recognised in future meetings.
-            await Self.enrollProfiles(embeddingByLabel: embeddingByLabel, appliedNameMap: appliedNameMap)
+            Self.enrollProfiles(embeddingByLabel: embeddingByLabel, appliedNameMap: appliedNameMap)
             Self.writeSpeakerEmbeddings(embeddingByLabel, folder: artifacts.folder)
 
-            let markdown = Self.renderMarkdown(segments: merged, artifacts: artifacts)
+            let rendered = await MeetingProcessingEngine.render(segments: merged, artifacts: artifacts)
             let transcriptURL = artifacts.folder.appendingPathComponent("transcript.md")
-            try markdown.write(to: transcriptURL, atomically: true, encoding: .utf8)
+            try rendered.markdown.write(to: transcriptURL, atomically: true, encoding: .utf8)
 
-            let mergedText = merged
-                .map { "[\(Self.timestamp($0.start))] \($0.speaker): \($0.text)" }
-                .joined(separator: "\n")
+            let mergedText = rendered.mergedText
             let fileName = "Meeting \(artifacts.displayName)"
             // Replace any prior transcript for this same recording so
             // re-transcribing updates in place instead of duplicating.
             for existing in FileTranscriptionHistoryStore.shared.entries where existing.fileName == fileName {
                 FileTranscriptionHistoryStore.shared.deleteEntry(id: existing.id)
             }
-            let historyEntry = TranscriptionResult(
+            let historyEntryID = FileTranscriptionHistoryStore.shared.addEntry(TranscriptionResult(
                 text: mergedText,
                 confidence: 1.0,
                 duration: artifacts.duration,
                 processingTime: Date().timeIntervalSince(startTime),
                 fileName: fileName
-            )
-            FileTranscriptionHistoryStore.shared.addEntry(historyEntry)
+            ))
 
-            self.currentStatus = "Summarizing..."
-            self.progress = 0.96
-            await self.summarize(mergedText: mergedText, artifacts: artifacts)
+            let titleLine: String
+            if mergedText.isEmpty {
+                // Nothing to summarise or title; keep the audio regardless of
+                // the delete setting so the user can retry.
+                titleLine = "Meeting (\(Self.friendlyDate(artifacts.startedAt)))"
+            } else {
+                self.currentStatus = "Summarizing..."
+                self.progress = 0.96
+                await self.summarize(mergedText: mergedText, artifacts: artifacts)
 
-            // Friendly meeting name: short generated title + readable date,
-            // shown in place of the raw folder timestamp everywhere.
-            self.currentStatus = "Naming meeting..."
-            self.progress = 0.98
-            let titleLine = await Self.generateTitleLine(
-                context: self.summary ?? mergedText,
-                startedAt: artifacts.startedAt
-            )
+                // Friendly meeting name: short generated title + readable date,
+                // shown in place of the raw folder timestamp everywhere.
+                self.currentStatus = "Naming meeting..."
+                self.progress = 0.98
+                titleLine = await Self.generateTitleLine(
+                    context: self.summary ?? mergedText,
+                    startedAt: artifacts.startedAt
+                )
+
+                // Only once both the transcript and the summary exist: deleting
+                // audio after a failed summary (e.g. local LLM not running)
+                // would leave nothing to retry from but the transcript.
+                if self.summary != nil, self.summaryError == nil {
+                    Self.deleteAudioIfConfigured(artifacts)
+                }
+            }
             Self.writeTitle(titleLine, folder: artifacts.folder)
             self.meetingTitle = titleLine
-
-            Self.deleteAudioIfConfigured(artifacts)
 
             self.currentStatus = "Complete!"
             self.progress = 1.0
             self.transcriptURL = transcriptURL
-            return transcriptURL
+            return MeetingProcessingResult(
+                transcriptURL: transcriptURL,
+                historyEntryID: historyEntryID,
+                mergedText: mergedText,
+                title: titleLine,
+                summaryError: self.summaryError
+            )
         } catch {
             self.error = error.localizedDescription
+            self.progress = 0.0
             throw error
         }
     }
 
-    /// Delete a meeting's raw audio once it's been transcribed (and
-    /// best-effort summarised), if the user has that enabled. The transcript
-    /// and summary are kept; only system.wav/mic.wav go. Best-effort: a
-    /// failed delete doesn't fail the pipeline. This makes Re-transcribe
-    /// unavailable for the meeting going forward (see
-    /// MeetingReprocessor.artifacts, which checks the files still exist).
+    /// Delete a meeting's raw audio once it's been transcribed and summarised,
+    /// if the user has opted in. The transcript and summary are kept; only
+    /// system.wav/mic.wav go. Best-effort: a failed delete doesn't fail the
+    /// pipeline. This makes Re-transcribe unavailable for the meeting going
+    /// forward (see MeetingReprocessor.artifacts, which checks the files
+    /// still exist).
     private static func deleteAudioIfConfigured(_ artifacts: MeetingRecordingArtifacts) {
         guard SettingsStore.shared.deleteMeetingAudioAfterTranscription else { return }
         for url in [artifacts.systemAudio, artifacts.microphone] {
@@ -220,8 +273,8 @@ final class MeetingTranscriptPipeline: ObservableObject {
 
         do {
             let body = try await Self.generateSummaryBody(mergedText: mergedText)
+            try Self.writeSummary(body: body, displayName: artifacts.displayName, folder: artifacts.folder)
             self.summary = body
-            try? Self.writeSummary(body: body, displayName: artifacts.displayName, folder: artifacts.folder)
         } catch {
             self.summaryError = error.localizedDescription
             DebugLogger.shared.warning(
@@ -271,7 +324,7 @@ final class MeetingTranscriptPipeline: ObservableObject {
     /// transcript.md, without re-running transcription or diarization.
     static func regenerateSummary(folder: URL, style: MeetingSummaryStyle = .current) async throws {
         let folderName = folder.lastPathComponent
-        guard MeetingFolderActivity.shared.begin(folderName) else {
+        guard MeetingFolderActivity.shared.begin(folderName, .summarizing) else {
             throw MeetingRecordingError("This meeting is already being processed.")
         }
         defer { MeetingFolderActivity.shared.end(folderName) }
@@ -280,22 +333,12 @@ final class MeetingTranscriptPipeline: ObservableObject {
         guard let markdown = try? String(contentsOf: transcriptURL, encoding: .utf8) else {
             throw MeetingRecordingError("No transcript found for this meeting.")
         }
-        let plain = Self.plainTranscript(markdown)
+        let plain = MeetingProcessingEngine.plainTranscript(markdown)
         guard !plain.isEmpty else {
             throw MeetingRecordingError("The transcript for this meeting is empty.")
         }
         let body = try await Self.generateSummaryBody(mergedText: plain, style: style)
         try Self.writeSummary(body: body, displayName: folder.lastPathComponent, folder: folder)
-    }
-
-    /// Strip Markdown header/bold from transcript.md so the summary model
-    /// sees plain "[MM:SS] Speaker: ..." lines.
-    static func plainTranscript(_ markdown: String) -> String {
-        markdown
-            .components(separatedBy: "\n")
-            .filter { $0.contains("]") && $0.contains(":") }
-            .map { $0.replacingOccurrences(of: "**", with: "") }
-            .joined(separator: "\n")
     }
 
     // MARK: - Meeting title
@@ -340,34 +383,96 @@ final class MeetingTranscriptPipeline: ObservableObject {
 
     // MARK: - Per-track transcription
 
+    private struct TrackTranscription {
+        let segments: [MeetingSegment]
+        /// 16 kHz mono samples, kept for diarization.
+        let samples: [Float]
+        /// False when the track was transcribed as one block by the
+        /// provider's native file path, so there are no per-utterance
+        /// timestamps to diarize against.
+        let diarizable: Bool
+    }
+
+    /// Decode a track off the main actor, then transcribe it utterance by
+    /// utterance. If utterance-level ASR fails outright and the provider has
+    /// its own whole-file path (Cohere/Nemotron), fall back to that as a
+    /// single segment rather than losing the track.
     private func transcribeTrack(
-        samples: [Float],
+        url: URL,
+        speaker: String,
+        provider: TranscriptionProvider,
+        progressRange: ClosedRange<Double>
+    ) async throws -> TrackTranscription {
+        let track = try await MeetingProcessingEngine.decodeAndSplit(url: url)
+        do {
+            let segments = try await self.transcribeUtterances(
+                track: track,
+                speaker: speaker,
+                provider: provider,
+                progressRange: progressRange
+            )
+            return TrackTranscription(segments: segments, samples: track.samples, diarizable: true)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch where provider.prefersNativeFileTranscription {
+            DebugLogger.shared.warning(
+                "Utterance ASR failed for \(url.lastPathComponent) (\(error.localizedDescription)); "
+                    + "falling back to \(provider.name) native file transcription",
+                source: "MeetingTranscriptPipeline"
+            )
+            let result = try await provider.transcribeFile(at: url)
+            let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let segments = text.isEmpty
+                ? []
+                : [MeetingSegment(start: 0, end: track.duration, speaker: speaker, text: text)]
+            self.progress = progressRange.upperBound
+            return TrackTranscription(segments: segments, samples: track.samples, diarizable: false)
+        }
+    }
+
+    /// Transcribe each utterance. A single bad utterance is skipped, but a
+    /// run of failures (or every utterance failing) means the provider is
+    /// broken and must fail the pipeline instead of producing an empty
+    /// transcript that looks like success. Cancellation always propagates.
+    private func transcribeUtterances(
+        track: MeetingProcessingEngine.DecodedTrack,
         speaker: String,
         provider: TranscriptionProvider,
         progressRange: ClosedRange<Double>
     ) async throws -> [MeetingSegment] {
-        let utterances = Self.splitOnSilence(samples: samples, sampleRate: 16_000)
+        let utterances = track.utterances
         var segments: [MeetingSegment] = []
+        var failures = 0
+        var consecutiveFailures = 0
 
         for (index, utterance) in utterances.enumerated() {
-            let slice = Array(samples[utterance.startSample..<utterance.endSample])
+            try Task.checkCancellation()
+            let slice = Array(track.samples[utterance.startSample..<utterance.endSample])
             let result: ASRTranscriptionResult
             do {
                 result = try await provider.transcribe(slice)
+                consecutiveFailures = 0
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
-                // One bad utterance shouldn't abort a long recording's
-                // transcription — skip it and keep going.
+                failures += 1
+                consecutiveFailures += 1
                 DebugLogger.shared.warning(
                     "Skipping unusable utterance (\(slice.count) samples): \(error.localizedDescription)",
                     source: "MeetingTranscriptPipeline"
                 )
+                if consecutiveFailures >= Self.maxConsecutiveUtteranceFailures || failures == utterances.count {
+                    throw MeetingRecordingError(
+                        "Speech recognition failed on \(failures) of \(utterances.count) utterances: \(error.localizedDescription)"
+                    )
+                }
                 continue
             }
             let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
             if !text.isEmpty {
                 segments.append(MeetingSegment(
-                    start: TimeInterval(utterance.startSample) / 16_000,
-                    end: TimeInterval(utterance.endSample) / 16_000,
+                    start: TimeInterval(utterance.startSample) / TimeInterval(MeetingProcessingEngine.sampleRate),
+                    end: TimeInterval(utterance.endSample) / TimeInterval(MeetingProcessingEngine.sampleRate),
                     speaker: speaker,
                     text: text
                 ))
@@ -379,186 +484,34 @@ final class MeetingTranscriptPipeline: ObservableObject {
         return segments
     }
 
-    // MARK: - Echo suppression (speaker -> mic bleed)
-
-    /// Remove "Me" (mic) segments that duplicate a near-simultaneous system
-    /// segment — the acoustic bleed of the far-end voice through the speakers.
-    /// System audio never contains the mic, so a shared utterance is always
-    /// leak on the mic side; keep the system copy, drop the mic echo.
-    static func suppressEcho(in segments: [MeetingSegment]) -> [MeetingSegment] {
-        let micLabel = Self.micSpeakerLabel
-        let systemSegments = segments.filter { $0.speaker != micLabel }
-        guard !systemSegments.isEmpty else { return segments }
-
-        let systemTokens = systemSegments.map { (seg: $0, tokens: Self.tokenSet($0.text)) }
-        let windowSeconds = 5.0
-
-        var kept: [MeetingSegment] = []
-        var dropped = 0
-        for segment in segments {
-            if segment.speaker == micLabel {
-                let tokens = Self.tokenSet(segment.text)
-                if !tokens.isEmpty {
-                    let isEcho = systemTokens.contains { candidate in
-                        guard abs(candidate.seg.start - segment.start) <= windowSeconds
-                            || Self.overlaps(segment, candidate.seg) else { return false }
-                        return Self.tokenSimilarity(tokens, candidate.tokens) >= 0.6
-                    }
-                    if isEcho {
-                        dropped += 1
-                        continue
-                    }
-                }
-            }
-            kept.append(segment)
-        }
-        if dropped > 0 {
-            DebugLogger.shared.info("Echo suppression removed \(dropped) leaked mic segment(s)", source: "MeetingTranscriptPipeline")
-        }
-        return kept
-    }
-
-    private static func overlaps(_ a: MeetingSegment, _ b: MeetingSegment) -> Bool {
-        min(a.end, b.end) - max(a.start, b.start) > 0
-    }
-
-    private static func tokenSet(_ text: String) -> Set<String> {
-        let lowered = text.lowercased()
-        let cleaned = lowered.map { $0.isLetter || $0.isNumber || $0.isWhitespace ? $0 : " " }
-        return Set(String(cleaned).split(whereSeparator: { $0.isWhitespace }).map(String.init))
-    }
-
-    /// Symmetric token overlap: |A∩B| / |smaller set|, so a short echoed
-    /// phrase still matches a longer system segment that contains it.
-    private static func tokenSimilarity(_ a: Set<String>, _ b: Set<String>) -> Double {
-        guard !a.isEmpty, !b.isEmpty else { return 0 }
-        let intersection = a.intersection(b).count
-        return Double(intersection) / Double(min(a.count, b.count))
-    }
-
     // MARK: - Speaker diarization + identity ("Them" track)
 
-    struct SpeakerResolution {
-        var segments: [MeetingSegment]
-        /// Final label -> L2-normalised voice centroid, for enrolment and for
-        /// persisting per-meeting so speakers can be named manually later.
-        var embeddingByLabel: [String: [Float]]
-    }
-
-    /// Diarize the system track, relabel each segment by its dominant speaker,
-    /// and resolve identities: a cluster matching a saved voice profile takes
-    /// that person's name; otherwise it becomes "Them"/"Them N". Also returns
-    /// each final label's voice centroid. Best-effort: any diarizer failure
-    /// keeps the plain "Them" labels and no embeddings.
+    /// Diarize the system track (off the main actor), match each speaker's
+    /// voice against saved profiles, and relabel each segment by its
+    /// dominant speaker. Best-effort: any diarizer failure keeps the plain
+    /// "Them" labels and no embeddings.
     static func resolveSpeakers(
         to segments: [MeetingSegment],
         samples: [Float]
-    ) async -> SpeakerResolution {
-        let result: DiarizationResult
+    ) async -> MeetingProcessingEngine.SpeakerResolution {
+        let diarization: MeetingProcessingEngine.Diarization
         do {
-            // The offline (pyannote community-1) pipeline was tried here as a
-            // fix for cross-talk fragmenting one speaker into duplicate labels,
-            // since it clusters globally and excludes overlapping-speech
-            // frames from embedding extraction. Measured on an actual noisy
-            // single-mic room recording it was worse, not better: at every
-            // clustering threshold from 0.3 to 0.9 it collapsed the entire
-            // 38-minute, ~6-person conversation into one speaker. The
-            // streaming clusterer at least partially separates people; a
-            // slightly higher threshold (0.75 vs. the library default 0.7)
-            // measurably drops the smallest spurious clusters without yet
-            // triggering the same collapse (which starts around 0.8 on this
-            // recording).
-            let config = DiarizerConfig(clusteringThreshold: 0.75)
-            let models = try await DiarizerModels.downloadIfNeeded()
-            let diarizer = DiarizerManager(config: config)
-            diarizer.initialize(models: models)
-            defer { diarizer.cleanup() }
-            result = try diarizer.performCompleteDiarization(samples, sampleRate: 16_000)
+            diarization = try await MeetingProcessingEngine.diarize(samples: samples)
         } catch {
             DebugLogger.shared.warning(
                 "Diarization skipped: \(error.localizedDescription)",
                 source: "MeetingTranscriptPipeline"
             )
-            return SpeakerResolution(segments: segments, embeddingByLabel: [:])
+            return MeetingProcessingEngine.SpeakerResolution(segments: segments, embeddingByLabel: [:])
         }
 
-        // Drop clusters that are almost certainly noise/cross-talk blips
-        // rather than a real speaker: on a real recording these consistently
-        // show up as one- or two-segment clusters totalling only a couple of
-        // seconds, regardless of clustering threshold. Left in, they mint a
-        // "Them N" identity that never actually gets assigned to any
-        // transcribed line (no utterance overlaps them enough to be
-        // "dominant"), so they only clutter speakers.json and the naming UI.
-        let minSpeakerDuration = 2.0
-        var durationById: [String: Double] = [:]
-        for segment in result.segments {
-            durationById[segment.speakerId, default: 0] += Double(segment.endTimeSeconds - segment.startTimeSeconds)
-        }
-        let speakerSegments = result.segments.filter { (durationById[$0.speakerId] ?? 0) >= minSpeakerDuration }
-        let speakerIds = speakerSegments.map(\.speakerId)
-        let distinctSpeakers = Set(speakerIds)
-        guard !distinctSpeakers.isEmpty else {
-            return SpeakerResolution(segments: segments, embeddingByLabel: [:])
-        }
-
-        // Centroid embedding per diarized speaker: prefer the diarizer's own
-        // speaker database, else average that speaker's segment embeddings.
-        var centroidById: [String: [Float]] = [:]
-        for id in distinctSpeakers {
-            if let dbEmbedding = result.speakerDatabase?[id] {
-                centroidById[id] = SpeakerProfileStore.normalize(dbEmbedding)
-            } else {
-                let embeddings = speakerSegments.filter { $0.speakerId == id }.map(\.embedding).filter { !$0.isEmpty }
-                if let averaged = Self.averageEmbedding(embeddings) {
-                    centroidById[id] = averaged
-                }
+        var matchedNames: [String: String] = [:]
+        for (id, centroid) in diarization.centroids {
+            if let name = SpeakerProfileStore.shared.bestMatchName(for: centroid) {
+                matchedNames[id] = name
             }
         }
-
-        // Resolve a display name per speaker id: known profile match, else a
-        // provisional "Them"/"Them N".
-        let matchedNames: [String: String?] = await MainActor.run {
-            var out: [String: String?] = [:]
-            for (id, centroid) in centroidById {
-                out[id] = SpeakerProfileStore.shared.bestMatchName(for: centroid)
-            }
-            return out
-        }
-
-        var provisionalNumber: [String: Int] = [:]
-        let singleUnmatched = distinctSpeakers.count == 1 && (matchedNames.values.first ?? nil) == nil
-        for id in speakerSegments.sorted(by: { $0.startTimeSeconds < $1.startTimeSeconds }).map(\.speakerId) {
-            guard provisionalNumber[id] == nil, (matchedNames[id] ?? nil) == nil else { continue }
-            provisionalNumber[id] = provisionalNumber.count + 1
-        }
-
-        func label(for id: String) -> String {
-            if let matched = matchedNames[id] ?? nil { return matched }
-            if singleUnmatched { return Self.systemSpeakerLabel }
-            return "\(Self.systemSpeakerLabel) \(provisionalNumber[id] ?? 1)"
-        }
-
-        var embeddingByLabel: [String: [Float]] = [:]
-        for (id, centroid) in centroidById {
-            embeddingByLabel[label(for: id)] = centroid
-        }
-
-        let relabelled = segments.map { segment -> MeetingSegment in
-            var overlapBySpeaker: [String: Double] = [:]
-            for speakerSegment in speakerSegments {
-                let overlap = min(segment.end, Double(speakerSegment.endTimeSeconds))
-                    - max(segment.start, Double(speakerSegment.startTimeSeconds))
-                if overlap > 0 {
-                    overlapBySpeaker[speakerSegment.speakerId, default: 0] += overlap
-                }
-            }
-            guard let dominant = overlapBySpeaker.max(by: { $0.value < $1.value })?.key else {
-                return segment
-            }
-            return MeetingSegment(start: segment.start, end: segment.end, speaker: label(for: dominant), text: segment.text)
-        }
-
-        return SpeakerResolution(segments: relabelled, embeddingByLabel: embeddingByLabel)
+        return MeetingProcessingEngine.assignSpeakers(to: segments, diarization: diarization, matchedNames: matchedNames)
     }
 
     /// True for a real person's name, i.e. not "Me" and not a provisional
@@ -578,18 +531,11 @@ final class MeetingTranscriptPipeline: ObservableObject {
     private static func enrollProfiles(
         embeddingByLabel: [String: [Float]],
         appliedNameMap: [String: String]
-    ) async {
-        var enrolments: [(name: String, embedding: [Float])] = []
+    ) {
         for (label, embedding) in embeddingByLabel {
             let finalName = appliedNameMap[label] ?? label
             guard Self.isRealSpeakerName(finalName) else { continue }
-            enrolments.append((finalName, embedding))
-        }
-        guard !enrolments.isEmpty else { return }
-        await MainActor.run {
-            for enrolment in enrolments {
-                SpeakerProfileStore.shared.enroll(name: enrolment.name, embedding: enrolment.embedding)
-            }
+            SpeakerProfileStore.shared.enroll(name: finalName, embedding: embedding)
         }
     }
 
@@ -603,199 +549,7 @@ final class MeetingTranscriptPipeline: ObservableObject {
         }
     }
 
-    private static func averageEmbedding(_ embeddings: [[Float]]) -> [Float]? {
-        guard let first = embeddings.first else { return nil }
-        var sum = [Float](repeating: 0, count: first.count)
-        for embedding in embeddings where embedding.count == first.count {
-            let normalized = SpeakerProfileStore.normalize(embedding)
-            for i in sum.indices { sum[i] += normalized[i] }
-        }
-        return SpeakerProfileStore.normalize(sum)
-    }
-
-    // MARK: - Audio loading
-
-    /// Read a whole audio file as 16 kHz mono Float32 samples, converting in
-    /// chunks so multi-hour recordings don't require the file's native-rate
-    /// audio in memory all at once.
-    nonisolated static func loadSamples16kMono(url: URL) throws -> [Float] {
-        let file = try AVAudioFile(forReading: url)
-        let sourceFormat = file.processingFormat
-        guard sourceFormat.sampleRate > 0 else {
-            throw MeetingRecordingError("Invalid audio file (sample rate 0): \(url.lastPathComponent)")
-        }
-        guard let targetFormat = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32, sampleRate: 16_000, channels: 1, interleaved: false
-        ) else {
-            throw MeetingRecordingError("Failed to build 16k mono format.")
-        }
-        guard let converter = AVAudioConverter(from: sourceFormat, to: targetFormat) else {
-            throw MeetingRecordingError("Failed to create audio converter for \(url.lastPathComponent)")
-        }
-
-        let chunkFrames = AVAudioFrameCount(sourceFormat.sampleRate * 60) // 1 minute per read
-        var output: [Float] = []
-        output.reserveCapacity(Int(Double(file.length) / sourceFormat.sampleRate * 16_000) + 1024)
-
-        while file.framePosition < file.length {
-            let remaining = AVAudioFrameCount(file.length - file.framePosition)
-            let toRead = min(chunkFrames, remaining)
-            guard let inBuffer = AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: toRead) else {
-                throw MeetingRecordingError("Failed to allocate read buffer")
-            }
-            try file.read(into: inBuffer, frameCount: toRead)
-
-            let ratio = 16_000 / sourceFormat.sampleRate
-            let outCapacity = AVAudioFrameCount(Double(inBuffer.frameLength) * ratio) + 1024
-            guard let outBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outCapacity) else {
-                throw MeetingRecordingError("Failed to allocate conversion buffer")
-            }
-
-            var consumed = false
-            var conversionError: NSError?
-            converter.convert(to: outBuffer, error: &conversionError) { _, status in
-                if consumed {
-                    status.pointee = .noDataNow
-                    return nil
-                }
-                consumed = true
-                status.pointee = .haveData
-                return inBuffer
-            }
-            if let conversionError {
-                throw conversionError
-            }
-            if let channel = outBuffer.floatChannelData {
-                output.append(contentsOf: UnsafeBufferPointer(start: channel[0], count: Int(outBuffer.frameLength)))
-            }
-        }
-        return output
-    }
-
-    // MARK: - Silence-based utterance splitting
-
-    struct Utterance {
-        let startSample: Int
-        let endSample: Int
-    }
-
-    /// Split audio into utterances at silences, giving each a start/end
-    /// timestamp so the two tracks can be interleaved. Energy-threshold VAD:
-    /// crude but adequate for turn boundaries; a model-based VAD can replace
-    /// it later without changing the pipeline shape.
-    nonisolated static func splitOnSilence(
-        samples: [Float],
-        sampleRate: Int,
-        minSilence: TimeInterval = 0.45,
-        minUtterance: TimeInterval = 1.0,
-        maxUtterance: TimeInterval = 30.0
-    ) -> [Utterance] {
-        guard !samples.isEmpty else { return [] }
-
-        let window = sampleRate / 33 // ~30 ms
-        let windowCount = (samples.count + window - 1) / window
-
-        var rms = [Float](repeating: 0, count: windowCount)
-        for w in 0..<windowCount {
-            let start = w * window
-            let end = min(start + window, samples.count)
-            var sum: Float = 0
-            for i in start..<end {
-                sum += samples[i] * samples[i]
-            }
-            rms[w] = (sum / Float(end - start)).squareRoot()
-        }
-        // Threshold from the track's noise floor rather than its mean: long
-        // silent stretches (padded system audio, quiet mic) drag the mean
-        // down and a mean-relative threshold with it. p20 approximates the
-        // noise floor, p90 the speech level; cut a bit above the floor.
-        let sorted = rms.sorted()
-        let noiseFloor = sorted[windowCount / 5]
-        let speechLevel = sorted[min(windowCount - 1, windowCount * 9 / 10)]
-        let threshold = max(0.004, noiseFloor + (speechLevel - noiseFloor) * 0.18)
-
-        let minSilenceWindows = max(1, Int(minSilence * Double(sampleRate)) / window)
-        let minUtteranceSamples = Int(minUtterance * Double(sampleRate))
-        let maxUtteranceSamples = Int(maxUtterance * Double(sampleRate))
-
-        var utterances: [Utterance] = []
-        var utteranceStart: Int? = nil
-        var silentWindows = 0
-
-        func close(at endSample: Int) {
-            guard let start = utteranceStart else { return }
-            let paddedEnd = min(endSample, samples.count)
-            if paddedEnd - start >= minUtteranceSamples {
-                // Hard-cap long utterances so single segments stay within
-                // provider limits (Whisper-style models window at 30 s).
-                // Split into equal chunks rather than max-size chunks plus a
-                // remainder: every chunk is then <= maxUtterance and, when a
-                // split happens at all, >= maxUtterance / 2 — never a sub-1s
-                // tail the ASR provider rejects.
-                let length = paddedEnd - start
-                let chunkCount = (length + maxUtteranceSamples - 1) / maxUtteranceSamples
-                let chunkLength = length / chunkCount
-                var chunkStart = start
-                for index in 0..<chunkCount {
-                    let chunkEnd = index == chunkCount - 1 ? paddedEnd : chunkStart + chunkLength
-                    utterances.append(Utterance(startSample: chunkStart, endSample: chunkEnd))
-                    chunkStart = chunkEnd
-                }
-            }
-            utteranceStart = nil
-            silentWindows = 0
-        }
-
-        for w in 0..<windowCount {
-            let isVoiced = rms[w] >= threshold
-            if isVoiced {
-                if utteranceStart == nil {
-                    // Back up half a window so onsets aren't clipped.
-                    utteranceStart = max(0, w * window - window / 2)
-                }
-                silentWindows = 0
-            } else if utteranceStart != nil {
-                silentWindows += 1
-                if silentWindows >= minSilenceWindows {
-                    close(at: (w - silentWindows + 1) * window + window)
-                }
-            }
-        }
-        close(at: samples.count)
-        return utterances
-    }
-
-    // MARK: - Rendering
-
-    nonisolated static func renderMarkdown(
-        segments: [MeetingSegment],
-        artifacts: MeetingRecordingArtifacts
-    ) -> String {
-        var lines: [String] = []
-        lines.append("# Meeting \(artifacts.displayName)")
-        lines.append("")
-        lines.append("- Started: \(artifacts.startedAt.formatted(date: .abbreviated, time: .shortened))")
-        lines.append("- Duration: \(Self.timestamp(artifacts.duration))")
-        lines.append("")
-
-        if segments.isEmpty {
-            lines.append("_No speech detected on either track._")
-        }
-        for segment in segments {
-            lines.append("**[\(Self.timestamp(segment.start))] \(segment.speaker):** \(segment.text)")
-            lines.append("")
-        }
-        return lines.joined(separator: "\n")
-    }
-
-    nonisolated static func timestamp(_ interval: TimeInterval) -> String {
-        let total = Int(interval)
-        let hours = total / 3600
-        let minutes = (total % 3600) / 60
-        let seconds = total % 60
-        if hours > 0 {
-            return String(format: "%d:%02d:%02d", hours, minutes, seconds)
-        }
-        return String(format: "%02d:%02d", minutes, seconds)
+    static func timestamp(_ interval: TimeInterval) -> String {
+        MeetingProcessingEngine.timestamp(interval)
     }
 }

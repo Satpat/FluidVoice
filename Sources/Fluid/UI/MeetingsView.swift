@@ -12,25 +12,26 @@ struct MeetingsView: View {
     // per-view pipeline mid-run would leave the fresh view showing no
     // progress with Re-transcribe re-enabled — inviting a duplicate run.
     @ObservedObject private var reprocessPipeline: MeetingTranscriptPipeline
+    // Same UserDefaults key SettingsStore.deleteMeetingAudioAfterTranscription reads.
+    @AppStorage("DeleteMeetingAudioAfterTranscription") private var deleteAudioAfterTranscription = false
     @ObservedObject private var speakerStore = SpeakerProfileStore.shared
-    // Ground truth for button-disable state: shared across process()/
-    // regenerateSummary()/relabel() so it can't go stale on view recreation
-    // (see MeetingFolderActivity).
+    // Ground truth for button-disable state and per-row progress labels:
+    // shared across process()/regenerateSummary()/relabel() so it can't go
+    // stale on view recreation (see MeetingFolderActivity).
     @ObservedObject private var folderActivity = MeetingFolderActivity.shared
     @State private var speakerNameInputs: [String: String] = [:]
-    @State private var summarizingFolder: String?
     @State private var summaryErrorsByFolder: [String: String] = [:]
     @AppStorage(MeetingSummaryStyle.defaultsKey) private var summaryStyleID = MeetingSummaryStyle.standard.rawValue
     @Environment(\.theme) private var theme
 
     init(asrService: ASRService) {
         self.asrService = asrService
-        _reprocessPipeline = ObservedObject(wrappedValue: MeetingTranscriptPipeline.sharedReprocessor(asrService: asrService))
+        _reprocessPipeline = ObservedObject(wrappedValue: MeetingTranscriptPipeline.shared(.reprocessor, asrService: asrService))
     }
 
     /// Meeting transcripts are stored in the shared file-transcription
     /// history under this prefix (see MeetingTranscriptPipeline).
-    private static let meetingEntryPrefix = "Meeting "
+    private static let meetingEntryPrefix = FileTranscriptionHistoryStore.meetingEntryPrefix
 
     private var meetingEntries: [FileTranscriptionEntry] {
         self.fileHistoryStore.entries.filter { $0.fileName.hasPrefix(Self.meetingEntryPrefix) }
@@ -58,7 +59,7 @@ struct MeetingsView: View {
                 VStack(spacing: 24) {
                     MeetingRecorderCard(asrService: self.asrService)
 
-                    MeetingQAPanel()
+                    MeetingQAPanel(selectedTranscript: self.meetingEntries.first { $0.id == self.expandedEntryID }?.text)
 
                     KnownSpeakersPanel()
 
@@ -77,8 +78,16 @@ struct MeetingsView: View {
 
     private var recentMeetingsSection: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("Recent meetings")
-                .font(.headline)
+            HStack(alignment: .firstTextBaseline) {
+                Text("Recent meetings")
+                    .font(.headline)
+                Spacer()
+                Toggle("Delete audio after summarising", isOn: self.$deleteAudioAfterTranscription)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .font(.caption)
+                    .help("Remove system.wav/mic.wav once a meeting is transcribed and summarised successfully. Saves disk space, but Re-transcribe is no longer possible for that meeting.")
+            }
 
             VStack(spacing: 8) {
                 ForEach(self.meetingEntries) { entry in
@@ -211,10 +220,8 @@ struct MeetingsView: View {
     private func regenerateSummary(entry: FileTranscriptionEntry) {
         let folder = self.recordingFolder(for: entry)
         let folderName = self.folderName(for: entry)
-        self.summarizingFolder = folderName
         self.summaryErrorsByFolder[folderName] = nil
         Task {
-            defer { self.summarizingFolder = nil }
             do {
                 try await MeetingTranscriptPipeline.regenerateSummary(folder: folder)
             } catch {
@@ -300,11 +307,16 @@ struct MeetingsView: View {
                     .padding(.horizontal, 12)
                 }
 
-                if self.summarizingFolder == self.folderName(for: entry) {
+                if let operation = self.folderActivity.operation(for: self.folderName(for: entry)),
+                   self.reprocessPipeline.processingFolderName != self.folderName(for: entry) {
+                    // Every other in-flight operation on this folder (summary,
+                    // rename, or a transcription run by another pipeline such
+                    // as the recorder card's). Reprocessing has its own
+                    // progress bar above.
                     HStack(spacing: 6) {
                         ProgressView()
                             .controlSize(.small)
-                        Text("Summarising (\(MeetingSummaryStyle.current.displayName))...")
+                        Text(operation.progressLabel)
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
@@ -314,21 +326,6 @@ struct MeetingsView: View {
                         .font(.caption)
                         .foregroundColor(.orange)
                         .padding(.horizontal, 12)
-                } else if self.folderActivity.isBusy(self.folderName(for: entry)),
-                          self.reprocessPipeline.processingFolderName != self.folderName(for: entry) {
-                    // Fallback for operations with no dedicated progress text
-                    // (rename), and for one resumed after this view was
-                    // recreated mid-run (the specific instance/@State above
-                    // reset, but the shared busy flag didn't). Excludes
-                    // reprocessing, which already has its own block above.
-                    HStack(spacing: 6) {
-                        ProgressView()
-                            .controlSize(.small)
-                        Text("Working...")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                    .padding(.horizontal, 12)
                 }
 
                 HStack {
@@ -365,10 +362,7 @@ struct MeetingsView: View {
                         Label("Summarise", systemImage: "sparkles")
                     }
                     .fixedSize()
-                    .disabled(
-                        self.folderActivity.isBusy(self.folderName(for: entry))
-                            || self.summarizingFolder == self.folderName(for: entry)
-                    )
+                    .disabled(self.folderActivity.isBusy(self.folderName(for: entry)))
                     .help("Regenerate this meeting's summary from its transcript with the selected style")
                     Spacer()
                     Button(action: {

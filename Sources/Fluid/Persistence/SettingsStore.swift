@@ -1304,15 +1304,15 @@ final class SettingsStore: ObservableObject {
     }
 
     /// Delete a meeting's raw audio (system.wav/mic.wav) once it has been
-    /// fully transcribed and summarised (default: ON). The transcript and
-    /// summary are kept; deleting the audio saves disk space but permanently
-    /// removes the ability to Re-transcribe that meeting later, since
-    /// Re-transcribe re-runs ASR/diarization on the original audio.
+    /// transcribed *and* successfully summarised (default: OFF). The
+    /// transcript and summary are kept; deleting the audio saves disk space
+    /// but permanently removes the ability to Re-transcribe that meeting
+    /// later, since Re-transcribe re-runs ASR/diarization on the original
+    /// audio. Audio is never deleted when the transcript is empty or the
+    /// summary failed.
     var deleteMeetingAudioAfterTranscription: Bool {
         get {
-            let value = self.defaults.object(forKey: Keys.deleteMeetingAudioAfterTranscription)
-            if value == nil { return true }
-            return self.defaults.bool(forKey: Keys.deleteMeetingAudioAfterTranscription)
+            self.defaults.bool(forKey: Keys.deleteMeetingAudioAfterTranscription)
         }
         set {
             objectWillChange.send()

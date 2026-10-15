@@ -163,7 +163,7 @@ final class MeetingLiveTranscriber: ObservableObject {
         queue.consume(cut)
 
         // Skip all-silence chunks (e.g. padded system audio while nobody talks).
-        let utterances = MeetingTranscriptPipeline.splitOnSilence(samples: chunk, sampleRate: Self.sampleRate)
+        let utterances = MeetingProcessingEngine.splitOnSilence(samples: chunk, sampleRate: Self.sampleRate)
         var results: [MeetingSegment] = []
         for utterance in utterances {
             let slice = Array(chunk[utterance.startSample..<utterance.endSample])

@@ -15,7 +15,7 @@ enum MeetingRelabeler {
         guard !clean.isEmpty else { return false }
 
         let folderName = folder.lastPathComponent
-        guard MeetingFolderActivity.shared.begin(folderName) else { return false }
+        guard MeetingFolderActivity.shared.begin(folderName, .relabeling) else { return false }
         defer { MeetingFolderActivity.shared.end(folderName) }
 
         // 1) transcript.md — replace the "] <label>:" token on each line.
@@ -51,7 +51,7 @@ enum MeetingRelabeler {
         // 4) regenerate the summary from the relabelled transcript so names are
         //    reflected there too, then the title from that summary (best-effort).
         if let mergedText = relabelledTranscript ?? (try? String(contentsOf: transcriptURL, encoding: .utf8)),
-           let body = try? await MeetingTranscriptPipeline.generateSummaryBody(mergedText: MeetingTranscriptPipeline.plainTranscript(mergedText)) {
+           let body = try? await MeetingTranscriptPipeline.generateSummaryBody(mergedText: MeetingProcessingEngine.plainTranscript(mergedText)) {
             try? MeetingTranscriptPipeline.writeSummary(body: body, displayName: folder.lastPathComponent, folder: folder)
 
             let startedAt = ISO8601DateFormatter.meetingFileSafe.date(from: folder.lastPathComponent)

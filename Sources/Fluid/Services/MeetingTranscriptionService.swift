@@ -148,12 +148,12 @@ final class MeetingTranscriptionService: ObservableObject {
 
         let pipeline = MeetingTranscriptPipeline(asrService: self.asrService)
         var cancellables = Set<AnyCancellable>()
+        // Both objects are main-actor; deliver synchronously (no
+        // receive(on:) hop) so no stale value lands after the final status.
         pipeline.$progress
-            .receive(on: DispatchQueue.main)
             .sink { [weak self] value in self?.progress = value }
             .store(in: &cancellables)
         pipeline.$currentStatus
-            .receive(on: DispatchQueue.main)
             .sink { [weak self] value in self?.currentStatus = value }
             .store(in: &cancellables)
 
@@ -173,26 +173,37 @@ final class MeetingTranscriptionService: ObservableObject {
             self.currentStatus = "Importing file..."
             let artifacts: MeetingRecordingArtifacts
             do {
-                // importArtifacts does blocking file I/O (full-file resample +
-                // two WAV writes); hop off the main actor so a large/long
-                // upload doesn't freeze the UI for the whole import.
-                artifacts = try await Task.detached(priority: .userInitiated) {
-                    try MeetingUploadImporter.importArtifacts(from: fileURL)
-                }.value
+                artifacts = try await MeetingUploadImporter.importArtifacts(
+                    from: fileURL,
+                    baseDirectory: MeetingRecordingSession.defaultBaseDirectory()
+                )
             } catch {
                 throw TranscriptionError.audioConversionFailed(error.localizedDescription)
             }
 
-            _ = try await pipeline.process(artifacts)
+            let processed = try await pipeline.process(artifacts)
+            cancellables.removeAll()
+            guard !processed.mergedText.isEmpty else {
+                throw TranscriptionError.transcriptionFailed(
+                    "No speech detected in \(fileURL.lastPathComponent). The import is kept in Meetings."
+                )
+            }
 
             let processingTime = Date().timeIntervalSince(startTime)
-            let expectedFileName = "Meeting \(artifacts.displayName)"
-            guard let historyEntry = FileTranscriptionHistoryStore.shared.entries
-                .first(where: { $0.fileName == expectedFileName })
-            else {
-                throw TranscriptionError.transcriptionFailed("Transcription completed but produced no text.")
-            }
-            let result = historyEntry.toTranscriptionResult()
+            // The Meetings history entry keeps the "Meeting <folder>" name
+            // (that's how the Meetings tab finds it); this result, shown on
+            // the File Transcription tab, carries the uploaded file's name.
+            let result = TranscriptionResult(
+                text: processed.mergedText,
+                confidence: 1.0,
+                duration: artifacts.duration,
+                processingTime: processingTime,
+                fileName: fileURL.lastPathComponent
+            )
+            self.currentStatus = processed.summaryError == nil
+                ? "Complete!"
+                : "Transcribed (summary failed: \(processed.summaryError ?? ""))"
+            self.progress = 1.0
 
             AnalyticsService.shared.capture(
                 .meetingTranscriptionCompleted,

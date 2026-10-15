@@ -94,6 +94,10 @@ final class FileTranscriptionHistoryStore: ObservableObject {
     private let defaults = UserDefaults.standard
     private let maxEntries = 50
 
+    /// History entries written by MeetingTranscriptPipeline are named
+    /// "Meeting <session folder>".
+    static let meetingEntryPrefix = "Meeting "
+
     private enum Keys {
         static let fileTranscriptionHistory = "FileTranscriptionHistoryEntries"
     }
@@ -112,15 +116,22 @@ final class FileTranscriptionHistoryStore: ObservableObject {
         return self.entries.first(where: { $0.id == id })
     }
 
-    /// Add a completed file transcription to history (call after successful transcribeFile).
-    func addEntry(_ result: TranscriptionResult) {
-        guard !result.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+    /// Add a completed file transcription to history (call after successful
+    /// transcribeFile). Returns the new entry's id, or nil when the result
+    /// has no text (empty transcripts aren't stored).
+    @discardableResult
+    func addEntry(_ result: TranscriptionResult) -> UUID? {
+        guard !result.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
 
         let entry = FileTranscriptionEntry(from: result)
         self.entries.insert(entry, at: 0)
 
-        if self.entries.count > self.maxEntries {
-            self.entries.removeLast()
+        // Cap plain file transcriptions only. Meeting entries are the
+        // Meetings tab's index of recorded meetings; evicting them would hide
+        // meetings whose folders (audio, transcript, summary) still exist.
+        if self.entries.count > self.maxEntries,
+           let oldestFileIndex = self.entries.lastIndex(where: { !$0.fileName.hasPrefix(Self.meetingEntryPrefix) }) {
+            self.entries.remove(at: oldestFileIndex)
         }
 
         self.selectedEntryID = entry.id
@@ -130,6 +141,7 @@ final class FileTranscriptionHistoryStore: ObservableObject {
             "Added file transcription to history (total: \(self.entries.count))",
             source: "FileTranscriptionHistoryStore"
         )
+        return entry.id
     }
 
     /// Replace an entry's transcript text in place (e.g. after relabelling

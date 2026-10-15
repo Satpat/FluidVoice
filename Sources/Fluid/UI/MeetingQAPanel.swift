@@ -1,9 +1,11 @@
 import SwiftUI
 
 /// Chat panel for asking the configured AI provider questions about the
-/// meeting-so-far. Reads the live transcript; falls back to the most recent
-/// transcribed meeting when nothing is live.
+/// meeting-so-far. Reads the live transcript; otherwise the meeting the user
+/// has expanded in the history, falling back to the most recent one.
 struct MeetingQAPanel: View {
+    /// Transcript of the meeting currently expanded in the Meetings list.
+    var selectedTranscript: String?
     @ObservedObject private var qaService = MeetingQAService.shared
     @ObservedObject private var liveTranscriber = MeetingLiveTranscriber.shared
     @ObservedObject private var fileHistoryStore = FileTranscriptionHistoryStore.shared
@@ -13,8 +15,9 @@ struct MeetingQAPanel: View {
     private var transcript: String {
         let live = self.liveTranscriber.transcriptText
         if !live.isEmpty { return live }
+        if let selected = self.selectedTranscript, !selected.isEmpty { return selected }
         return self.fileHistoryStore.entries
-            .first { $0.fileName.hasPrefix("Meeting ") }?.text ?? ""
+            .first { $0.fileName.hasPrefix(FileTranscriptionHistoryStore.meetingEntryPrefix) }?.text ?? ""
     }
 
     var body: some View {

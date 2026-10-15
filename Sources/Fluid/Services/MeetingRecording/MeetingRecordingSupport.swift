@@ -9,7 +9,7 @@ import AudioToolbox
 /// DebugLogger because tap/IO callbacks run on realtime-adjacent queues).
 let kMeetingRecordingSubsystem = "com.fluidvoice.meetai.recording"
 
-struct MeetingRecordingError: LocalizedError {
+nonisolated struct MeetingRecordingError: LocalizedError, Sendable {
     let message: String
     init(_ message: String) { self.message = message }
     var errorDescription: String? { self.message }

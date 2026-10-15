@@ -7,12 +7,15 @@ import Foundation
 import SwiftUI
 import OSLog
 
-struct MeetingRecordingArtifacts: Codable, Hashable {
+nonisolated struct MeetingRecordingArtifacts: Codable, Hashable, Sendable {
     let folder: URL
     let systemAudio: URL
     let microphone: URL
     let startedAt: Date
     let endedAt: Date
+    /// Original file name for meetings imported via upload; nil for live
+    /// recordings. Optional so older session.json files still decode.
+    var sourceFileName: String? = nil
 
     var displayName: String { self.folder.lastPathComponent }
     var duration: TimeInterval { self.endedAt.timeIntervalSince(self.startedAt) }
@@ -164,7 +167,7 @@ final class MeetingRecordingSession {
 }
 
 extension ISO8601DateFormatter {
-    static let meetingFileSafe: ISO8601DateFormatter = {
+    nonisolated static let meetingFileSafe: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withYear, .withMonth, .withDay, .withDashSeparatorInDate,
                            .withTime, .withColonSeparatorInTime]
