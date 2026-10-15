@@ -20,7 +20,7 @@
 		7CDB0A2E2F3C4D5600FB7CAD /* AudioFixtureLoader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7CDB0A2A2F3C4D5600FB7CAD /* AudioFixtureLoader.swift */; };
 		7CDB0A2F2F3C4D5600FB7CAD /* dictation_fixture.wav in Resources */ = {isa = PBXBuildFile; fileRef = 7CDB0A2B2F3C4D5600FB7CAD /* dictation_fixture.wav */; };
 		7CDB0A302F3C4D5600FB7CAD /* XCTest.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 7CDB0A2C2F3C4D5600FB7CAD /* XCTest.framework */; };
-		7CE006BD2E80EBE600DDCCD6 /* AppUpdater in Frameworks */ = {isa = PBXBuildFile; productRef = 7CE006BC2E80EBE600DDCCD6 /* AppUpdater */; };
+		7CE006BD2E80EBE600DDCCD6 /* PromiseKit in Frameworks */ = {isa = PBXBuildFile; productRef = 7CE006BC2E80EBE600DDCCD6 /* PromiseKit */; };
 		86CAA2D4EF18433096185602 /* LLMClientRequestBodyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 343B29013F4441D6A797D12D /* LLMClientRequestBodyTests.swift */; };
 /* End PBXBuildFile section */
 
@@ -65,7 +65,7 @@
 				7C3697892ED70F9C005874CE /* DynamicNotchKit in Frameworks */,
 				7C5AF14B2F15041600DE21B0 /* MediaRemoteAdapter in Frameworks */,
 				7C1C72F22EECBD1300E3BF4D /* SwiftWhisper in Frameworks */,
-				7CE006BD2E80EBE600DDCCD6 /* AppUpdater in Frameworks */,
+				7CE006BD2E80EBE600DDCCD6 /* PromiseKit in Frameworks */,
 				7C078DA52E3B386A00FB7CAC /* FluidAudio in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -169,7 +169,7 @@
 			packageProductDependencies = (
 				7C078DA42E3B386A00FB7CAC /* FluidAudio */,
 				7C3697882ED70F9C005874CE /* DynamicNotchKit */,
-				7CE006BC2E80EBE600DDCCD6 /* AppUpdater */,
+				7CE006BC2E80EBE600DDCCD6 /* PromiseKit */,
 				7C1C72F12EECBD1300E3BF4D /* SwiftWhisper */,
 				7C5AF14A2F15041600DE21B0 /* MediaRemoteAdapter */,
 			);
@@ -224,7 +224,7 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				7C078DA32E3B386A00FB7CAC /* XCRemoteSwiftPackageReference "FluidAudio" */,
-				7CE006BB2E80EBE600DDCCD6 /* XCRemoteSwiftPackageReference "AppUpdater" */,
+				7CE006BB2E80EBE600DDCCD6 /* XCRemoteSwiftPackageReference "PromiseKit" */,
 				7C3697872ED70F9C005874CE /* XCRemoteSwiftPackageReference "DynamicNotchKit" */,
 				7C1C72F02EECBD1300E3BF4D /* XCRemoteSwiftPackageReference "SwiftWhisper" */,
 				7C5AF1492F15041600DE21B0 /* XCRemoteSwiftPackageReference "mediaremote-adapter" */,
@@ -641,12 +641,12 @@
 				kind = branch;
 			};
 		};
-		7CE006BB2E80EBE600DDCCD6 /* XCRemoteSwiftPackageReference "AppUpdater" */ = {
+		7CE006BB2E80EBE600DDCCD6 /* XCRemoteSwiftPackageReference "PromiseKit" */ = {
 			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/mxcl/AppUpdater.git";
+			repositoryURL = "https://github.com/mxcl/PromiseKit.git";
 			requirement = {
 				kind = upToNextMajorVersion;
-				minimumVersion = 1.1.1;
+				minimumVersion = 6.22.1;
 			};
 		};
 /* End XCRemoteSwiftPackageReference section */
@@ -672,10 +672,10 @@
 			package = 7C5AF1492F15041600DE21B0 /* XCRemoteSwiftPackageReference "mediaremote-adapter" */;
 			productName = MediaRemoteAdapter;
 		};
-		7CE006BC2E80EBE600DDCCD6 /* AppUpdater */ = {
+		7CE006BC2E80EBE600DDCCD6 /* PromiseKit */ = {
 			isa = XCSwiftPackageProductDependency;
-			package = 7CE006BB2E80EBE600DDCCD6 /* XCRemoteSwiftPackageReference "AppUpdater" */;
-			productName = AppUpdater;
+			package = 7CE006BB2E80EBE600DDCCD6 /* XCRemoteSwiftPackageReference "PromiseKit" */;
+			productName = PromiseKit;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};
