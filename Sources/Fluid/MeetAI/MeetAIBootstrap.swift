@@ -14,6 +14,10 @@ enum MeetAIBootstrap {
     static func start() {
         guard !self.started, !self.isTestHost else { return }
         self.started = true
+        let paths = MeetAIPaths.standard()
+        _ = MeetAISpeakerProfileStore.shared.copyLegacyProfilesIfNeeded(from: paths.legacyProfilesFile)
+        MeetAIHooks.sessionDidComplete = { session in await MeetAISessionProcessor.shared.sessionDidComplete(session) }
+        MeetAIHooks.sessionCorrected = { session in MeetAISessionProcessor.shared.sessionCorrected(session) }
         Task { await self.sweepOrphanedSidecars() }
     }
 
