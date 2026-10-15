@@ -387,11 +387,19 @@ final class SimpleUpdater: ObservableObject {
     }
 
     func checkForUpdatesAutomatically() {
+        guard MeetAIBuildFlags.updaterEnabled else {
+            DebugLogger.shared.info("Updater disabled in the MeetAI fork build", source: "SimpleUpdater")
+            return
+        }
         guard self.updateDefaults.object(forKey: SettingsStore.UpdateKeys.autoUpdateCheckEnabled) as? Bool ?? true else { return }
         self.startUpdateCheck(explicit: false)
     }
 
     func checkForUpdatesManually() {
+        guard MeetAIBuildFlags.updaterEnabled else {
+            DebugLogger.shared.info("Updater disabled in the MeetAI fork build", source: "SimpleUpdater")
+            return
+        }
         self.startUpdateCheck(explicit: true)
     }
 

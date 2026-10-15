@@ -7,6 +7,7 @@
 #   ./build.sh                    # signed public OSS build
 #   ./build.sh public             # signed public OSS build
 #   ./build.sh unsigned           # unsigned public OSS build (CI/fallback)
+#   ./build.sh install            # signed build with the release bundle ID, installed to /Applications
 #   ./build.sh fi                 # private FI build
 
 set -euo pipefail
@@ -122,7 +123,11 @@ EOF
 
     echo "Running signed public FluidVoice build..."
     echo "Build product: ${DERIVED_DATA_PATH}/Build/Products/Debug/FluidVoice Debug.app"
-    xcodebuild "${build_args[@]}" DEVELOPMENT_TEAM="${development_team}"
+    local -a extra_settings=()
+    if [ -n "${FLUIDVOICE_BUNDLE_ID_OVERRIDE:-}" ]; then
+        extra_settings+=(PRODUCT_BUNDLE_IDENTIFIER="${FLUIDVOICE_BUNDLE_ID_OVERRIDE}")
+    fi
+    xcodebuild "${build_args[@]}" DEVELOPMENT_TEAM="${development_team}" "${extra_settings[@]+"${extra_settings[@]}"}"
 
     app_path="${DERIVED_DATA_PATH}/Build/Products/Debug/FluidVoice Debug.app"
     ctranscribe_framework="${app_path}/Contents/Frameworks/CTranscribe.framework"
@@ -208,6 +213,22 @@ case "${PROFILE}" in
     unsigned|ci)
         run_public_build unsigned
         ;;
+    install)
+        # Upstream gives Debug builds the bundle ID com.FluidApp.app.debug to isolate test
+        # preferences. The installed app must keep com.FluidApp.app so it reuses the user's
+        # settings, keychain API keys and privacy permissions.
+        FLUIDVOICE_BUNDLE_ID_OVERRIDE=com.FluidApp.app run_public_build signed
+        installed_app="/Applications/FluidVoice.app"
+        built_app="${DERIVED_DATA_PATH}/Build/Products/Debug/FluidVoice Debug.app"
+        if pgrep -x "FluidVoice" >/dev/null 2>&1 || pgrep -x "FluidVoice Debug" >/dev/null 2>&1; then
+            echo "Note: FluidVoice is running; quit it before relaunching the installed copy."
+        fi
+        rm -rf "${installed_app}"
+        ditto "${built_app}" "${installed_app}"
+        # ditto keeps the source bundle's timestamps; bump the bundle so Finder shows the install time.
+        touch "${installed_app}"
+        echo "Installed ${installed_app} ($(defaults read "${installed_app}/Contents/Info.plist" CFBundleIdentifier))"
+        ;;
     fi|private|dev|full)
         if [ ! -x "${PRIVATE_FI_BUILD_SCRIPT}" ]; then
             echo "Private Fluid Intelligence build script is missing:"
@@ -219,7 +240,7 @@ case "${PROFILE}" in
         ;;
     *)
         echo "Unknown build profile: ${PROFILE}"
-        echo "Valid profiles: public/oss/incremental/fast, unsigned/ci, fi/private/dev/full"
+        echo "Valid profiles: public/oss/incremental/fast, unsigned/ci, install, fi/private/dev/full"
         exit 1
         ;;
 esac

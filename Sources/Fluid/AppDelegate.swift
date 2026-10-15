@@ -116,7 +116,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         AnalyticsService.shared.bootstrap()
 
         // Check for updates automatically if enabled (initial check on launch)
-        self.checkForUpdatesAutomatically()
+        if MeetAIBuildFlags.updaterEnabled {
+            self.checkForUpdatesAutomatically()
+        }
 
         // Schedule periodic update checks every hour while app is running
         self.schedulePeriodicUpdateChecks()
