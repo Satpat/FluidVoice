@@ -28,6 +28,8 @@ final class DictationCoordinator: ObservableObject {
         let currentSidebarItem: () -> SidebarItem?
         let selectSidebarItem: (SidebarItem) -> Void
         let isAccessibilityEnabled: () -> Bool
+        /// Sync ContentView's AI-settings UI mirrors after a prompt shortcut switched provider/model.
+        let providerSelectionDidChange: (_ providerID: String, _ providerKey: String, _ selectedModels: [String: String], _ modelName: String) -> Void
     }
 
     // MARK: - Collaborators
