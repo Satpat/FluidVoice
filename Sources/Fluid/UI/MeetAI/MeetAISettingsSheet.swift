@@ -75,10 +75,16 @@ struct MeetAISettingsSheet: View {
                 self.reprocessMessage = "Re-processing \(folder)…"
                 Task {
                     do {
-                        _ = try await self.migrator.reprocess(folder: folder, retry: {
+                        let result = try await self.migrator.reprocess(folder: folder, retry: {
                             _ = try await AppServices.shared.meetingSessionCoordinator.retryProcessing(sessionID: $0)
+                        }, discard: { id in
+                            try await Self.deleteViaCoordinator(id)
                         })
-                        self.reprocessMessage = "Re-processed \(folder)."
+                        if let problem = result.oldCopyRemovalError {
+                            self.reprocessMessage = "Re-processed \(folder), but the old copy couldn't be removed: \(problem)"
+                        } else {
+                            self.reprocessMessage = "Re-processed \(folder)."
+                        }
                     } catch {
                         self.reprocessMessage = "Couldn't re-process \(folder): \(error.localizedDescription)"
                     }
@@ -86,7 +92,25 @@ struct MeetAISettingsSheet: View {
                 }
             }
         } message: {
-            Text("The transcript will be replaced with a new one from the original audio. Speaker names come back where voices match saved speakers. This can take several minutes.")
+            Text("FluidMeet will transcribe the original audio again and replace this meeting. Speaker names come back only where voices match saved speakers. Transcript corrections and the current summary are discarded; a new summary is written only if 'Write a summary' is on. This can take several minutes.")
+        }
+    }
+
+    /// Goes through the coordinator so a failed/interrupted offer for the session is cleared too.
+    /// Retries briefly while the coordinator is still winding down.
+    private static func deleteViaCoordinator(_ id: MeetingSessionID) async throws {
+        var attempt = 0
+        while true {
+            do {
+                try await AppServices.shared.meetingSessionCoordinator.deleteSession(id: id)
+                return
+            } catch MeetingCoordinatorError.activityInProgress where attempt < 10 {
+                attempt += 1
+                try await Task.sleep(nanoseconds: 1_000_000_000)
+            } catch MeetingCoordinatorError.maintenanceInProgress where attempt < 10 {
+                attempt += 1
+                try await Task.sleep(nanoseconds: 1_000_000_000)
+            }
         }
     }
 

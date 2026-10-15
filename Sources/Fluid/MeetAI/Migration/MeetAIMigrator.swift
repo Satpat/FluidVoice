@@ -53,7 +53,19 @@ final class MeetAIMigrator: ObservableObject {
 
     /// Tier 2 (spec §7.2, §12.8): rebuild the meeting from the fork's two WAVs and run FluidMeet's
     /// pipeline. On success the transcript-only session is replaced; on failure the new one is deleted.
-    func reprocess(folder: String, retry: @MainActor (MeetingSessionID) async throws -> Void) async throws -> MeetingSessionID {
+    struct ReprocessResult: Equatable {
+        let sessionID: MeetingSessionID
+        /// Set when the new session is good but the old transcript-only copy couldn't be removed.
+        let oldCopyRemovalError: String?
+    }
+
+    /// `discard` removes a session (the app passes a coordinator-backed closure so a failed/interrupted offer is cleared too).
+    func reprocess(
+        folder: String,
+        retry: @MainActor (MeetingSessionID) async throws -> Void,
+        discard: (@MainActor (MeetingSessionID) async throws -> Void)? = nil
+    ) async throws -> ReprocessResult {
+        let discard: @MainActor (MeetingSessionID) async throws -> Void = discard ?? { [store = self.store] in try await store.delete(id: $0) }
         guard let entry = self.entries[folder], entry.status == .done, let oldID = entry.sessionID else {
             throw MeetAILLMError("This meeting hasn't been imported yet.")
         }
@@ -75,16 +87,29 @@ final class MeetAIMigrator: ObservableObject {
         do {
             try await retry(session.id)
         } catch {
-            try? await self.store.delete(id: session.id)
-            try? await self.sidecars.removeAll(for: session.id)
+            do { try await discard(session.id) } catch {
+                DebugLogger.shared.warning("Discarding failed re-process session failed: \(error.localizedDescription)", source: "MeetAI")
+            }
+            await self.removeSidecars(for: session.id)
             throw error
         }
-        try? await self.store.delete(id: oldID)
-        try? await self.sidecars.removeAll(for: oldID)
+        // Record the swap before removing the old copy so a crash can't make run() recreate a duplicate.
         self.entries[folder]?.sessionID = session.id
         self.entries[folder]?.reprocessedAt = Date()
         self.saveEntries()
-        return session.id
+        var removalError: String?
+        do { try await discard(oldID) } catch {
+            removalError = error.localizedDescription
+            DebugLogger.shared.warning("Removing old transcript-only session failed: \(error.localizedDescription)", source: "MeetAI")
+        }
+        await self.removeSidecars(for: oldID)
+        return ReprocessResult(sessionID: session.id, oldCopyRemovalError: removalError)
+    }
+
+    private func removeSidecars(for id: MeetingSessionID) async {
+        do { try await self.sidecars.removeAll(for: id) } catch {
+            DebugLogger.shared.warning("Removing MeetAI sidecars failed: \(error.localizedDescription)", source: "MeetAI")
+        }
     }
 
     func saveEntries() {

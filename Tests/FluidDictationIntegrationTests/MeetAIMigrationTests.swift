@@ -232,7 +232,9 @@ final class MeetAIMigrationTests: XCTestCase {
         let oldID = try XCTUnwrap(migrator.entries[folderName]?.sessionID)
 
         var retried: [MeetingSessionID] = []
-        let newID = try await migrator.reprocess(folder: folderName, retry: { retried.append($0) })
+        let result = try await migrator.reprocess(folder: folderName, retry: { retried.append($0) })
+        let newID = result.sessionID
+        XCTAssertNil(result.oldCopyRemovalError)
         XCTAssertEqual(retried, [newID])
         let oldSession = try await store.load(id: oldID)
         XCTAssertNil(oldSession, "old transcript-only session removed")
@@ -262,5 +264,70 @@ final class MeetAIMigrationTests: XCTestCase {
         let all = try await store.loadAll()
         XCTAssertEqual(all.map(\.id), [oldID], "new session deleted, old kept")
         XCTAssertEqual(migrator.entries[folderName]?.sessionID, oldID)
+    }
+
+    private func reprocessFixture() async throws -> (MeetAIMigrator, MeetingSessionStore, MeetAISidecarStore, String, MeetingSessionID) {
+        let root = try MeetAIFixtures.tempDirectory(self)
+        let paths = MeetAIPaths(supportRoot: root)
+        let folderName = "2026-10-15T06:00:44"
+        try self.makeLegacyFolder(root, name: folderName, transcript: self.sampleTranscript, summary: "# Meeting summary — x\n\n## Overview\nModels.")
+        let folder = paths.legacyMeetingsDirectory.appendingPathComponent(folderName)
+        try self.writeWAV(folder.appendingPathComponent("system.wav"), seconds: 3, frequency: 220)
+        try self.writeWAV(folder.appendingPathComponent("mic.wav"), seconds: 3, frequency: 330)
+        let store = MeetingSessionStore(rootDirectory: root.appendingPathComponent("Meetings"))
+        let sidecars = MeetAISidecarStore(paths: paths)
+        let migrator = MeetAIMigrator(paths: paths, store: store, sidecars: sidecars)
+        await migrator.run()
+        return (migrator, store, sidecars, folderName, try XCTUnwrap(migrator.entries[folderName]?.sessionID))
+    }
+
+    func testReprocessThenRunLeavesOneSessionAndNoOldSidecars() async throws {
+        let (migrator, store, sidecars, folder, oldID) = try await reprocessFixture()
+        let before = try await sidecars.summary(for: oldID)
+        XCTAssertNotNil(before)
+        let result = try await migrator.reprocess(folder: folder, retry: { _ in })
+        await migrator.run()
+        let all = try await store.loadAll()
+        XCTAssertEqual(all.map(\.id), [result.sessionID])
+        let after = try await sidecars.summary(for: oldID)
+        XCTAssertNil(after)
+    }
+
+    func testReprocessFailureDiscardsNewSessionAndSidecarsViaClosure() async throws {
+        let (migrator, store, sidecars, folder, oldID) = try await reprocessFixture()
+        var discarded: [MeetingSessionID] = []
+        var failedID: MeetingSessionID?
+        do {
+            _ = try await migrator.reprocess(
+                folder: folder,
+                retry: { id in
+                    failedID = id
+                    try await sidecars.saveSummary(MeetAISummaryRecord(style: "s", transcriptHash: "h", markdown: "x", providerID: "p", modelID: "m", createdAt: Date()), for: id)
+                    throw MeetingCoordinatorError.activityInProgress
+                },
+                discard: { id in discarded.append(id); try await store.delete(id: id) }
+            )
+            XCTFail("expected failure")
+        } catch {}
+        let newID = try XCTUnwrap(failedID)
+        XCTAssertEqual(discarded, [newID])
+        let all = try await store.loadAll()
+        XCTAssertEqual(all.map(\.id), [oldID])
+        let leftover = try await sidecars.summary(for: newID)
+        XCTAssertNil(leftover)
+    }
+
+    func testReprocessOldCopyRemovalFailureIsReportedNotThrown() async throws {
+        let (migrator, store, _, folder, oldID) = try await reprocessFixture()
+        struct Boom: LocalizedError { var errorDescription: String? { "boom" } }
+        let result = try await migrator.reprocess(
+            folder: folder, retry: { _ in },
+            discard: { id in
+                if id == oldID { throw Boom() }
+                try await store.delete(id: id)
+            }
+        )
+        XCTAssertEqual(result.oldCopyRemovalError, "boom")
+        XCTAssertEqual(migrator.entries[folder]?.sessionID, result.sessionID)
     }
 }
