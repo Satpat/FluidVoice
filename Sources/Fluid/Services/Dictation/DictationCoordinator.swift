@@ -38,6 +38,8 @@ final class DictationCoordinator: ObservableObject {
     /// before any recording can start.
     var menuBarManager: MenuBarManager!
     var host: DictationHostBridge?
+    let commandModeService = CommandModeService()
+    let rewriteModeService = RewriteModeService()
 
     // MARK: - Session state (moved from ContentView @State)
 
