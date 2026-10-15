@@ -195,7 +195,6 @@ struct ContentView: View {
 
     @State private var selectedSidebarItem: SidebarItem?
     @State private var previousSidebarItem: SidebarItem? = nil // Track previous for mode transitions
-    @State private var playgroundUsed: Bool = SettingsStore.shared.playgroundUsed
 
     // Command Mode State
     // @State private var showCommandMode: Bool = false
@@ -529,6 +528,7 @@ struct ContentView: View {
                 currentSidebarItem: { self.selectedSidebarItem },
                 selectSidebarItem: { self.selectedSidebarItem = $0 },
                 isAccessibilityEnabled: { self.accessibilityEnabled },
+                isTranscriptionEditorFocused: { self.isTranscriptionFocused },
                 providerSelectionDidChange: { providerID, providerKey, selectedModels, modelName in
                     self.selectedProviderID = providerID
                     self.currentProvider = providerKey
@@ -1292,11 +1292,11 @@ struct ContentView: View {
     private var welcomeView: some View {
         WelcomeView(
             selectedSidebarItem: self.$selectedSidebarItem,
-            playgroundUsed: self.$playgroundUsed,
+            playgroundUsed: self.$settings.playgroundUsed,
             isTranscriptionFocused: self.$isTranscriptionFocused,
             accessibilityEnabled: self.accessibilityEnabled,
-            stopAndProcessTranscription: { await self.stopAndProcessTranscription() },
-            startRecording: self.startRecording,
+            stopAndProcessTranscription: { await self.dictation.stopAndProcessTranscription() },
+            startRecording: { self.dictation.startRecording() },
             openAccessibilitySettings: self.openAccessibilitySettings,
             restartApp: self.restartApp
         )
@@ -1442,7 +1442,7 @@ struct ContentView: View {
             copyToClipboard: self.$copyToClipboard,
             hotkeyManager: self.hotkeyManager,
             menuBarManager: self.menuBarManager,
-            startRecording: self.startRecording,
+            startRecording: { self.dictation.startRecording() },
             refreshDevices: self.refreshDevices,
             openAccessibilitySettings: self.openAccessibilitySettings,
             restartApp: self.restartApp,
@@ -1454,8 +1454,8 @@ struct ContentView: View {
     private var recordingView: some View {
         RecordingView(
             appear: self.$appear,
-            stopAndProcessTranscription: { await self.stopAndProcessTranscription() },
-            startRecording: self.startRecording
+            stopAndProcessTranscription: { await self.dictation.stopAndProcessTranscription() },
+            startRecording: { self.dictation.startRecording() }
         )
     }
 
@@ -1663,417 +1663,13 @@ struct ContentView: View {
 
     // MARK: - Stop and Process Transcription
 
-    private func stopAndProcessTranscription(route: DictationCoordinator.DictationOutputRoute = .normal) async {
-        DebugLogger.shared.debug("stopAndProcessTranscription called", source: "ContentView")
-        DebugLogger.shared.info("Output route selected: \(route.rawValue)", source: "ContentView")
-        self.dictation.appBench("stop_path_enter route=\(route.rawValue)")
-
-        // Check if we're in rewrite or command mode
-        let modeAtStop = self.dictation.activeRecordingMode
-        let wasRewriteMode = modeAtStop == .edit || self.dictation.isRecordingForRewrite
-        let wasCommandMode = modeAtStop == .command || self.dictation.isRecordingForCommand
-        let activeDictationSlot = self.dictation.currentDictationShortcutSlot(for: modeAtStop)
-        let promptOverride = self.dictation.promptModeOverrideText
-        let promptTest = DictationPromptTestCoordinator.shared
-        let shouldUseAIOnStop = activeDictationSlot.map {
-            DictationAIPostProcessingGate.isConfigured(for: $0, appBundleID: self.dictation.recordingAppInfo?.bundleId)
-        } ?? DictationAIPostProcessingGate.isConfigured(for: .primary, appBundleID: self.dictation.recordingAppInfo?.bundleId)
-        let shouldHideOverlayOnStop = route == .normal &&
-            !wasRewriteMode &&
-            !wasCommandMode &&
-            !promptTest.isActive &&
-            !shouldUseAIOnStop
-        var didRequestOverlayHideOnStop = false
-        DebugLogger.shared.info(
-            "Routing decision snapshot | activeMode=\(modeAtStop.rawValue) | rewrite=\(wasRewriteMode) | command=\(wasCommandMode) | overlay=\(NotchContentState.shared.mode.rawValue)",
-            source: "ContentView"
-        )
-
-        self.dictation.clearActiveRecordingMode()
-
-        if shouldHideOverlayOnStop {
-            didRequestOverlayHideOnStop = true
-            DebugLogger.shared.debug("Hiding dictation overlay at stop path", source: "ContentView")
-            self.dictation.hideOverlayAsync(reason: "stop_path")
-        } else {
-            // Show "Transcribing" state before calling stop() when the overlay needs
-            // to remain available for prompt, command, rewrite, or AI feedback.
-            DebugLogger.shared.debug("Showing transcription processing state", source: "ContentView")
-            self.dictation.appBench("processing_ui_request status=Transcribing")
-            self.menuBarManager.setProcessing(true)
-            NotchOverlayManager.shared.updateTranscriptionText("Transcribing")
-            self.dictation.appBench("processing_ui_requested status=Transcribing")
-
-            // Give SwiftUI a chance to render the processing state before heavier work.
-            await Task.yield()
-        }
-
-        // Stop the ASR service and wait for transcription to complete
-        // The processing indicator will stay visible during this phase
-        let asrStopStartedAt = ProcessInfo.processInfo.systemUptime
-        self.dictation.appBench("asr_stop_call")
-        // Play the stop cue as soon as the audio engine has stopped, before the
-        // (potentially slow) final transcription pass. Scoped to dictation only —
-        // Command/Edit modes call asr.stop() without this callback.
-        let transcribedText = await asr.stop(onCaptureStopped: {
-            TranscriptionSoundPlayer.shared.playStopSound()
-        })
-        self.dictation.appBench("asr_stop_return elapsedMs=\(Int(((ProcessInfo.processInfo.systemUptime - asrStopStartedAt) * 1000).rounded()))")
-        let audioSnapshot = self.asr.consumeLastCompletedAudioSnapshot()
-        DebugLogger.shared.info(
-            "Stop transcription result | chars=\(transcribedText.count) | empty=\(transcribedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)",
-            source: "ContentView"
-        )
-
-        // Reset the transcription text display after transcription completes
-        NotchOverlayManager.shared.updateTranscriptionText("")
-
-        guard transcribedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
-            DebugLogger.shared.debug("Transcription returned empty text", source: "ContentView")
-            // Finish the same short exit transition even when no text is emitted.
-            if !didRequestOverlayHideOnStop {
-                await self.menuBarManager.finishProcessingAndHideOverlay()
-            }
-            return
-        }
-
-        // Prompt Test Mode: reroute dictation hotkey output into the prompt editor (no typing/clipboard/history).
-        if promptTest.isActive {
-            promptTest.lastTranscriptionText = transcribedText
-            promptTest.lastOutputText = ""
-            promptTest.lastError = ""
-
-            guard DictationAIPostProcessingGate.isProviderConfigured() else {
-                promptTest.lastError = "AI post-processing is not configured. Configure a provider/model (and API key for non-local endpoints) to test prompts."
-                self.menuBarManager.setProcessing(false)
-                return
-            }
-
-            promptTest.isProcessing = true
-            // Processing already true from above
-            defer {
-                self.menuBarManager.setProcessing(false)
-                promptTest.isProcessing = false
-            }
-
-            do {
-                let result = try await self.dictation.processTextWithAI(transcribedText, overrideSystemPrompt: promptTest.draftPromptText)
-                let appInfo = self.dictation.recordingAppInfo ?? self.dictation.getCurrentAppInfo()
-                let literalFormattedResult = ASRService.applyDictationLiteralFormatting(
-                    result,
-                    appName: appInfo.name,
-                    bundleID: appInfo.bundleId,
-                    windowTitle: appInfo.windowTitle
-                )
-                promptTest.lastOutputText = ASRService.applyGAAVFormatting(literalFormattedResult)
-            } catch {
-                DebugLogger.shared.error("Prompt test AI call failed: \(error.localizedDescription)", source: "ContentView")
-                promptTest.lastError = error.localizedDescription
-            }
-            return
-        }
-
-        if NotchOverlayManager.shared.isBottomOverlayVisible {
-            BottomOverlayWindowController.shared.beginReleaseTransition()
-        }
-
-        // If this was a rewrite recording, process the rewrite instead of typing
-        if wasRewriteMode {
-            DebugLogger.shared.info("Processing rewrite with instruction: \(transcribedText)", source: "ContentView")
-            let appInfo = self.dictation.recordingAppInfo ?? self.dictation.getCurrentAppInfo()
-            await self.dictation.processRewriteWithVoiceInstruction(transcribedText, appInfo: appInfo)
-            AnalyticsService.shared.capture(
-                .transcriptionCompleted,
-                properties: [
-                    "mode": AnalyticsMode.rewrite.rawValue,
-                    "words_bucket": AnalyticsBuckets.bucketWords(AnalyticsBuckets.wordCount(in: transcribedText)),
-                    "ai_used": true,
-                ]
-            )
-            return
-        }
-
-        // If this was a command recording, process the command
-        if wasCommandMode {
-            DebugLogger.shared.info("Processing command: \(transcribedText)", source: "ContentView")
-            await self.dictation.processCommandWithVoice(transcribedText)
-            AnalyticsService.shared.capture(
-                .transcriptionCompleted,
-                properties: [
-                    "mode": AnalyticsMode.command.rawValue,
-                    "words_bucket": AnalyticsBuckets.bucketWords(AnalyticsBuckets.wordCount(in: transcribedText)),
-                    "ai_used": true,
-                ]
-            )
-            return
-        }
-
-        var finalText: String
-        var aiFallbackReason: String?
-        var postProcessingModel: String?
-        let appInfo = self.dictation.recordingAppInfo ?? self.dictation.getCurrentAppInfo()
-        let normalizedTranscribedText = ASRService.applySpokenPunctuationFormatting(
-            transcribedText,
-            appName: appInfo.name,
-            bundleID: appInfo.bundleId,
-            windowTitle: appInfo.windowTitle
-        )
-
-        let shouldUseAI = activeDictationSlot.map {
-            DictationAIPostProcessingGate.isConfigured(for: $0, appBundleID: appInfo.bundleId)
-        } ?? DictationAIPostProcessingGate.isConfigured(for: .primary, appBundleID: appInfo.bundleId)
-        let transcriptionModelInfo = self.dictation.currentTranscriptionModelInfo()
-
-        if shouldUseAI {
-            DebugLogger.shared.debug("Routing transcription through AI post-processing", source: "ContentView")
-            let postProcessingModelInfo = self.dictation.currentDictationAIModelInfo()
-            postProcessingModel = postProcessingModelInfo.model
-            let postProcessingInputChars = normalizedTranscribedText.count
-            let postProcessingStart = Date()
-
-            // Update overlay text to show we're now refining (processing already true)
-            self.dictation.appBench("processing_ui_request status=Refining")
-            NotchOverlayManager.shared.updateTranscriptionText("Refining")
-            self.dictation.appBench("processing_ui_requested status=Refining")
-
-            // Ensure the status label becomes visible immediately.
-            await Task.yield()
-
-            do {
-                finalText = try await self.dictation.processTextWithAI(
-                    normalizedTranscribedText,
-                    overrideSystemPrompt: promptOverride,
-                    dictationSlot: activeDictationSlot
-                )
-            } catch {
-                // Fall back to the raw transcription so the user still gets
-                // their words typed instead of an error string.
-                DebugLogger.shared.error(
-                    "AI post-processing failed, falling back to raw transcription: \(error.localizedDescription)",
-                    source: "ContentView"
-                )
-                aiFallbackReason = error.localizedDescription
-                // Configuration errors are actionable — point the user at settings
-                // rather than just echoing the technical error string.
-                if let aiError = error as? AIProcessingError,
-                   aiError.isConfigurationError
-                {
-                    NotificationService.showAIProcessingFallback(
-                        error: "\(aiError.localizedDescription). Open AI Enhancement settings to configure a provider."
-                    )
-                } else {
-                    NotificationService.showAIProcessingFallback(error: error.localizedDescription)
-                }
-                finalText = normalizedTranscribedText
-            }
-            let postProcessingLatencyMs = Int((Date().timeIntervalSince(postProcessingStart) * 1000).rounded())
-            AnalyticsService.shared.capture(
-                .dictationPostProcessingCompleted,
-                properties: [
-                    "latency_ms": postProcessingLatencyMs,
-                    "input_chars": postProcessingInputChars,
-                    "post_processing_provider": postProcessingModelInfo.provider ?? "unknown",
-                    "post_processing_model": postProcessingModelInfo.model ?? "unknown",
-                    "transcription_provider": transcriptionModelInfo.provider,
-                    "transcription_model": transcriptionModelInfo.model,
-                ]
-            )
-
-            // Clear transient status text before leaving processing state to avoid
-            // a brief non-shimmer "Refining..." preview flash.
-            NotchOverlayManager.shared.updateTranscriptionText("")
-
-        } else {
-            finalText = normalizedTranscribedText
-        }
-
-        // Normalize literal command and mention syntax after AI cleanup and before final user preferences.
-        finalText = ASRService.applyDictationLiteralFormatting(
-            finalText,
-            appName: appInfo.name,
-            bundleID: appInfo.bundleId,
-            windowTitle: appInfo.windowTitle
-        )
-        // Apply GAAV formatting as the FINAL step (after AI post-processing)
-        // This ensures the user's preference for no capitalization/period is respected
-        finalText = ASRService.applyGAAVFormatting(finalText)
-        // Apply Continuous Dictation Mode after GAAV so smart caps use the field
-        // context captured at recording start, and the trailing space enables chaining.
-        finalText = ASRService.applyContinuousDictationFormatting(finalText, precedingText: self.dictation.recordingPrecedingText)
-        finalText = ASRService.applyTerminalLiteralAutocompleteSpacing(
-            finalText,
-            appName: appInfo.name,
-            bundleID: appInfo.bundleId,
-            windowTitle: appInfo.windowTitle
-        )
-        self.dictation.recordingPrecedingText = ""
-        self.asr.finalText = finalText
-        if route == .onboardingSandbox,
-           self.dictation.isOnboardingVoicePlaygroundStepActive,
-           !finalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        {
-            self.settings.onboardingPlaygroundValidated = true
-            self.settings.playgroundUsed = true
-            self.playgroundUsed = true
-        }
-
-        DebugLogger.shared.info("Transcription finalized (chars: \(finalText.count))", source: "ContentView")
-        let finalTextReadyAt = ProcessInfo.processInfo.systemUptime
-        let finalOutputPlan = ASRService.makeDictationLiteralOutputPlan(
-            for: finalText,
-            appName: appInfo.name,
-            bundleID: appInfo.bundleId,
-            windowTitle: appInfo.windowTitle
-        )
-        self.dictation.appBench("transcription_finalized chars=\(finalText.count)")
-        self.dictation.appBench("text_ready chars=\(finalText.count)")
-
-        AnalyticsService.shared.capture(
-            .transcriptionCompleted,
-            properties: [
-                "mode": AnalyticsMode.dictation.rawValue,
-                "words_bucket": AnalyticsBuckets.bucketWords(AnalyticsBuckets.wordCount(in: finalText)),
-                "ai_used": shouldUseAI,
-                "ai_changed_text": transcribedText != finalText,
-                "transcription_provider": transcriptionModelInfo.provider,
-                "transcription_model": transcriptionModelInfo.model,
-            ]
-        )
-
-        let shouldPersistOutputs = route == .normal
-        if !shouldPersistOutputs {
-            DebugLogger.shared.info(
-                "Sandbox route active: suppressing clipboard/history/external typing side effects",
-                source: "ContentView"
-            )
-        }
-
-        let shouldShowAIProcessingFailure = shouldPersistOutputs && aiFallbackReason != nil
-        if shouldShowAIProcessingFailure {
-            self.dictation.pendingAIReprocessText = transcribedText
-            NotchContentState.shared.showAIProcessingFailure()
-            self.menuBarManager.finishProcessingKeepingOverlayVisible()
-        } else {
-            self.dictation.pendingAIReprocessText = nil
-        }
-
-        let frontmostApp = NSWorkspace.shared.frontmostApplication
-        let frontmostName = frontmostApp?.localizedName ?? "Unknown"
-        let isFluidFrontmost = frontmostApp?.bundleIdentifier == Bundle.main.bundleIdentifier
-
-        // Save to transcription history (transcription mode only, if enabled)
-        if shouldPersistOutputs, SettingsStore.shared.saveTranscriptionHistory {
-            let historyEntryID = UUID()
-            let historyTimestamp = Date()
-            TranscriptionHistoryStore.shared.addEntry(
-                id: historyEntryID,
-                timestamp: historyTimestamp,
-                rawText: transcribedText,
-                processedText: finalText,
-                appName: appInfo.name,
-                windowTitle: appInfo.windowTitle,
-                wasAIProcessed: postProcessingModel != nil && aiFallbackReason == nil,
-                processingModel: postProcessingModel,
-                aiProcessingError: aiFallbackReason
-            )
-            self.dictation.persistDictationAudioIfNeeded(
-                audioSnapshot,
-                entryID: historyEntryID,
-                timestamp: historyTimestamp,
-                model: transcriptionModelInfo.model
-            )
-        }
-        // When FluidVoice itself is frontmost, the bound editor already receives `finalText`.
-        // Avoid re-inserting or overwriting the clipboard in that self-target case.
-        let shouldCopyToClipboard = shouldPersistOutputs &&
-            SettingsStore.shared.copyTranscriptionToClipboard &&
-            !isFluidFrontmost
-
-        if shouldCopyToClipboard {
-            ClipboardService.copyToClipboard(finalText)
-            AnalyticsService.shared.capture(
-                .outputDelivered,
-                properties: [
-                    "mode": AnalyticsMode.dictation.rawValue,
-                    "method": AnalyticsOutputMethod.clipboard.rawValue,
-                ]
-            )
-        }
-
-        var didTypeExternally = false
-        let shouldTypeExternally = shouldPersistOutputs && !isFluidFrontmost
-
-        DebugLogger.shared.debug(
-            "Typing decision → frontmost: \(frontmostName), fluidFrontmost: \(isFluidFrontmost), editorFocused: \(self.isTranscriptionFocused), willTypeExternally: \(shouldTypeExternally)",
-            source: "ContentView"
-        )
-
-        if shouldTypeExternally {
-            let typingTarget = self.dictation.resolveTypingTargetPID()
-            // Dispatch insertion as soon as the destination app is ready; the
-            // overlay hides asynchronously after output so it cannot delay paste.
-            if typingTarget.shouldRestoreOriginalFocus {
-                await self.dictation.restoreFocusToRecordingTarget()
-            }
-            self.dictation.appBench(
-                "text_ready_to_type_request elapsedMs=\(Int(((ProcessInfo.processInfo.systemUptime - finalTextReadyAt) * 1000).rounded()))"
-            )
-            self.asr.typeOutputPlanToActiveField(
-                finalOutputPlan,
-                preferredTargetPID: typingTarget.pid,
-                textReadyAt: finalTextReadyAt
-            )
-            didTypeExternally = true
-            if !shouldShowAIProcessingFailure, !didRequestOverlayHideOnStop {
-                self.dictation.hideOverlayAfterOutput()
-            }
-        }
-
-        if didTypeExternally {
-            AnalyticsService.shared.capture(
-                .outputDelivered,
-                properties: [
-                    "mode": AnalyticsMode.dictation.rawValue,
-                    "method": AnalyticsOutputMethod.typed.rawValue,
-                ]
-            )
-
-            // Register the post-transcription edit observation after insertion is dispatched.
-            let wordsBucket = AnalyticsBuckets.bucketWords(AnalyticsBuckets.wordCount(in: finalText))
-            let modelInfo = self.dictation.currentDictationAIModelInfo()
-            await PostTranscriptionEditTracker.shared.markTranscriptionCompleted(
-                mode: AnalyticsMode.dictation.rawValue,
-                outputMethod: AnalyticsOutputMethod.typed.rawValue,
-                wordsBucket: wordsBucket,
-                aiUsed: shouldUseAI,
-                aiModel: modelInfo.model,
-                aiProvider: modelInfo.provider
-            )
-        } else if shouldPersistOutputs,
-                  SettingsStore.shared.copyTranscriptionToClipboard == false,
-                  SettingsStore.shared.saveTranscriptionHistory
-        {
-            AnalyticsService.shared.capture(
-                .outputDelivered,
-                properties: [
-                    "mode": AnalyticsMode.dictation.rawValue,
-                    "method": AnalyticsOutputMethod.historyOnly.rawValue,
-                ]
-            )
-        }
-
-        if !didTypeExternally, !shouldShowAIProcessingFailure, !didRequestOverlayHideOnStop {
-            self.dictation.hideOverlayAfterOutput()
-        }
-    }
-
     private func reprocessLastDictation() {
         if let pendingText = self.dictation.pendingAIReprocessText?.trimmingCharacters(in: .whitespacesAndNewlines),
            !pendingText.isEmpty
         {
             DebugLogger.shared.info("Actions: Reprocessing pending failed dictation", source: "ContentView")
             Task { @MainActor in
-                await self.reprocessDictationText(pendingText)
+                await self.dictation.reprocessDictationText(pendingText)
             }
             return
         }
@@ -2091,7 +1687,7 @@ struct ContentView: View {
 
         DebugLogger.shared.info("Actions: Reprocessing latest dictation history entry", source: "ContentView")
         Task { @MainActor in
-            await self.reprocessDictationText(rawText)
+            await self.dictation.reprocessDictationText(rawText)
         }
     }
 
@@ -2297,176 +1893,9 @@ struct ContentView: View {
         }
     }
 
-    private func reprocessDictationText(_ transcribedText: String) async {
-        // If live recording is still active, stop it first so reprocess does not
-        // leave ASR running in the background (which causes the next hotkey press
-        // to behave like a stop instead of start).
-        if self.asr.isRunning {
-            DebugLogger.shared.info("Actions: stopping active recording before reprocess", source: "ContentView")
-            await self.asr.stopWithoutTranscription()
-            self.dictation.cancelPrewarmDictationIfNeeded()
-        }
-
-        self.dictation.setActiveRecordingMode(.dictate)
-        self.menuBarManager.setProcessing(true)
-        NotchOverlayManager.shared.updateTranscriptionText("Reprocessing...")
-        await Task.yield()
-
-        var aiFallbackReason: String?
-        var postProcessingModel: String?
-        let appInfo = self.dictation.getCurrentAppInfo()
-        let normalizedTranscribedText = ASRService.applySpokenPunctuationFormatting(
-            transcribedText,
-            appName: appInfo.name,
-            bundleID: appInfo.bundleId,
-            windowTitle: appInfo.windowTitle
-        )
-        var finalText = normalizedTranscribedText
-        let shouldUseAI = DictationAIPostProcessingGate.isConfigured(for: .primary, appBundleID: appInfo.bundleId)
-        if shouldUseAI {
-            postProcessingModel = self.dictation.currentDictationAIModelInfo().model
-            do {
-                finalText = try await self.dictation.processTextWithAI(
-                    normalizedTranscribedText,
-                    dictationSlot: .primary
-                )
-            } catch {
-                DebugLogger.shared.error(
-                    "AI reprocess failed, falling back to raw transcription: \(error.localizedDescription)",
-                    source: "ContentView"
-                )
-                aiFallbackReason = error.localizedDescription
-                NotificationService.showAIProcessingFallback(error: error.localizedDescription)
-                finalText = normalizedTranscribedText
-            }
-        }
-
-        NotchOverlayManager.shared.updateTranscriptionText("")
-
-        finalText = ASRService.applyDictationLiteralFormatting(
-            finalText,
-            appName: appInfo.name,
-            bundleID: appInfo.bundleId,
-            windowTitle: appInfo.windowTitle
-        )
-        finalText = ASRService.applyGAAVFormatting(finalText)
-        let precedingText = SettingsStore.shared.needsDictationFormattingContext
-            ? TypingService.textBeforeCursorInFocusedField()
-            : ""
-        finalText = ASRService.applyContinuousDictationFormatting(finalText, precedingText: precedingText)
-        finalText = ASRService.applyTerminalLiteralAutocompleteSpacing(
-            finalText,
-            appName: appInfo.name,
-            bundleID: appInfo.bundleId,
-            windowTitle: appInfo.windowTitle
-        )
-        self.dictation.recordingPrecedingText = ""
-        let outputPlan = ASRService.makeDictationLiteralOutputPlan(
-            for: finalText,
-            appName: appInfo.name,
-            bundleID: appInfo.bundleId,
-            windowTitle: appInfo.windowTitle
-        )
-
-        if SettingsStore.shared.saveTranscriptionHistory {
-            TranscriptionHistoryStore.shared.addEntry(
-                rawText: transcribedText,
-                processedText: finalText,
-                appName: appInfo.name,
-                windowTitle: appInfo.windowTitle,
-                wasAIProcessed: postProcessingModel != nil && aiFallbackReason == nil,
-                processingModel: postProcessingModel,
-                aiProcessingError: aiFallbackReason
-            )
-        }
-        if aiFallbackReason != nil {
-            self.dictation.pendingAIReprocessText = transcribedText
-            NotchContentState.shared.showAIProcessingFailure()
-            self.menuBarManager.finishProcessingKeepingOverlayVisible()
-        } else {
-            self.dictation.pendingAIReprocessText = nil
-        }
-
-        if SettingsStore.shared.copyTranscriptionToClipboard {
-            ClipboardService.copyToClipboard(finalText)
-        }
-
-        let focusedPID = TypingService.captureSystemFocusedPID()
-            ?? NSWorkspace.shared.frontmostApplication?.processIdentifier
-        NotchContentState.shared.recordingTargetPID = focusedPID
-
-        let frontmostApp = NSWorkspace.shared.frontmostApplication
-        let isFluidFrontmost = frontmostApp?.bundleIdentifier?.contains("fluid") == true
-        let shouldTypeExternally = !isFluidFrontmost || self.isTranscriptionFocused == false
-        if shouldTypeExternally {
-            let typingTarget = self.dictation.resolveTypingTargetPID()
-            if typingTarget.shouldRestoreOriginalFocus {
-                await self.dictation.restoreFocusToRecordingTarget()
-            }
-            self.asr.typeOutputPlanToActiveField(
-                outputPlan,
-                preferredTargetPID: typingTarget.pid
-            )
-        }
-
-        if aiFallbackReason == nil {
-            self.dictation.hideOverlayAfterOutput()
-        }
-
-        self.dictation.clearActiveRecordingMode()
-    }
-
     // MARK: - Rewrite Mode Voice Processing
 
     // MARK: - Command Mode Voice Processing
-
-    /// Capture app context at start to avoid mismatches if the user switches apps mid-session
-    private func startRecording() {
-        let model = SettingsStore.shared.selectedSpeechModel
-        DebugLogger.shared.info(
-            "ContentView: startRecording() for model=\(model.displayName), supportsStreaming=\(model.supportsStreaming)",
-            source: "ContentView"
-        )
-
-        self.dictation.advanceOverlayLifecycle()
-        self.dictation.setActiveRecordingMode(.dictate)
-        let shouldShowDictationOverlay = !self.dictation.isRecordingForCommand && !self.dictation.isRecordingForRewrite
-        let shouldPlayStartSound = !self.dictation.isRecordingForCommand
-            && !self.dictation.isRecordingForRewrite
-            && self.asr.micStatus == .authorized
-
-        // Ensure normal dictation mode is set (command/rewrite modes set their own)
-        if shouldShowDictationOverlay {
-            self.menuBarManager.setOverlayMode(.dictation)
-        }
-
-        Task {
-            if shouldPlayStartSound, !self.asr.isRunning {
-                TranscriptionSoundPlayer.shared.playStartSound()
-            }
-            await self.asr.start(onCaptureStarted: {
-                self.dictation.captureRecordingContext()
-                self.dictation.prewarmPrivateAIDictationIfNeeded(for: .primary)
-                if shouldShowDictationOverlay {
-                    self.menuBarManager.showRecordingOverlayImmediately()
-                }
-            })
-            if !self.asr.isRunning {
-                self.menuBarManager.hideRecordingOverlayImmediately(reason: "asr_start_failed")
-            }
-        }
-
-        // Pre-load model in background while recording (avoids 10s freeze on stop)
-        Task {
-            do {
-                DebugLogger.shared.debug("ContentView: pre-load model task started", source: "ContentView")
-                try await self.asr.ensureAsrReady()
-                DebugLogger.shared.debug("Model pre-loaded during recording", source: "ContentView")
-            } catch {
-                DebugLogger.shared.error("Failed to pre-load model: \(error)", source: "ContentView")
-            }
-        }
-    }
 
     // MARK: - ASR Model Management
 
@@ -2601,7 +2030,7 @@ struct ContentView: View {
             rewriteModeShortcutEnabled: self.isRewriteModeShortcutEnabled,
             startRecordingCallback: {
                 DebugLogger.shared.debug("ContentView: startRecordingCallback invoked by hotkey", source: "ContentView")
-                self.startRecording()
+                self.dictation.startRecording()
             },
             dictationModeCallback: {
                 DebugLogger.shared.info("Dictate mode triggered", source: "ContentView")
@@ -2609,20 +2038,20 @@ struct ContentView: View {
                     "ContentView: selected model for dictate hotkey=\(SettingsStore.shared.selectedSpeechModel.displayName)",
                     source: "ContentView"
                 )
-                self.beginDictationRecording(for: .primary, mode: .dictate)
+                self.dictation.beginDictationRecording(for: .primary, mode: .dictate)
             },
             stopAndProcessCallback: {
                 let route = self.dictation.currentDictationOutputRouteForHotkeyStop()
                 DebugLogger.shared.info("Hotkey stop callback using route: \(route.rawValue)", source: "ContentView")
-                await self.stopAndProcessTranscription(route: route)
+                await self.dictation.stopAndProcessTranscription(route: route)
             },
             promptModeCallback: {
                 DebugLogger.shared.info("Prompt mode triggered", source: "ContentView")
-                self.beginDictationRecording(for: .secondary, mode: .promptMode)
+                self.dictation.beginDictationRecording(for: .secondary, mode: .promptMode)
             },
             promptSelectionCallback: { selection in
                 DebugLogger.shared.info("Prompt selection shortcut triggered", source: "ContentView")
-                self.beginDictationRecording(for: selection, mode: .promptMode)
+                self.dictation.beginDictationRecording(for: selection, mode: .promptMode)
             },
             commandModeCallback: {
                 DebugLogger.shared.info("Command mode triggered", source: "ContentView")
@@ -2890,58 +2319,6 @@ extension ContentView {
             properties["override_empty"] = overrideEmpty
         }
         return properties
-    }
-
-    private func beginDictationRecording(for slot: SettingsStore.DictationShortcutSlot, mode: DictationCoordinator.ActiveRecordingMode) {
-        DebugLogger.shared.debug("Begin dictation recording for slot \(slot.rawValue)", source: "ContentView")
-        self.dictation.appBench("begin_recording slot=\(slot.rawValue) mode=\(mode.rawValue)")
-        if self.dictation.isOnboardingVoicePlaygroundStepActive {
-            self.asr.finalText = ""
-            self.settings.onboardingPlaygroundValidated = false
-            self.settings.onboardingPlaygroundSkipped = false
-            self.settings.playgroundUsed = false
-            self.playgroundUsed = false
-        }
-        self.dictation.applyDictationShortcutSelectionContext(for: slot)
-        self.dictation.setActiveRecordingMode(mode)
-        self.dictation.rewriteModeService.clearState()
-
-        guard !self.asr.isRunning else {
-            self.dictation.appBench("asr_start_skipped reason=already_running")
-            return
-        }
-        self.dictation.advanceOverlayLifecycle()
-        Task {
-            let asrStartStartedAt = ProcessInfo.processInfo.systemUptime
-            DebugLogger.shared.benchmark("APP_BENCH", message: "asr_start_call", source: "AppBenchmark")
-            if SettingsStore.shared.enableTranscriptionSounds, !self.asr.isRunning {
-                TranscriptionSoundPlayer.shared.playStartSound()
-            }
-            await self.asr.start(onCaptureStarted: {
-                self.dictation.captureRecordingContext()
-                self.dictation.applyDictationPromptConfiguration(for: SettingsStore.shared.dictationPromptSelection(for: slot))
-                self.dictation.appBench("overlay_mode_request mode=Dictation")
-                self.menuBarManager.setOverlayMode(.dictation)
-                self.menuBarManager.showRecordingOverlayImmediately()
-                self.dictation.appBench("overlay_mode_requested mode=Dictation")
-                self.dictation.prewarmPrivateAIDictationIfNeeded(for: slot)
-            })
-            if !self.asr.isRunning {
-                self.menuBarManager.hideRecordingOverlayImmediately(reason: "asr_start_failed")
-            }
-            DebugLogger.shared.benchmark(
-                "APP_BENCH",
-                message: "asr_start_return elapsedMs=\(Int(((ProcessInfo.processInfo.systemUptime - asrStartStartedAt) * 1000).rounded()))",
-                source: "AppBenchmark"
-            )
-        }
-    }
-
-    private func beginDictationRecording(for selection: SettingsStore.DictationPromptSelection, mode: DictationCoordinator.ActiveRecordingMode) {
-        let settings = SettingsStore.shared
-        settings.setDictationPromptSelection(selection, for: .secondary)
-        self.dictation.applyDictationPromptConfiguration(for: selection)
-        self.beginDictationRecording(for: .secondary, mode: mode)
     }
 
     private func callOpenAIChat() async {
@@ -3545,7 +2922,6 @@ private extension ContentView {
         self.isPromptModeShortcutEnabled = SettingsStore.shared.promptModeShortcutEnabled
         self.isCommandModeShortcutEnabled = SettingsStore.shared.commandModeShortcutEnabled
         self.isRewriteModeShortcutEnabled = SettingsStore.shared.rewriteModeShortcutEnabled
-        self.playgroundUsed = SettingsStore.shared.playgroundUsed
         self.visualizerNoiseThreshold = SettingsStore.shared.visualizerNoiseThreshold
         self.selectedInputUID = AudioDevice.getDefaultInputDevice()?.uid ?? ""
         self.selectedOutputUID = SettingsStore.shared.preferredOutputDeviceUID ?? ""
