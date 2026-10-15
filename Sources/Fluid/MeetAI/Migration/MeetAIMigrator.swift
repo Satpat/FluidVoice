@@ -45,7 +45,49 @@ final class MeetAIMigrator: ObservableObject {
         self.entries = (try? decoder.decode([String: MeetAIMigrationEntry].self, from: data)) ?? [:]
     }
 
-    private func saveEntries() {
+    func hasLegacyAudio(folder: String) -> Bool {
+        let url = self.paths.legacyMeetingsDirectory.appendingPathComponent(folder, isDirectory: true)
+        return FileManager.default.fileExists(atPath: url.appendingPathComponent("system.wav").path)
+            && FileManager.default.fileExists(atPath: url.appendingPathComponent("mic.wav").path)
+    }
+
+    /// Tier 2 (spec §7.2, §12.8): rebuild the meeting from the fork's two WAVs and run FluidMeet's
+    /// pipeline. On success the transcript-only session is replaced; on failure the new one is deleted.
+    func reprocess(folder: String, retry: @MainActor (MeetingSessionID) async throws -> Void) async throws -> MeetingSessionID {
+        guard let entry = self.entries[folder], entry.status == .done, let oldID = entry.sessionID else {
+            throw MeetAILLMError("This meeting hasn't been imported yet.")
+        }
+        guard self.hasLegacyAudio(folder: folder) else { throw MeetAILLMError("The original audio for this meeting is gone.") }
+        let url = self.paths.legacyMeetingsDirectory.appendingPathComponent(folder, isDirectory: true)
+        let old = try await self.store.load(id: oldID)
+        let system = try await MeetAIAudioDecoder.decode(url: url.appendingPathComponent("system.wav"))
+        let microphone = try await MeetAIAudioDecoder.decode(url: url.appendingPathComponent("mic.wav"))
+        let session = try await MeetAISessionImport.createAudioSession(
+            store: self.store,
+            title: old?.title ?? folder,
+            languageCode: old?.languageCode ?? "en",
+            startedAt: old?.startedAt ?? Date(),
+            tracks: [
+                .init(kind: .applicationAudio, samples: system, echoProtection: .unprotected),
+                .init(kind: .microphone, samples: microphone, echoProtection: .legacyUnclassified),
+            ]
+        )
+        do {
+            try await retry(session.id)
+        } catch {
+            try? await self.store.delete(id: session.id)
+            try? await self.sidecars.removeAll(for: session.id)
+            throw error
+        }
+        try? await self.store.delete(id: oldID)
+        try? await self.sidecars.removeAll(for: oldID)
+        self.entries[folder]?.sessionID = session.id
+        self.entries[folder]?.reprocessedAt = Date()
+        self.saveEntries()
+        return session.id
+    }
+
+    func saveEntries() {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]

@@ -1,4 +1,5 @@
 @testable import FluidVoice_Debug
+import AVFoundation
 import XCTest
 
 @MainActor
@@ -199,5 +200,67 @@ final class MeetAIMigrationTests: XCTestCase {
                 try fm.copyItem(at: item, to: target)
             }
         }
+    }
+
+    /// Real 16 kHz mono Int16 WAV, like the fork wrote.
+    private func writeWAV(_ url: URL, seconds: Double, frequency: Float) throws {
+        let settings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: 16_000, AVNumberOfChannelsKey: 1,
+            AVLinearPCMBitDepthKey: 16, AVLinearPCMIsFloatKey: false, AVLinearPCMIsBigEndianKey: false,
+        ]
+        let file = try AVAudioFile(forWriting: url, settings: settings, commonFormat: .pcmFormatFloat32, interleaved: false)
+        let frames = AVAudioFrameCount(seconds * 16_000)
+        let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: frames))
+        buffer.frameLength = frames
+        let channel = try XCTUnwrap(buffer.floatChannelData?[0])
+        for i in 0..<Int(frames) { channel[i] = 0.2 * sin(2 * .pi * frequency * Float(i) / 16_000) }
+        try file.write(from: buffer)
+    }
+
+    func testReprocessReplacesTranscriptOnlySession() async throws {
+        let root = try MeetAIFixtures.tempDirectory(self)
+        let paths = MeetAIPaths(supportRoot: root)
+        let folderName = "2026-10-15T06:00:44"
+        try self.makeLegacyFolder(root, name: folderName, transcript: self.sampleTranscript, title: "Frontier Models (Thu, 15 Oct at 4:30 pm)")
+        let folder = paths.legacyMeetingsDirectory.appendingPathComponent(folderName)
+        try self.writeWAV(folder.appendingPathComponent("system.wav"), seconds: 3, frequency: 220)
+        try self.writeWAV(folder.appendingPathComponent("mic.wav"), seconds: 3, frequency: 330)
+        let store = MeetingSessionStore(rootDirectory: root.appendingPathComponent("Meetings"))
+        let migrator = MeetAIMigrator(paths: paths, store: store, sidecars: MeetAISidecarStore(paths: paths))
+        await migrator.run()
+        XCTAssertTrue(migrator.hasLegacyAudio(folder: folderName))
+        let oldID = try XCTUnwrap(migrator.entries[folderName]?.sessionID)
+
+        var retried: [MeetingSessionID] = []
+        let newID = try await migrator.reprocess(folder: folderName, retry: { retried.append($0) })
+        XCTAssertEqual(retried, [newID])
+        let oldSession = try await store.load(id: oldID)
+        XCTAssertNil(oldSession, "old transcript-only session removed")
+        let replacement = try await XCTUnwrapAsync(await store.load(id: newID))
+        XCTAssertEqual(replacement.mode, .onlineCall)
+        XCTAssertEqual(replacement.title, "Frontier Models")
+        XCTAssertEqual(migrator.entries[folderName]?.sessionID, newID)
+        XCTAssertNotNil(migrator.entries[folderName]?.reprocessedAt)
+    }
+
+    func testReprocessFailureKeepsOldSession() async throws {
+        let root = try MeetAIFixtures.tempDirectory(self)
+        let paths = MeetAIPaths(supportRoot: root)
+        let folderName = "2026-10-15T06:00:44"
+        try self.makeLegacyFolder(root, name: folderName, transcript: self.sampleTranscript)
+        let folder = paths.legacyMeetingsDirectory.appendingPathComponent(folderName)
+        try self.writeWAV(folder.appendingPathComponent("system.wav"), seconds: 3, frequency: 220)
+        try self.writeWAV(folder.appendingPathComponent("mic.wav"), seconds: 3, frequency: 330)
+        let store = MeetingSessionStore(rootDirectory: root.appendingPathComponent("Meetings"))
+        let migrator = MeetAIMigrator(paths: paths, store: store, sidecars: MeetAISidecarStore(paths: paths))
+        await migrator.run()
+        let oldID = try XCTUnwrap(migrator.entries[folderName]?.sessionID)
+        do {
+            _ = try await migrator.reprocess(folder: folderName, retry: { _ in throw MeetingCoordinatorError.activityInProgress })
+            XCTFail("expected failure")
+        } catch {}
+        let all = try await store.loadAll()
+        XCTAssertEqual(all.map(\.id), [oldID], "new session deleted, old kept")
+        XCTAssertEqual(migrator.entries[folderName]?.sessionID, oldID)
     }
 }
