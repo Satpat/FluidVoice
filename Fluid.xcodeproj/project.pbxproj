@@ -7,6 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		DE4FAAF4DD53ACA6DFAB8188 /* MeetAIFoundationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA82D01E9E31D968A4D98900 /* MeetAIFoundationTests.swift */; };
+		D73BECB5BAF3882A6D7F18C3 /* MeetAITestSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6C62E5286EDD1A3FEBA572DB /* MeetAITestSupport.swift */; };
 		D981FBB05838B6B02BCEEB73 /* MeetAISyntheticSessionBuilderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 454F7131D09A196E0B0EAA6B /* MeetAISyntheticSessionBuilderTests.swift */; };
 		C816B628B2F31EC0B6CC0FEC /* MeetAIReasoningModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2C4D337E1D31DA71C54D4A3E /* MeetAIReasoningModelTests.swift */; };
 		163B761765AA6DF4FD9C45B2 /* FluidAudioSmokeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 796E039E0E99122C2CA5D96B /* FluidAudioSmokeTests.swift */; };
@@ -182,6 +184,8 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		CA82D01E9E31D968A4D98900 /* MeetAIFoundationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeetAIFoundationTests.swift; sourceTree = "<group>"; };
+		6C62E5286EDD1A3FEBA572DB /* MeetAITestSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeetAITestSupport.swift; sourceTree = "<group>"; };
 		454F7131D09A196E0B0EAA6B /* MeetAISyntheticSessionBuilderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeetAISyntheticSessionBuilderTests.swift; sourceTree = "<group>"; };
 		2C4D337E1D31DA71C54D4A3E /* MeetAIReasoningModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeetAIReasoningModelTests.swift; sourceTree = "<group>"; };
 		796E039E0E99122C2CA5D96B /* FluidAudioSmokeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FluidAudioSmokeTests.swift; sourceTree = "<group>"; };
@@ -438,6 +442,8 @@
 				C0DE89000000000000000001 /* SettingsNavigationStateTests.swift */,
 				343B29013F4441D6A797D12D /* LLMClientRequestBodyTests.swift */,
 				980330F3CE464336ADCE3E23 /* TemperatureSupportTests.swift */,
+				CA82D01E9E31D968A4D98900 /* MeetAIFoundationTests.swift */,
+				6C62E5286EDD1A3FEBA572DB /* MeetAITestSupport.swift */,
 				454F7131D09A196E0B0EAA6B /* MeetAISyntheticSessionBuilderTests.swift */,
 				2C4D337E1D31DA71C54D4A3E /* MeetAIReasoningModelTests.swift */,
 				796E039E0E99122C2CA5D96B /* FluidAudioSmokeTests.swift */,
@@ -818,6 +824,8 @@
 				C0DE89000000000000000002 /* SettingsNavigationStateTests.swift in Sources */,
 				86CAA2D4EF18433096185602 /* LLMClientRequestBodyTests.swift in Sources */,
 				272BFB5CB271489892CAE50C /* TemperatureSupportTests.swift in Sources */,
+				DE4FAAF4DD53ACA6DFAB8188 /* MeetAIFoundationTests.swift in Sources */,
+				D73BECB5BAF3882A6D7F18C3 /* MeetAITestSupport.swift in Sources */,
 				D981FBB05838B6B02BCEEB73 /* MeetAISyntheticSessionBuilderTests.swift in Sources */,
 				C816B628B2F31EC0B6CC0FEC /* MeetAIReasoningModelTests.swift in Sources */,
 				163B761765AA6DF4FD9C45B2 /* FluidAudioSmokeTests.swift in Sources */,

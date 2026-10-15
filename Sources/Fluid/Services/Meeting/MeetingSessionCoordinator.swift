@@ -863,6 +863,8 @@ final class MeetingSessionCoordinator: ObservableObject {
         self.correctionUndoStacks[sessionID] = stack
 
         self.refreshSlots(with: target)
+        // MeetAI H6: diff-based; the handler only schedules work and never mutates synchronously.
+        MeetAIHooks.notifySessionCorrected(target)
         return target
     }
 
@@ -1690,6 +1692,8 @@ final class MeetingSessionCoordinator: ObservableObject {
             await self.releaseActivityLease()
             diagnosticOutcome = "completed"
             diagnosticStage = .completed
+            // MeetAI H1: speaker embeddings need the audio before the retention sweep below.
+            await MeetAIHooks.runSessionDidComplete(session)
             // afterTranscription policy deletes here; sweep failures are logged, never affect this result.
             Task { @MainActor [weak self] in await self?.sweepExpiredAudio() }
             #if DEBUG

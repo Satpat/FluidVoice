@@ -107,6 +107,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         DictationAppSession.shared.start()
         OnboardingAISetupController.live.resumePendingDownload()
         LocalAPIServer.shared.start()
+        MeetAIBootstrap.start()
 
         // Record first-open synchronously before async analytics bootstrap so
         // onboarding initialization is deterministic on brand-new installs.
