@@ -60,7 +60,7 @@ flowchart TB
         menubar[MenuBarManager<br/>NSStatusItem · overlays]
     end
     subgraph ui[UI — SwiftUI]
-        content[ContentView<br/>NavigationSplitView + <b>dictation orchestration</b>]
+        content[ContentView<br/>NavigationSplitView · binds dictation state]
         meetings[MeetingsView]
         recorder[MeetingRecorderCard]
         qa[MeetingQAPanel]
@@ -72,6 +72,7 @@ flowchart TB
         hotkey[GlobalHotkeyManager<br/>CGEventTap]
         asr[ASRService<br/>capture · streaming · final]
         providers[TranscriptionProvider impls]
+        coord[DictationCoordinator<br/>session state · flow · hotkeys]
         gate[DictationAIPostProcessingGate]
         llm[LLMClient.shared]
         typing[TypingService]
@@ -98,11 +99,14 @@ flowchart TB
     end
 
     app --> delegate & services & menubar & content
-    content --> hotkey & asr & typing & gate & llm & cmd & rewrite
     content --> meetings & filetx & settings
     meetings --> recorder & qa
     menubar --> overlay
+    services --> coord
     services --> asr --> providers
+    content -- binds UI --> coord
+    coord --> hotkey & asr & typing & gate & cmd & rewrite
+    coord --> proc[DictationAIProcessor] --> llm
     recorder --> session & live & pipeline
     meetings --> pipeline & relabel & reproc & activity
     filetx --> importer --> pipeline
@@ -113,7 +117,7 @@ flowchart TB
     session & pipeline --> disk
 ```
 
-Notable: the **dictation pipeline is owned by a SwiftUI view**. `ContentView.handleContentAppear()` boots the runtime (menu bar, delayed `asr.initialize()`, accessibility polling, hotkey manager), and `GlobalHotkeyManager` lives in ContentView `@State`. Callbacks injected from ContentView drive start/stop/AI/typing.
+Notable: the **dictation pipeline is owned by `DictationCoordinator`**, which `AppServices.shared` lazily owns (`AppServices.shared.dictation`). ContentView binds to `AppServices.shared.dictation` and calls `bootIfNeeded()` on appear, after `attach(menuBar:host:)`; `bootIfNeeded()` creates the `GlobalHotkeyManager`. The coordinator reaches back into the view only through `DictationHostBridge` (sidebar selection, accessibility, transcription-editor focus, shortcut capture, provider-selection sync). `DictationAIProcessor` is the single AI post-processing engine for dictation and the Local API.
 
 ## 1.3 Dictation: hotkey → text inserted
 
@@ -122,13 +126,14 @@ sequenceDiagram
     autonumber
     participant K as CGEventTap
     participant H as GlobalHotkeyManager
-    participant C as ContentView
+    participant C as DictationCoordinator
     participant A as ASRService
     participant Cap as DirectCoreAudioInput /<br/>AVAudioEngine
     participant P as AudioCapturePipeline<br/>(16 kHz, levels)
     participant X as TranscriptionExecutor<br/>(actor)
     participant Pr as TranscriptionProvider
     participant G as DictationAIPostProcessingGate
+    participant AI as DictationAIProcessor
     participant L as LLMClient / PrivateAI /<br/>AppleIntelligence
     participant T as TypingService
 
@@ -158,8 +163,10 @@ sequenceDiagram
     else dictation
         C->>G: isConfigured(for: appBundleID)?
         opt AI enhancement enabled & provider verified
-            C->>L: processTextWithAI (prompt + transcript)
-            L-->>C: enhanced text (fallback: raw + notification)
+            C->>AI: processTextWithAI (prompt + transcript)
+            AI->>L: LLM request
+            L-->>AI: enhanced text
+            AI-->>C: enhanced text (fallback: raw + notification)
         end
         C->>C: literal · GAAV · continuous · terminal formatting<br/>→ makeDictationLiteralOutputPlan
         C->>C: TranscriptionHistoryStore.addEntry · audio history
@@ -566,7 +573,7 @@ xcodebuild test -project Fluid.xcodeproj -scheme Fluid -destination 'platform=ma
 
 Ordered by value ÷ risk:
 
-1. **Move dictation orchestration out of `ContentView`.** Today the hotkey manager, stop → AI → typing chain and runtime boot live in a 4.4k-line SwiftUI view. Extract a `DictationCoordinator` owned by `AppServices`, and have `DictationPostProcessingService` replace `ContentView.processTextWithAI`, removing the duplicate.
+1. ~~**Move dictation orchestration out of `ContentView`.**~~ **Done** in `dadabd6..fd7cf35` on `meetai-v2-hardening`. `DictationCoordinator` is owned by `AppServices`, `DictationAIProcessor` replaces `ContentView.processTextWithAI`, and `DictationPostProcessingService` is now a thin Local API adapter over it. `ContentView` went from 4458 to 2519 lines. Follow-up: SettingsView still binds to ContentView shortcut `@State` editor copies.
 2. **`TypingService` thread safety.** Remove `DispatchQueue.main.sync` from `virtualKeyCode`, and synchronise `isCurrentlyTyping`.
 3. **Keychain read per API-key access.** Cache `providerAPIKeys` in memory and invalidate on write (29 call sites).
 4. **Meeting index from disk.** List meetings from `MeetingRecordings/*/session.json` instead of the UserDefaults history blob, which also removes the need for the history-cap exception.
