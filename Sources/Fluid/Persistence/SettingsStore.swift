@@ -2176,7 +2176,10 @@ final class SettingsStore: ObservableObject {
 
     var playgroundUsed: Bool {
         get { self.defaults.bool(forKey: Keys.playgroundUsed) }
-        set { self.defaults.set(newValue, forKey: Keys.playgroundUsed) }
+        set {
+            objectWillChange.send()
+            self.defaults.set(newValue, forKey: Keys.playgroundUsed)
+        }
     }
 
     var onboardingCompleted: Bool {
