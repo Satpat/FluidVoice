@@ -2,8 +2,8 @@
 
 This document describes how FluidVoice works end to end: dictation, AI post-processing, text insertion, and the MeetAI meeting subsystem (recording, transcription, diarization, summaries). It has two halves:
 
-- **Part 1 — Current state**: the app as it was at the start of the `meetai-v2-hardening` review (baseline commit `d2071ae` on top of `meetai-v2`).
-- **Part 2 — Target state**: the app after the review fixes and refactor, with a delta table mapping each finding to the change that addressed it.
+- **Part 1 — Current state (baseline)**: the app as it was at the start of the `meetai-v2-hardening` review (baseline commit `d2071ae` on top of `meetai-v2`).
+- **Part 2 — Target state**: the app after the review fixes and refactor on `meetai-v2-hardening` (implemented), with a delta table mapping each finding to its commit, and a roadmap of what is still open.
 
 All paths are relative to `Sources/Fluid/` unless noted.
 
@@ -350,4 +350,228 @@ Also: `TypingService.virtualKeyCode` uses `DispatchQueue.main.sync` from a worke
 
 # Part 2 — Target state
 
-_Filled in once the hardening commits land._
+Everything in this part is implemented on `meetai-v2-hardening` unless listed under §2.8 Roadmap. Dictation (§1.3), provider resolution (§1.4), recording (§1.5) and the on-disk layout (§1.5) are unchanged except where noted.
+
+## 2.1 What changed at a glance
+
+```mermaid
+flowchart LR
+    subgraph before[Baseline]
+        b1[Pipeline: everything on MainActor]
+        b2[Upload: full-file array ×2]
+        b3[Audio deleted unconditionally<br/>default ON, no toggle]
+        b4[ASR errors swallowed]
+        b5[Set&lt;String&gt; busy folders +<br/>per-view @State progress]
+        b6[Shared URLSession 600 s for all]
+        b7[isLocalEndpoint ×5 · reasoning params ×7]
+        b8[Package.swift + AppUpdater + PostHog]
+    end
+    subgraph after[Target]
+        a1[MainActor coordinator +<br/>@concurrent MeetingProcessingEngine]
+        a2[Upload: streamed 16 kHz chunks, off-main]
+        a3[Delete only after transcript + summary saved<br/>default OFF, toggle in Meetings]
+        a4[Cancellation propagates · 5 consecutive / all fail → error<br/>native-file fallback]
+        a5[MeetingFolderActivity: folder → Operation<br/>shared .recorder / .reprocessor pipelines]
+        a6[Shared session 60 s · long session 600 s]
+        a7[EndpointClassifier · SettingsStore.reasoningExtraParameters]
+        a8[xcodeproj only · PromiseKit direct]
+    end
+    b1-->a1
+    b2-->a2
+    b3-->a3
+    b4-->a4
+    b5-->a5
+    b6-->a6
+    b7-->a7
+    b8-->a8
+```
+
+## 2.2 Meeting pipeline: coordinator + engine
+
+`MeetingTranscriptPipeline` stays a `@MainActor ObservableObject`. It publishes progress and runs the steps that need main-actor state: the ASR provider, `SpeakerProfileStore`, `FileTranscriptionHistoryStore` and AI calls. CPU-heavy work moves to `MeetingProcessingEngine` (`Services/MeetingRecording/MeetingProcessingEngine.swift`), a `nonisolated enum`. Its expensive entry points are `@concurrent`, so they leave the main actor even under the app's default MainActor isolation.
+
+```mermaid
+flowchart TB
+    subgraph main[MainActor — MeetingTranscriptPipeline.process]
+        lock[MeetingFolderActivity.begin folder, .transcribing]
+        ready[ensureAsrReady · provider]
+        asrMic[transcribeUtterances Me<br/>provider.transcribe per ≤30 s slice]
+        asrSys[transcribeUtterances Them]
+        match[SpeakerProfileStore.bestMatchName<br/>per diarized centroid]
+        name[MeetingSpeakerNamer LLM]
+        enrol[enrollProfiles · speakers.json]
+        write[write transcript.md · history entry]
+        sum[summarize → summary.md]
+        title[generateTitleLine → title.txt]
+        del{transcript non-empty<br/>and summary saved<br/>and toggle ON?}
+        result([MeetingProcessingResult])
+    end
+    subgraph engine[Off main — MeetingProcessingEngine @concurrent]
+        dec1[decodeAndSplit mic.wav<br/>stream decode → VAD → even ≤30 s chunks]
+        dec2[decodeAndSplit system.wav]
+        diar[diarize<br/>DiarizerManager created + torn down here<br/>dropShortSpeakers · centroids]
+        assign[assignSpeakers — pure]
+        merge[mergeSuppressingEcho]
+        render[render → markdown + mergedText]
+    end
+    lock --> ready --> dec1 --> asrMic
+    asrMic -- mic samples released --> dec2 --> asrSys
+    asrSys --> diar --> match --> assign --> merge --> name --> enrol --> render --> write
+    write --> sum --> title --> del
+    del -- yes --> rm[(delete system.wav + mic.wav)]
+    del -- no --> keep[(keep audio)]
+    rm & keep --> result
+```
+
+Error handling in `transcribeUtterances`:
+
+- `Task.checkCancellation()` runs before every utterance, and `CancellationError` is always rethrown.
+- A single failed utterance is logged and skipped.
+- Five failures in a row, or every utterance failing, throws `MeetingRecordingError` instead of producing an empty "successful" transcript.
+- If utterance ASR fails and the provider has `prefersNativeFileTranscription` (Cohere/Nemotron), `transcribeTrack` falls back to `provider.transcribeFile(at:)` as a single segment. That track is then not diarized.
+
+Decode fix: `forEach16kMonoChunk` now drains the `AVAudioConverter` with `.endOfStream` at EOF. Before, the resampler's filter latency (~85 ms on a 44.1 kHz file) was dropped from the end of every decoded file.
+
+## 2.3 Upload flow (target)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant V as MeetingTranscriptionView
+    participant S as MeetingTranscriptionService<br/>(MainActor)
+    participant I as MeetingUploadImporter<br/>(@concurrent)
+    participant E as MeetingProcessingEngine
+    participant P as MeetingTranscriptPipeline<br/>(MainActor)
+    participant H as FileTranscriptionHistoryStore
+
+    V->>S: transcribeFile(url)
+    S->>S: validate extension · subscribe to pipeline progress (synchronous sink)
+    S->>I: importArtifacts(from:baseDirectory:)
+    I->>E: forEach16kMonoChunk(source)
+    loop ~1 min chunks
+        E-->>I: [Float] chunk
+        I->>I: append to system.wav (16-bit PCM)
+    end
+    I->>I: mic.wav (0.1 s silence) · session.json (+ sourceFileName)
+    I-->>S: MeetingRecordingArtifacts
+    S->>P: process(artifacts)
+    P->>E: decodeAndSplit · diarize · render (off main)
+    P->>H: addEntry("Meeting <folder>") → historyEntryID
+    P-->>S: MeetingProcessingResult (mergedText, title, summaryError)
+    S->>S: cancel subscriptions
+    alt mergedText empty
+        S-->>V: error "No speech detected" (import kept in Meetings)
+    else
+        S-->>V: TranscriptionResult(fileName = original upload name), progress 1.0
+    end
+```
+
+## 2.4 Per-folder operations and UI state
+
+```mermaid
+stateDiagram-v2
+    [*] --> idle
+    idle --> transcribing: process() — recorder / reprocessor / upload / launch sweep
+    idle --> summarizing: regenerateSummary()
+    idle --> relabeling: MeetingRelabeler.relabel()
+    transcribing --> idle: end (defer)
+    summarizing --> idle: end (defer)
+    relabeling --> idle: end (defer)
+    note right of idle
+        MeetingFolderActivity.busy: [folder: Operation]
+        begin() returns false if the folder is busy,
+        so concurrent writers to transcript.md / summary.md /
+        speakers.json are rejected
+    end note
+```
+
+| UI | State source |
+|---|---|
+| Meetings row progress bar | `MeetingTranscriptPipeline.shared(.reprocessor).processingFolderName/progress` |
+| Meetings row spinner label | `MeetingFolderActivity.operation(for:)` → `progressLabel` (summarising with style, applying names, transcribing by another pipeline) |
+| Re-transcribe / Summarise / Save & apply disabled | `MeetingFolderActivity.isBusy(folder)` |
+| Recorder card | `MeetingTranscriptPipeline.shared(.recorder)` (survives navigation) |
+| Q&A context | live transcript → **expanded meeting** → newest meeting |
+| Delete-audio toggle | `@AppStorage("DeleteMeetingAudioAfterTranscription")` = `SettingsStore.deleteMeetingAudioAfterTranscription`, default **OFF** |
+| Meetings list retention | 50-entry cap now evicts only non-meeting file transcriptions |
+
+## 2.5 LLM plumbing
+
+```mermaid
+flowchart LR
+    callers[Dictation · Command · Rewrite ·<br/>Meeting summary/title/Q&A · Local API] --> cfg[LLMClient.Config<br/>timeoutSeconds]
+    cfg --> pick{request.timeoutInterval<br/>> 30 s?}
+    pick -- no --> shared[shared URLSession<br/>resource 60 s]
+    pick -- yes --> long[longSession<br/>resource 600 s]
+    callers --> ec[EndpointClassifier.isLocal<br/>localhost · ::1 · 127/8 · 10/8 · 172.16/12 · 192.168/16]
+    callers --> rp[SettingsStore.reasoningExtraParameters<br/>reasoning_effort · enable_thinking · Responses API mapping]
+    ec --> err[LLMError: 'Local AI server … not running']
+    ec --> retry[MeetingAIClient.completeFittingContext<br/>20 attempts local · 4 remote]
+```
+
+- `MeetingAIClient.completeFittingContext` is the trim-and-retry loop with an injectable completion. `isContextOverflow` is a pure predicate. Both are unit-tested.
+- Removed dead code: `Networking/AIProvider.swift` (`AIProvider` and `OpenAICompatibleProvider`) and `Networking/FunctionCallingProvider.swift`.
+
+## 2.6 Build, dependencies, tests
+
+| Package | Before | After |
+|---|---|---|
+| FluidAudio (altic-dev fork) | `B/cohere-coreml-asr` @ 72625bb | @ **3fd6388** (pipelined Parakeet long-form, pronunciation customization; no diarizer changes) |
+| mediaremote-adapter | `master` @ 78aae86 | @ **5b6afde** (race/deadlock fixes) |
+| PromiseKit | transitive via AppUpdater | **direct**, 6.22.1 (latest 6.x) |
+| AppUpdater (+ Path.swift, Version, PMKFoundation) | 1.1.1 | **removed** (never imported) |
+| posthog-ios | `Package.swift` only | **removed** (never imported) |
+| SwiftWhisper / DynamicNotchKit | 1.2.0 / `main` @ 708f31d | unchanged (already latest in range) |
+| `Package.swift` + root `Package.resolved` | stale, could not build the app | **deleted**; `Fluid.xcodeproj` is the single source of truth |
+
+Tests: all in the Xcode target `FluidDictationIntegrationTests`. Each new test file needs explicit pbxproj entries. App sources use a synchronized folder, so they don't.
+
+| Suite | Covers |
+|---|---|
+| `MeetingPipelineTests` | `splitOnSilence` (cuts, blips, even ≤30 s chunks), echo suppression, merge, `dropShortSpeakers`, `assignSpeakers`, markdown render and `plainTranscript`, relabel rewrite, upload import (resample, manifest, empty-file cleanup) |
+| `MarkdownTextTests` | bullets, ordinals, nesting depth, headers, inline bold |
+| `LLMHelpersTests` | `EndpointClassifier`, `reasoningExtraParameters`, context-window retry convergence and caps |
+| `FluidAudioSmokeTests` | Parakeet v2 on the fixture; diarizer through `MeetingProcessingEngine.diarize` (skip when models aren't cached) |
+| existing | `DictationE2ETests` (Whisper tiny E2E + formatting), hotkeys, LLM request bodies, temperature support |
+
+```bash
+xcodebuild test -project Fluid.xcodeproj -scheme Fluid -destination 'platform=macOS' -only-testing:FluidDictationIntegrationTests CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM=
+```
+
+## 2.7 Concurrency rules (read before adding meeting code)
+
+1. The app target compiles with `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor` and Swift 5 language mode, so isolation violations are **warnings**, not errors. Don't add new ones.
+2. `nonisolated` on a synchronous function does **not** move work off main when it's called from main. Mark CPU-heavy async entry points `@concurrent`, and make the types they take or return `nonisolated` and `Sendable` (`MeetingSegment`, `MeetingRecordingArtifacts`, `MeetingRecordingError`).
+3. Don't call `DebugLogger`, `SettingsStore` or any store from engine code. Return values and let the coordinator log or persist.
+4. Create non-Sendable framework objects (e.g. `DiarizerManager`) inside the `@concurrent` function that uses them.
+5. Any writer to a meeting folder must claim it with `MeetingFolderActivity.begin(folder, operation)` and release it in `defer`.
+
+## 2.8 Code-review findings → fixes
+
+| # | Finding | Fix | Commit |
+|---|---|---|---|
+| 1 | Audio deleted after empty transcript / failed summary | Gated on non-empty transcript and a saved summary; default OFF; toggle | `187ec54` |
+| 2 | Per-utterance catch swallowed cancellation and systemic failures | Cancellation propagates; 5 consecutive / all failures throw | `187ec54` |
+| 3 | Decode/diarization on main; upload double full-file load | `MeetingProcessingEngine` `@concurrent` stages; streamed import; one track in memory | `187ec54` |
+| 4 | `MarkdownText` list items rendered as paragraphs | Kind from first header/list-item component; depth indent | `06c8be9` |
+| 5 | Final chunk up to 31 s | Even split, every chunk ≤30 s and ≥15 s | `a0e96d5` |
+| 6 | Upload ignored native file transcription | Native-file fallback when utterance ASR fails | `187ec54` |
+| 7 | Upload result lost filename, dead guard, progress reset | `MeetingProcessingResult`; `sourceFileName`; "No speech detected"; final progress kept | `187ec54` |
+| 8 | `summarizingFolder` race | `MeetingFolderActivity` operation per folder | `187ec54` |
+| 9 | Duplicated helpers | `EndpointClassifier`, `reasoningExtraParameters`; dead providers removed | `5c92f93` |
+| 10 | Session-wide 600 s timeout | Dedicated long session | `5c92f93` |
+| — | Resampler tail dropped (found by new tests) | Drain converter at EOF | `187ec54` |
+
+## 2.9 Roadmap (not done in this pass)
+
+Ordered by value ÷ risk:
+
+1. **Move dictation orchestration out of `ContentView`.** Today the hotkey manager, stop → AI → typing chain and runtime boot live in a 4.4k-line SwiftUI view. Extract a `DictationCoordinator` owned by `AppServices`, and have `DictationPostProcessingService` replace `ContentView.processTextWithAI`, removing the duplicate.
+2. **`TypingService` thread safety.** Remove `DispatchQueue.main.sync` from `virtualKeyCode`, and synchronise `isCurrentlyTyping`.
+3. **Keychain read per API-key access.** Cache `providerAPIKeys` in memory and invalidate on write (29 call sites).
+4. **Meeting index from disk.** List meetings from `MeetingRecordings/*/session.json` instead of the UserDefaults history blob, which also removes the need for the history-cap exception.
+5. **Live transcriber VAD on main.** Route `MeetingLiveTranscriber.tick`'s `splitOnSilence`/`lastSilenceCut` through an `@concurrent` engine call.
+6. **ASR provider isolation.** Meeting ASR calls the provider directly, so it can overlap live dictation. Route it through `ASRService.transcriptionExecutor`.
+7. **Split the large files** (`SettingsStore` 4.9k, `ContentView` 4.4k, `ASRService` 3.9k lines) along the seams above.
+8. **Swift 6 language mode** once the remaining ~75 isolation warnings are cleared.
+9. **`.qwen3Asr`** routes to the Parakeet provider with no Qwen-specific code. Implement it or hide it.
