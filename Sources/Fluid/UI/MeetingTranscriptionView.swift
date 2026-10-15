@@ -2093,7 +2093,11 @@ private struct MeetingSetupCanvas: View {
             if self.documentSection == .summary {
                 MeetingSummaryView()
             } else {
-                self.recordingSetup
+                VStack(alignment: .leading, spacing: self.theme.metrics.spacing.lg) {
+                    self.recordingSetup
+                    // MeetAI H3: import and MeetAI settings.
+                    MeetAIHomeActions()
+                }
             }
         }
     }
