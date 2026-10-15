@@ -205,7 +205,7 @@ enum MeetingAIClient {
     }
 
     /// Mirror of the AI Enhancement provider resolution (see
-    /// DictationPostProcessingService.resolveProvider), without the
+    /// DictationAIProcessor.resolveProvider), without the
     /// dictation-slot and Private AI special cases.
     static func resolveProvider() -> ResolvedProvider {
         let settings = SettingsStore.shared
