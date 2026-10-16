@@ -12,16 +12,19 @@ final class MeetAIAudioImporter: ObservableObject {
 
     static let shared = MeetAIAudioImporter(
         store: MeetingSessionStore.shared,
+        sidecars: .shared,
         retry: { _ = try await AppServices.shared.meetingSessionCoordinator.retryProcessing(sessionID: $0) }
     )
 
     @Published private(set) var status: Status = .idle
 
     private let store: any MeetingSessionStoring
+    private let sidecars: MeetAISidecarStore
     private let retry: @MainActor (MeetingSessionID) async throws -> Void
 
-    init(store: any MeetingSessionStoring, retry: @escaping @MainActor (MeetingSessionID) async throws -> Void) {
+    init(store: any MeetingSessionStoring, sidecars: MeetAISidecarStore, retry: @escaping @MainActor (MeetingSessionID) async throws -> Void) {
         self.store = store
+        self.sidecars = sidecars
         self.retry = retry
     }
 
@@ -57,6 +60,13 @@ final class MeetAIAudioImporter: ObservableObject {
         } catch {
             self.status = .failed(error.localizedDescription)
             return
+        }
+
+        // The file name stands in for MeetAI's own title, so the title step may replace it until the user edits it.
+        do {
+            try await self.sidecars.saveMeta(MeetAIMetaRecord(titleSource: .llm, lastLLMTitle: session.title), for: session.id)
+        } catch {
+            DebugLogger.shared.warning("MeetAI couldn't mark the imported title as replaceable: \(error.localizedDescription)", source: "MeetAI")
         }
 
         self.status = .working("Transcribing \(title)…")
