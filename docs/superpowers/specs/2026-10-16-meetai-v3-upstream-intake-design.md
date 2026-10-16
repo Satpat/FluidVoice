@@ -351,7 +351,19 @@ Command: §8.1, run in this worktree with a scratch DerivedData.
 - Full suite (signed): executed 2316, 42 skipped, 9 failed, all within the 11-test baseline above (`UpdateInstallationPipelineTests`: testCancelledTaskBeforePreparationDoesNotTouchOriginalStageOrBackup, testDevelopmentCandidateIsRejectedAsReleaseButAcceptedAsRollbackAndRetained, testInstalledBuildChangedSinceApprovalRejectsPreparation, testInstalledVersionChangedSinceApprovalRejectsPreparation, testPreexistingBackupDestinationIsPreservedAndOriginalIsUntouched, testRegularFileAtBackupParentAbortsWithoutReplacingOriginal, testReleaseInstallationHasVerifiedBackupAndCanRecoverWithoutConsumingSource, testReleaseWithoutApprovedVersionIsRejectedBeforeAnyStagingOrBackup, testTamperedCandidateCannotReplaceOriginalOrCreateBackup).
 - `./build.sh` (signed dev build, Debug bundle ID): BUILD SUCCEEDED, exit 0.
 - Signing change: test runs are signed with personal team BVA3X42BK9, after a keychain prompt hung unsigned test hosts.
-- Manual checklist (§8.7) and install: pending user go-ahead.
+- After the final-review fix wave (`e4bb585..a7b9e26`): full suite 2327 executed, 42 skipped, the same 9 baseline failures.
+- Backup: `~/FluidVoice-backup-20261016` (Application Support/FluidVoice, verified identical, plus `com.FluidApp.app.plist`).
+- Install: `./build.sh install` → `/Applications/FluidVoice.app` v1.6.11, `com.FluidApp.app`, team BVA3X42BK9, `codesign --verify --deep --strict` OK.
+- First launch migration on real data: 113 folders, 105 done, 8 skipped, 0 failed; 27 profiles copied; legacy `MeetingRecordings/` and `SpeakerProfiles/` byte-identical to the backup afterwards.
+- Manual checklist (§8.7), run with the user on 2026-10-16:
+  1. Migrated meetings, old summaries, Ask, MeetAI settings (105/8/0, 27 speakers): pass.
+  2. Live in-room call: AI naming from introduction, title, summary (gpt-6.1-sol), Ask: pass. Known-voice match missed the legacy one-sample "Satya" profile (0.166). H1 6776 ms cold.
+  3. Rename to "Satyaveer" enrolled the voice; next solo meeting auto-named by voice at 0.915 (runner-up 0.413): pass.
+  4. Audio retention: not run (retention left at the 7-day default).
+  5. Voice Memo import "New Recording 73": processed (54 segments, 2 speakers, summary); Girish matched by voice 0.763; second speaker 0.656 to "Satyaveer" (just under 0.7, phone mic, one-sample profile): pass.
+  6. Tier 2 re-process of `2026-10-15T06:00:44`: Girish matched by voice 0.894 (runner-up Stephen 0.841), confirming legacy profiles are compatible with the new embedder. H1 595 ms with the cached model: pass.
+  7. Dictation: inserted into the focused field, 171 ms stop-to-delivery: pass.
+- Follow-ups found: confirm an AI-assigned name (to enrol the voice) without renaming; show meeting titles in the Tier 2 re-process list; ambiguity margin when two profiles both clear 0.7 (Girish 0.894 vs Stephen 0.841); auto-title imported meetings instead of keeping the file name.
 
 ## 12. Plan-time amendments
 
