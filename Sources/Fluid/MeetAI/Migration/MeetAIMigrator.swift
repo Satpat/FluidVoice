@@ -38,11 +38,48 @@ final class MeetAIMigrator: ObservableObject {
                            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]))
     }
 
+    /// Name of the moved-aside unreadable migration.json while migration state awaits a user rebuild
+    /// ("Re-run migration"). While set, the automatic launch run does nothing: re-migrating from an
+    /// empty state would duplicate meetings that were re-processed (Tier 2) under new session IDs.
+    @Published private(set) var unreadableStateFile: String?
+
+    private static let unreadablePrefix = "migration.json.unreadable-"
+
+    /// Loads migration.json. A file that exists but can't be decoded is moved aside (never
+    /// overwritten) and `unreadableStateFile` is set. With no migration.json, a leftover aside file
+    /// means a rebuild is still pending.
     func loadEntries() {
-        guard let data = try? Data(contentsOf: self.paths.migrationFile) else { return }
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        self.entries = (try? decoder.decode([String: MeetAIMigrationEntry].self, from: data)) ?? [:]
+        let manager = FileManager.default
+        let file = self.paths.migrationFile
+        guard manager.fileExists(atPath: file.path) else {
+            self.unreadableStateFile = self.unreadableStateFile ?? self.pendingAsideFile()
+            return
+        }
+        do {
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            self.entries = try decoder.decode([String: MeetAIMigrationEntry].self, from: Data(contentsOf: file))
+            self.unreadableStateFile = nil
+        } catch {
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.dateFormat = "yyyyMMdd-HHmmss"
+            let asideName = Self.unreadablePrefix + formatter.string(from: Date())
+            DebugLogger.shared.warning("MeetAI migration state unreadable (\(error.localizedDescription)); moving to \(asideName)", source: "MeetAI")
+            do {
+                try manager.moveItem(at: file, to: file.deletingLastPathComponent().appendingPathComponent(asideName))
+            } catch {
+                DebugLogger.shared.warning("Moving unreadable migration state aside failed: \(error.localizedDescription)", source: "MeetAI")
+            }
+            self.entries = [:]
+            self.unreadableStateFile = asideName
+        }
+    }
+
+    private func pendingAsideFile() -> String? {
+        let directory = self.paths.migrationFile.deletingLastPathComponent()
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
+        return names.filter { $0.hasPrefix(Self.unreadablePrefix) }.sorted().last
     }
 
     func hasLegacyAudio(folder: String) -> Bool {
@@ -87,7 +124,7 @@ final class MeetAIMigrator: ObservableObject {
         do {
             try await retry(session.id)
         } catch {
-            do { try await discard(session.id) } catch {
+            do { try await self.discardWithFallback(session.id, discard) } catch {
                 DebugLogger.shared.warning("Discarding failed re-process session failed: \(error.localizedDescription)", source: "MeetAI")
             }
             await self.removeSidecars(for: session.id)
@@ -98,12 +135,28 @@ final class MeetAIMigrator: ObservableObject {
         self.entries[folder]?.reprocessedAt = Date()
         self.saveEntries()
         var removalError: String?
-        do { try await discard(oldID) } catch {
+        do { try await self.discardWithFallback(oldID, discard) } catch {
             removalError = error.localizedDescription
             DebugLogger.shared.warning("Removing old transcript-only session failed: \(error.localizedDescription)", source: "MeetAI")
         }
         await self.removeSidecars(for: oldID)
         return ReprocessResult(sessionID: session.id, oldCopyRemovalError: removalError)
+    }
+
+    /// Tries the injected discard first; if it fails, deletes straight from the store. Logs both.
+    private func discardWithFallback(_ id: MeetingSessionID, _ discard: @MainActor (MeetingSessionID) async throws -> Void) async throws {
+        do {
+            try await discard(id)
+        } catch {
+            DebugLogger.shared.warning("Discarding session \(id) failed (\(error.localizedDescription)); falling back to deleting it from the store", source: "MeetAI")
+            do {
+                try await self.store.delete(id: id)
+                DebugLogger.shared.info("Fallback store delete of session \(id) succeeded", source: "MeetAI")
+            } catch {
+                DebugLogger.shared.warning("Fallback store delete of session \(id) failed: \(error.localizedDescription)", source: "MeetAI")
+                throw error
+            }
+        }
     }
 
     private func removeSidecars(for id: MeetingSessionID) async {
@@ -129,7 +182,22 @@ final class MeetAIMigrator: ObservableObject {
         self.isRunning = true
         defer { self.isRunning = false }
         self.loadEntries()
+        let rebuilding = self.unreadableStateFile != nil
+        if rebuilding {
+            guard retryFailed else {
+                DebugLogger.shared.warning("MeetAI migration skipped: state unreadable, waiting for Re-run migration", source: "MeetAI")
+                return
+            }
+            self.entries = [:]
+        }
         let directory = self.paths.legacyMeetingsDirectory
+        defer {
+            if rebuilding {
+                // Written even with no folders, so later automatic runs see a readable state.
+                self.saveEntries()
+                self.unreadableStateFile = nil
+            }
+        }
         guard let folders = try? FileManager.default.contentsOfDirectory(atPath: directory.path) else { return }
         for folder in folders.filter({ !$0.hasPrefix(".") }).sorted() {
             if let entry = self.entries[folder] {

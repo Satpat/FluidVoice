@@ -318,7 +318,11 @@ final class MeetAIMigrationTests: XCTestCase {
     }
 
     func testReprocessOldCopyRemovalFailureIsReportedNotThrown() async throws {
-        let (migrator, store, _, folder, oldID) = try await reprocessFixture()
+        let (fixture, inner, sidecars, folder, oldID) = try await reprocessFixture()
+        // Both the injected discard and the store.delete fallback fail for the old copy.
+        let store = DeleteFailingStore(inner: inner, failing: [oldID])
+        let migrator = MeetAIMigrator(paths: fixture.paths, store: store, sidecars: sidecars)
+        migrator.loadEntries()
         struct Boom: LocalizedError { var errorDescription: String? { "boom" } }
         let result = try await migrator.reprocess(
             folder: folder, retry: { _ in },
@@ -327,7 +331,107 @@ final class MeetAIMigrationTests: XCTestCase {
                 try await store.delete(id: id)
             }
         )
-        XCTAssertEqual(result.oldCopyRemovalError, "boom")
+        XCTAssertEqual(result.oldCopyRemovalError, "store delete failed")
         XCTAssertEqual(migrator.entries[folder]?.sessionID, result.sessionID)
     }
+
+    // MARK: F7 — a failing coordinator discard falls back to store.delete
+
+    func testReprocessDiscardFailureFallsBackToStoreDelete() async throws {
+        let (migrator, store, sidecars, folder, oldID) = try await reprocessFixture()
+        struct Boom: LocalizedError { var errorDescription: String? { "boom" } }
+        let result = try await migrator.reprocess(folder: folder, retry: { _ in }, discard: { _ in throw Boom() })
+        XCTAssertNil(result.oldCopyRemovalError, "fallback removed the old copy")
+        let all = try await store.loadAll()
+        XCTAssertEqual(all.map(\.id), [result.sessionID])
+        let oldSummary = try await sidecars.summary(for: oldID)
+        XCTAssertNil(oldSummary)
+    }
+
+    func testReprocessFailureWithFailingDiscardStillDeletesNewSession() async throws {
+        let (migrator, store, sidecars, folder, oldID) = try await reprocessFixture()
+        struct Boom: LocalizedError { var errorDescription: String? { "boom" } }
+        var failedID: MeetingSessionID?
+        do {
+            _ = try await migrator.reprocess(
+                folder: folder,
+                retry: { id in
+                    failedID = id
+                    try await sidecars.saveSummary(MeetAISummaryRecord(style: "s", transcriptHash: "h", markdown: "x", providerID: "p", modelID: "m", createdAt: Date()), for: id)
+                    throw MeetingCoordinatorError.activityInProgress
+                },
+                discard: { _ in throw Boom() }
+            )
+            XCTFail("expected failure")
+        } catch {}
+        let all = try await store.loadAll()
+        XCTAssertEqual(all.map(\.id), [oldID])
+        let leftover = try await sidecars.summary(for: try XCTUnwrap(failedID))
+        XCTAssertNil(leftover)
+    }
+
+    // MARK: F4 — an unreadable migration.json is moved aside and never silently re-migrated
+
+    func testUnreadableMigrationStateIsMovedAsideAndBlocksAutomaticRun() async throws {
+        let root = try MeetAIFixtures.tempDirectory(self)
+        let paths = MeetAIPaths(supportRoot: root)
+        try self.makeLegacyFolder(root, name: "2026-10-15T06:00:44", transcript: self.sampleTranscript)
+        try FileManager.default.createDirectory(at: paths.migrationFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("{ not json".utf8).write(to: paths.migrationFile)
+        let store = MeetingSessionStore(rootDirectory: root.appendingPathComponent("Meetings"))
+        let migrator = MeetAIMigrator(paths: paths, store: store, sidecars: MeetAISidecarStore(paths: paths))
+
+        await migrator.run()
+        let asideName = try XCTUnwrap(migrator.unreadableStateFile)
+        XCTAssertTrue(asideName.hasPrefix("migration.json.unreadable-"))
+        let aside = paths.migrationFile.deletingLastPathComponent().appendingPathComponent(asideName)
+        XCTAssertEqual(try Data(contentsOf: aside), Data("{ not json".utf8), "original kept, moved aside")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: paths.migrationFile.path))
+        XCTAssertTrue(migrator.entries.isEmpty)
+        var all = try await store.loadAll()
+        XCTAssertTrue(all.isEmpty, "automatic run did not migrate")
+
+        // A later launch's automatic run stays blocked until the user rebuilds.
+        let relaunch = MeetAIMigrator(paths: paths, store: store, sidecars: MeetAISidecarStore(paths: paths))
+        await relaunch.run()
+        XCTAssertNotNil(relaunch.unreadableStateFile)
+        all = try await store.loadAll()
+        XCTAssertTrue(all.isEmpty)
+
+        // "Re-run migration" rebuilds.
+        await relaunch.run(retryFailed: true)
+        XCTAssertNil(relaunch.unreadableStateFile)
+        XCTAssertEqual(relaunch.entries["2026-10-15T06:00:44"]?.status, .done)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: paths.migrationFile.path))
+        let afterRebuild = MeetAIMigrator(paths: paths, store: store, sidecars: MeetAISidecarStore(paths: paths))
+        await afterRebuild.run()
+        XCTAssertNil(afterRebuild.unreadableStateFile)
+        all = try await store.loadAll()
+        XCTAssertEqual(all.count, 1)
+    }
+}
+
+/// Forwards to a real store; `delete` throws for the listed IDs.
+nonisolated private final class DeleteFailingStore: MeetingSessionStoring {
+    struct Failure: LocalizedError { var errorDescription: String? { "store delete failed" } }
+    let inner: MeetingSessionStore
+    let failing: Set<MeetingSessionID>
+
+    init(inner: MeetingSessionStore, failing: Set<MeetingSessionID>) {
+        self.inner = inner
+        self.failing = failing
+    }
+
+    func create(_ session: MeetingSession) async throws { try await self.inner.create(session) }
+    func save(_ session: MeetingSession) async throws { try await self.inner.save(session) }
+    func load(id: MeetingSessionID) async throws -> MeetingSession? { try await self.inner.load(id: id) }
+    func loadAll() async throws -> [MeetingSession] { try await self.inner.loadAll() }
+    func loadRecoverable() async throws -> [MeetingSession] { try await self.inner.loadRecoverable() }
+    func sessionDirectory(for id: MeetingSessionID) async throws -> URL { try await self.inner.sessionDirectory(for: id) }
+    func existingSessionDirectory(for id: MeetingSessionID) async throws -> URL? { try await self.inner.existingSessionDirectory(for: id) }
+    func delete(id: MeetingSessionID) async throws {
+        if self.failing.contains(id) { throw Failure() }
+        try await self.inner.delete(id: id)
+    }
+    func deleteAudioFiles(for id: MeetingSessionID) async throws { try await self.inner.deleteAudioFiles(for: id) }
 }

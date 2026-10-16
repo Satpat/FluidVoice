@@ -29,6 +29,11 @@ struct MeetAISettingsSheet: View {
                     MeetAIKnownSpeakersView()
                 }
                 Section("Meetings from the previous MeetAI version") {
+                    if let aside = self.migrator.unreadableStateFile {
+                        Text("Migration state unreadable; moved aside (\(aside)) — Re-run migration to rebuild.")
+                            .font(self.theme.typography.caption)
+                            .foregroundStyle(self.theme.palette.secondaryText)
+                    }
                     Text("Imported \(self.count(.done)) · skipped \(self.count(.skipped)) · failed \(self.count(.failed))")
                     ForEach(self.folders { $0.status == .done }.filter { self.migrator.hasLegacyAudio(folder: $0) }, id: \.self) { folder in
                         HStack {
@@ -71,6 +76,10 @@ struct MeetAISettingsSheet: View {
             Button("Re-process") {
                 guard let folder = self.pendingReprocess else { return }
                 self.pendingReprocess = nil
+                guard AppServices.shared.meetingSessionCoordinator.isQuiescent else {
+                    self.reprocessMessage = "Finish or stop the current meeting first."
+                    return
+                }
                 self.reprocessing = folder
                 self.reprocessMessage = "Re-processing \(folder)…"
                 Task {
