@@ -144,4 +144,45 @@ final class MeetAISpeakerTests: XCTestCase {
         let records: [SessionSpeakerID: MeetAISpeakerRecord] = [session.speakers[0].id: .init(embedding: self.vector(0.1))]
         XCTAssertTrue(MeetAIProfileMatching.decide(session: session, records: records, profiles: [sam]).isEmpty)
     }
+
+    /// Unit vector along `axis` mixed with `other`: dot with the `axis` basis vector is exactly `cosine`.
+    private func profileVector(cosine: Float, axis: Int = 0, other: Int) -> [Float] {
+        var vector = [Float](repeating: 0, count: 256)
+        vector[axis] = cosine
+        vector[other] = (1 - cosine * cosine).squareRoot()
+        return vector
+    }
+
+    private func basis(_ axis: Int) -> [Float] {
+        var vector = [Float](repeating: 0, count: 256)
+        vector[axis] = 1
+        return vector
+    }
+
+    func testAmbiguousRunnerUpWithinMarginSkipsAutoNaming() {
+        // Real scores from one speaker in a 2026-10-16 meeting: Girish 0.894, Stephen 0.841.
+        let session = MeetAIFixtures.session(speakers: [("Speaker 1", false)], lines: [])
+        let girish = MeetAISpeakerProfile(name: "Girish", embedding: self.profileVector(cosine: 0.894, other: 1))
+        let stephen = MeetAISpeakerProfile(name: "Stephen", embedding: self.profileVector(cosine: 0.841, other: 2))
+        let records: [SessionSpeakerID: MeetAISpeakerRecord] = [session.speakers[0].id: .init(embedding: self.basis(0))]
+        XCTAssertTrue(MeetAIProfileMatching.decide(session: session, records: records, profiles: [girish, stephen]).isEmpty)
+    }
+
+    func testClearWinnerBeyondMarginStillAutoNames() {
+        let session = MeetAIFixtures.session(speakers: [("Speaker 1", false)], lines: [])
+        let sam = MeetAISpeakerProfile(name: "Sam", embedding: self.profileVector(cosine: 0.9, other: 1))
+        let alex = MeetAISpeakerProfile(name: "Alex", embedding: self.profileVector(cosine: 0.79, other: 2))
+        let records: [SessionSpeakerID: MeetAISpeakerRecord] = [session.speakers[0].id: .init(embedding: self.basis(0))]
+        let decisions = MeetAIProfileMatching.decide(session: session, records: records, profiles: [sam, alex])
+        XCTAssertEqual(decisions.map(\.profile.name), ["Sam"])
+    }
+
+    func testRunnerUpBelowThresholdIsNotAmbiguous() {
+        let session = MeetAIFixtures.session(speakers: [("Speaker 1", false)], lines: [])
+        let sam = MeetAISpeakerProfile(name: "Sam", embedding: self.profileVector(cosine: 0.72, other: 1))
+        let alex = MeetAISpeakerProfile(name: "Alex", embedding: self.profileVector(cosine: 0.69, other: 2))
+        let records: [SessionSpeakerID: MeetAISpeakerRecord] = [session.speakers[0].id: .init(embedding: self.basis(0))]
+        let decisions = MeetAIProfileMatching.decide(session: session, records: records, profiles: [sam, alex])
+        XCTAssertEqual(decisions.map(\.profile.name), ["Sam"])
+    }
 }
