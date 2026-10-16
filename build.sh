@@ -223,8 +223,20 @@ case "${PROFILE}" in
         if pgrep -x "FluidVoice" >/dev/null 2>&1 || pgrep -x "FluidVoice Debug" >/dev/null 2>&1; then
             echo "Note: FluidVoice is running; quit it before relaunching the installed copy."
         fi
+        # Stage the copy next to the old app and swap only once it is complete, so a failed copy
+        # never leaves the user without an installed app.
+        staged_app="${installed_app}.installing-$$"
+        rm -rf "${staged_app}"
+        if ! ditto "${built_app}" "${staged_app}" || [ ! -f "${staged_app}/Contents/Info.plist" ]; then
+            rm -rf "${staged_app}"
+            echo "Copying the build to ${staged_app} failed; ${installed_app} was left unchanged." >&2
+            exit 1
+        fi
         rm -rf "${installed_app}"
-        ditto "${built_app}" "${installed_app}"
+        if ! mv "${staged_app}" "${installed_app}"; then
+            echo "Moving ${staged_app} into place failed; the new build is still at ${staged_app}." >&2
+            exit 1
+        fi
         # ditto keeps the source bundle's timestamps; bump the bundle so Finder shows the install time.
         touch "${installed_app}"
         echo "Installed ${installed_app} ($(defaults read "${installed_app}/Contents/Info.plist" CFBundleIdentifier))"
