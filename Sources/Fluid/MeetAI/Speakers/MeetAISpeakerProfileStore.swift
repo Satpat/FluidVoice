@@ -28,10 +28,15 @@ final class MeetAISpeakerProfileStore: ObservableObject {
     static let embeddingDimensions = 256
 
     @Published private(set) var profiles: [MeetAISpeakerProfile] = []
+    /// Set when an unreadable profiles.json could not be moved aside: saving would overwrite it.
+    private(set) var saveBlocked = false
     private let fileURL: URL
+    private let moveAside: (URL, URL) throws -> Void
 
-    init(fileURL: URL) {
+    /// `moveAside` is a test seam; production moves the file with FileManager.
+    init(fileURL: URL, moveAside: @escaping (URL, URL) throws -> Void = { try FileManager.default.moveItem(at: $0, to: $1) }) {
         self.fileURL = fileURL
+        self.moveAside = moveAside
         self.load()
     }
 
@@ -96,6 +101,7 @@ final class MeetAISpeakerProfileStore: ObservableObject {
         decoder.dateDecodingStrategy = .iso8601
         do {
             self.profiles = try decoder.decode([MeetAISpeakerProfile].self, from: data)
+            self.saveBlocked = false
         } catch {
             self.profiles = []
             let formatter = DateFormatter()
@@ -105,14 +111,19 @@ final class MeetAISpeakerProfileStore: ObservableObject {
                 .appendingPathComponent("\(self.fileURL.lastPathComponent).unreadable-\(formatter.string(from: Date()))")
             DebugLogger.shared.warning("Speaker profiles unreadable (\(error.localizedDescription)); moving to \(aside.lastPathComponent)", source: "MeetAI")
             do {
-                try FileManager.default.moveItem(at: self.fileURL, to: aside)
+                try self.moveAside(self.fileURL, aside)
             } catch {
-                DebugLogger.shared.warning("Moving unreadable speaker profiles aside failed: \(error.localizedDescription)", source: "MeetAI")
+                self.saveBlocked = true
+                DebugLogger.shared.warning("Moving unreadable speaker profiles aside failed (\(error.localizedDescription)); saving is disabled so the original is kept", source: "MeetAI")
             }
         }
     }
 
     private func save() {
+        guard !self.saveBlocked else {
+            DebugLogger.shared.warning("Speaker profiles not saved: the unreadable original could not be moved aside", source: "MeetAI")
+            return
+        }
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]

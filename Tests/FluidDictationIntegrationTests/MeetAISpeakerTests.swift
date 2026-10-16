@@ -60,6 +60,18 @@ final class MeetAISpeakerTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: dir.appendingPathComponent(aside[0])), junk)
     }
 
+    func testUnreadableProfilesThatCannotBeMovedAsideAreNeverOverwritten() throws {
+        let dir = try MeetAIFixtures.tempDirectory(self)
+        let file = dir.appendingPathComponent("profiles.json")
+        let junk = Data("{ not json".utf8)
+        try junk.write(to: file)
+        struct MoveFailed: Error {}
+        let store = MeetAISpeakerProfileStore(fileURL: file, moveAside: { _, _ in throw MoveFailed() })
+        XCTAssertTrue(store.saveBlocked)
+        _ = store.enroll(name: "Sam", embedding: self.vector(0.1))
+        XCTAssertEqual(try Data(contentsOf: file), junk, "save is a no-op while blocked")
+    }
+
     func testCopyLegacyProfilesOnlyWhenMissing() throws {
         let root = try MeetAIFixtures.tempDirectory(self)
         let legacy = root.appendingPathComponent("legacy.json")
