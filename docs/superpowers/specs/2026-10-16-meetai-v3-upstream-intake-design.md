@@ -364,6 +364,12 @@ Command: §8.1, run in this worktree with a scratch DerivedData.
   6. Tier 2 re-process of `2026-10-15T06:00:44`: Girish matched by voice 0.894 (runner-up Stephen 0.841), confirming legacy profiles are compatible with the new embedder. H1 595 ms with the cached model: pass.
   7. Dictation: inserted into the focused field, 171 ms stop-to-delivery: pass.
 - Follow-ups found: confirm an AI-assigned name (to enrol the voice) without renaming; show meeting titles in the Tier 2 re-process list; ambiguity margin when two profiles both clear 0.7 (Girish 0.894 vs Stephen 0.841); auto-title imported meetings instead of keeping the file name.
+- Follow-ups done on `meetai-v3-followups` (2026-10-16):
+  1. Confirm an AI name: the Summary tab lists speakers whose name came from the LLM (`nameSource == .llm`, name unchanged, embedding stored) with "Save this voice as <name>". It enrols the stored embedding under that name and sets `nameSource = .user` (`MeetAISessionProcessor.confirmSpeakerName`, run in the session queue). No new hook point.
+  2. Tier 2 list: rows show the migrated session's title and start date, with the folder as secondary text; the folder name is the fallback when the session can't be loaded (`MeetAIMigrator.reprocessCandidates`).
+  3. Ambiguity margin 0.1: a speaker is left for LLM naming when the runner-up profile also clears 0.7 within 0.1 of the best. The real case had a gap of 0.053, so 0.05 would not have caught it. The real profiles explain why: Girish and Stephen are 0.887 alike, while the next most alike pair of the 27 is 0.50 (median pair 0.11). Clear matches still name (manual check 3: 0.915 vs 0.413). Likely one of those two profiles was enrolled from the other person's voice; until one is deleted or re-enrolled, both will usually be skipped as ambiguous.
+  4. Imported titles: at import, `meta.json` records `titleSource = .llm`, `lastLLMTitle = <file name>` before processing starts, so the title step replaces the file name; a user edit still wins (`MeetAITitler.ownsTitle`).
+  - Full suite (signed) after these four: 2337 executed, 42 skipped, the same 9 baseline `UpdateInstallationPipelineTests` failures. Not yet checked in the installed app.
 
 ## 12. Plan-time amendments
 

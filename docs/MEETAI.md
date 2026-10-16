@@ -3,10 +3,10 @@
 MeetAI adds meeting features to upstream FluidVoice's FluidMeet without changing how FluidMeet records or transcribes.
 
 ## What it adds
-- Persistent speakers: voices you name are recognised in later meetings (cosine >= 0.7, WeSpeaker embeddings).
+- Persistent speakers: voices you name are recognised in later meetings (cosine >= 0.7, WeSpeaker embeddings). A speaker whose second-best profile also clears 0.7 within 0.1 of the best is not auto-named by voice; LLM naming handles it instead. An AI-assigned name can be confirmed from the Summary tab ("Save this voice as <name>"), which saves the voice like a rename would.
 - LLM speaker naming from introductions, LLM titles, summaries in four styles, and per-meeting Q&A, all through the AI Enhancement provider.
-- Import an audio file as a meeting. The synthetic session stores PCM-first CAF Float32 chunks (`tracks/<kind>/NNNNNN.caf`, audioSchemaVersion 2, ready `captureAnalysisAsset` of kind `linearPCMFloat32CAFV1`) so upstream's analysis attributes speakers.
-- One-time migration of meetings recorded by the previous MeetAI version (transcript-only; meetings whose transcript has no lines, e.g. "No speech detected", are skipped), plus optional Tier 2 re-processing of the ones that still have audio. Migration status and the re-process action live in the MeetAI settings sheet.
+- Import an audio file as a meeting; the file name is a placeholder title that MeetAI's title step replaces unless you edit it first. The synthetic session stores PCM-first CAF Float32 chunks (`tracks/<kind>/NNNNNN.caf`, audioSchemaVersion 2, ready `captureAnalysisAsset` of kind `linearPCMFloat32CAFV1`) so upstream's analysis attributes speakers.
+- One-time migration of meetings recorded by the previous MeetAI version (transcript-only; meetings whose transcript has no lines, e.g. "No speech detected", are skipped), plus optional Tier 2 re-processing of the ones that still have audio. Migration status and the re-process action live in the MeetAI settings sheet, which lists re-processable meetings by title and date.
 
 ## Where things live
 - Code: `Sources/Fluid/MeetAI/`, `Sources/Fluid/UI/MeetAI/`.
