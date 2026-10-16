@@ -54,6 +54,8 @@ struct MeetAIQAPanel: View {
     }
 
     private func send() {
+        // onSubmit bypasses the Ask button's disabled state: keep the typed text while an answer is pending.
+        guard !self.service.isThinking else { return }
         let text = self.question
         self.question = ""
         Task { await self.service.ask(text, session: self.session) }

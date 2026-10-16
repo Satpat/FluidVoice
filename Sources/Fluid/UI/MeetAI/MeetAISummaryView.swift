@@ -75,8 +75,8 @@ struct MeetAISummaryView: View {
         if let saved = self.record.flatMap({ MeetAISummaryStyle(rawValue: $0.style) }) { self.style = saved }
     }
 
+    /// The style picker here is per meeting; the global default is set only in the MeetAI settings sheet.
     private func regenerate() {
-        MeetAISettings.shared.summaryStyle = self.style
         Task {
             await self.processor.regenerateSummary(sessionID: self.session.id, style: self.style)
             await self.reload()
