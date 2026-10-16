@@ -88,6 +88,31 @@ final class MeetAIMigrator: ObservableObject {
             && FileManager.default.fileExists(atPath: url.appendingPathComponent("mic.wav").path)
     }
 
+    /// A migrated meeting that still has its audio, as the settings sheet lists it.
+    struct ReprocessCandidate: Equatable, Identifiable {
+        let folder: String
+        /// The meeting's current title, or the folder name when its session can't be loaded.
+        let title: String
+        let startedAt: Date?
+        let reprocessed: Bool
+        var id: String { self.folder }
+    }
+
+    func reprocessCandidates() async -> [ReprocessCandidate] {
+        var candidates: [ReprocessCandidate] = []
+        for (folder, entry) in self.entries.sorted(by: { $0.key < $1.key }) where entry.status == .done && self.hasLegacyAudio(folder: folder) {
+            var session: MeetingSession?
+            if let id = entry.sessionID { session = try? await self.store.load(id: id) }
+            candidates.append(ReprocessCandidate(
+                folder: folder,
+                title: session?.title ?? folder,
+                startedAt: session?.startedAt ?? Self.folderDate(folder),
+                reprocessed: entry.reprocessedAt != nil
+            ))
+        }
+        return candidates
+    }
+
     /// Tier 2 (spec §7.2, §12.8): rebuild the meeting from the fork's two WAVs and run FluidMeet's
     /// pipeline. On success the transcript-only session is replaced; on failure the new one is deleted.
     struct ReprocessResult: Equatable {

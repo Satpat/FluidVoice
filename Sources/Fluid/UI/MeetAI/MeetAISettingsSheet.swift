@@ -8,6 +8,7 @@ struct MeetAISettingsSheet: View {
     @State private var pendingReprocess: String?
     @State private var reprocessing: String?
     @State private var reprocessMessage: String?
+    @State private var candidates: [MeetAIMigrator.ReprocessCandidate] = []
 
     var body: some View {
         VStack(alignment: .leading, spacing: self.theme.metrics.spacing.xl) {
@@ -35,14 +36,19 @@ struct MeetAISettingsSheet: View {
                             .foregroundStyle(self.theme.palette.secondaryText)
                     }
                     Text("Imported \(self.count(.done)) · skipped \(self.count(.skipped)) · failed \(self.count(.failed))")
-                    ForEach(self.folders { $0.status == .done }.filter { self.migrator.hasLegacyAudio(folder: $0) }, id: \.self) { folder in
+                    ForEach(self.candidates) { candidate in
                         HStack {
-                            Text(folder).font(self.theme.typography.caption)
-                            if self.migrator.entries[folder]?.reprocessedAt != nil {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(candidate.title).font(self.theme.typography.caption)
+                                Text(self.subtitle(for: candidate))
+                                    .font(self.theme.typography.caption)
+                                    .foregroundStyle(self.theme.palette.secondaryText)
+                            }
+                            if candidate.reprocessed {
                                 Text("re-processed").font(self.theme.typography.caption).foregroundStyle(self.theme.palette.secondaryText)
                             }
                             Spacer()
-                            Button("Re-process…") { self.pendingReprocess = folder }
+                            Button("Re-process…") { self.pendingReprocess = candidate.folder }
                                 .disabled(self.reprocessing != nil)
                         }
                     }
@@ -69,6 +75,7 @@ struct MeetAISettingsSheet: View {
         .padding(self.theme.metrics.spacing.xl)
         .frame(minWidth: 520, minHeight: 480)
         .task { self.migrator.loadEntries() }
+        .task(id: self.migrator.entries) { self.candidates = await self.migrator.reprocessCandidates() }
         .confirmationDialog(
             "Re-process this meeting with FluidMeet?",
             isPresented: Binding(get: { self.pendingReprocess != nil }, set: { if !$0 { self.pendingReprocess = nil } })
@@ -80,8 +87,9 @@ struct MeetAISettingsSheet: View {
                     self.reprocessMessage = "Finish or stop the current meeting first."
                     return
                 }
+                let name = self.displayName(folder)
                 self.reprocessing = folder
-                self.reprocessMessage = "Re-processing \(folder)…"
+                self.reprocessMessage = "Re-processing \(name)…"
                 Task {
                     do {
                         let result = try await self.migrator.reprocess(folder: folder, retry: {
@@ -90,12 +98,12 @@ struct MeetAISettingsSheet: View {
                             try await Self.deleteViaCoordinator(id)
                         })
                         if let problem = result.oldCopyRemovalError {
-                            self.reprocessMessage = "Re-processed \(folder), but the old copy couldn't be removed: \(problem)"
+                            self.reprocessMessage = "Re-processed \(name), but the old copy couldn't be removed: \(problem)"
                         } else {
-                            self.reprocessMessage = "Re-processed \(folder)."
+                            self.reprocessMessage = "Re-processed \(name)."
                         }
                     } catch {
-                        self.reprocessMessage = "Couldn't re-process \(folder): \(error.localizedDescription)"
+                        self.reprocessMessage = "Couldn't re-process \(name): \(error.localizedDescription)"
                     }
                     self.reprocessing = nil
                 }
@@ -121,6 +129,15 @@ struct MeetAISettingsSheet: View {
                 try await Task.sleep(nanoseconds: 1_000_000_000)
             }
         }
+    }
+
+    private func displayName(_ folder: String) -> String {
+        self.candidates.first { $0.folder == folder }?.title ?? folder
+    }
+
+    private func subtitle(for candidate: MeetAIMigrator.ReprocessCandidate) -> String {
+        guard let startedAt = candidate.startedAt else { return candidate.folder }
+        return "\(startedAt.formatted(date: .abbreviated, time: .shortened)) · \(candidate.folder)"
     }
 
     private func count(_ status: MeetAIMigrationEntry.Status) -> Int {

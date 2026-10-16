@@ -281,6 +281,40 @@ final class MeetAIMigrationTests: XCTestCase {
         return (migrator, store, sidecars, folderName, try XCTUnwrap(migrator.entries[folderName]?.sessionID))
     }
 
+    func testReprocessCandidatesShowSessionTitleAndDateWithFolderAsSecondary() async throws {
+        let root = try MeetAIFixtures.tempDirectory(self)
+        let paths = MeetAIPaths(supportRoot: root)
+        let folderName = "2026-10-15T06:00:44"
+        try self.makeLegacyFolder(root, name: folderName, transcript: self.sampleTranscript, title: "Frontier Models (Thu, 15 Oct at 4:30 pm)")
+        let folder = paths.legacyMeetingsDirectory.appendingPathComponent(folderName)
+        try self.writeWAV(folder.appendingPathComponent("system.wav"), seconds: 3, frequency: 220)
+        try self.writeWAV(folder.appendingPathComponent("mic.wav"), seconds: 3, frequency: 330)
+        try self.makeLegacyFolder(root, name: "2026-10-14T01:00:00", transcript: self.sampleTranscript, title: "No Audio Here")
+        let store = MeetingSessionStore(rootDirectory: root.appendingPathComponent("Meetings"))
+        let migrator = MeetAIMigrator(paths: paths, store: store, sidecars: MeetAISidecarStore(paths: paths))
+        await migrator.run()
+
+        let candidates = await migrator.reprocessCandidates()
+        XCTAssertEqual(candidates.map(\.folder), [folderName], "only meetings that still have audio")
+        let candidate = try XCTUnwrap(candidates.first)
+        XCTAssertEqual(candidate.title, "Frontier Models")
+        XCTAssertEqual(candidate.startedAt, ISO8601DateFormatter().date(from: folderName + "Z"))
+        XCTAssertFalse(candidate.reprocessed)
+
+        _ = try await migrator.reprocess(folder: folderName, retry: { _ in })
+        let after = await migrator.reprocessCandidates()
+        XCTAssertEqual(after.first?.title, "Frontier Models", "title read from the re-processed session")
+        XCTAssertEqual(after.first?.reprocessed, true)
+    }
+
+    func testReprocessCandidateFallsBackToFolderWhenSessionIsGone() async throws {
+        let (migrator, store, _, folder, oldID) = try await reprocessFixture()
+        try await store.delete(id: oldID)
+        let candidates = await migrator.reprocessCandidates()
+        XCTAssertEqual(candidates.first?.title, folder)
+        XCTAssertEqual(candidates.first?.startedAt, ISO8601DateFormatter().date(from: folder + "Z"))
+    }
+
     func testReprocessThenRunLeavesOneSessionAndNoOldSidecars() async throws {
         let (migrator, store, sidecars, folder, oldID) = try await reprocessFixture()
         let before = try await sidecars.summary(for: oldID)
