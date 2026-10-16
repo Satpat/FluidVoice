@@ -8,7 +8,7 @@ struct MeetAIKnownSpeakersView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: self.theme.metrics.spacing.sm) {
             if self.store.profiles.isEmpty {
-                Text("No saved voices yet. Rename a speaker in a meeting to save their voice.")
+                Text("No saved voices yet. Rename a speaker in a meeting, or use Save this voice on its Summary tab, to save their voice.")
                     .font(self.theme.typography.caption)
                     .foregroundStyle(self.theme.palette.secondaryText)
             }

@@ -284,6 +284,60 @@ final class MeetAISessionProcessorTests: XCTestCase {
         XCTAssertEqual(after[speaker1]?.nameSource, .user)
     }
 
+    private func llmNamedSession() async throws -> (Harness, MeetingSession) {
+        let session = self.twoSpeakerSession()
+        let h = try self.harness(session: session, embeddings: ["alpha": self.vector(0.1)], llm: FakeLLM(replies: ["{\"Speaker 1\": \"Bob\"}", ""]))
+        h.settings.autoName = true
+        await h.processor.sessionDidComplete(session)
+        await h.processor.enqueue(session.id) { _ in }.value
+        // Echo of the LLM rename through H6 changes nothing.
+        await h.processor.handleCorrection(sessionID: session.id)
+        XCTAssertEqual(h.mutator.session.speakers[1].displayName, "Bob")
+        XCTAssertTrue(h.profiles.profiles.isEmpty)
+        return (h, session)
+    }
+
+    func testConfirmableSpeakersAreLLMNamedWithAVoice() async throws {
+        let (h, session) = try await self.llmNamedSession()
+        let candidates = await h.processor.confirmableSpeakers(sessionID: session.id)
+        XCTAssertEqual(candidates, [.init(speakerID: session.speakers[1].id, name: "Bob")])
+    }
+
+    func testConfirmSpeakerNameEnrolsVoiceAndMarksUser() async throws {
+        let (h, session) = try await self.llmNamedSession()
+        let speaker = session.speakers[1].id
+        let saved = await h.processor.confirmSpeakerName(sessionID: session.id, speakerID: speaker)
+        XCTAssertTrue(saved)
+        XCTAssertEqual(h.profiles.profiles.map(\.name), ["Bob"])
+        let records = try await h.sidecars.speakers(for: session.id)
+        XCTAssertEqual(records[speaker]?.nameSource, .user)
+        XCTAssertEqual(records[speaker]?.matchedProfileID, h.profiles.profiles.first?.id)
+        XCTAssertTrue(h.mutator.renameCalls.count == 1, "no rename: the name stays as it is")
+        let after = await h.processor.confirmableSpeakers(sessionID: session.id)
+        XCTAssertTrue(after.isEmpty)
+        // A second confirm is a no-op: no extra sample.
+        let again = await h.processor.confirmSpeakerName(sessionID: session.id, speakerID: speaker)
+        XCTAssertFalse(again)
+        XCTAssertEqual(h.profiles.profiles.first?.sampleCount, 1)
+    }
+
+    func testConfirmIsRefusedWhenNameChangedOrVoiceMissing() async throws {
+        let (h, session) = try await self.llmNamedSession()
+        try h.mutator.session.renameSpeaker(id: session.speakers[1].id, to: "Robert")
+        let renamed = await h.processor.confirmSpeakerName(sessionID: session.id, speakerID: session.speakers[1].id)
+        XCTAssertFalse(renamed, "the shown name is stale; the user's rename is handled by H6")
+        XCTAssertTrue(h.profiles.profiles.isEmpty)
+
+        var records = try await h.sidecars.speakers(for: session.id)
+        records[session.speakers[2].id] = MeetAISpeakerRecord(nameSource: .llm, lastAppliedName: "Carol")
+        try await h.sidecars.saveSpeakers(records, for: session.id)
+        try h.mutator.session.renameSpeaker(id: session.speakers[2].id, to: "Carol")
+        let noVoice = await h.processor.confirmSpeakerName(sessionID: session.id, speakerID: session.speakers[2].id)
+        XCTAssertFalse(noVoice)
+        let candidates = await h.processor.confirmableSpeakers(sessionID: session.id)
+        XCTAssertTrue(candidates.isEmpty)
+    }
+
     func testUserTitleEditDuringTitleCallIsKept() async throws {
         let session = self.twoSpeakerSession()
         var mutatorRef: FakeMutator?

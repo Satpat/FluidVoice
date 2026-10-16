@@ -154,6 +154,54 @@ final class MeetAISessionProcessor: ObservableObject {
         }
     }
 
+    /// An AI-named speaker whose voice can be saved under that name.
+    struct ConfirmableSpeaker: Equatable {
+        let speakerID: SessionSpeakerID
+        let name: String
+    }
+
+    /// Speakers still carrying the name the LLM gave them, with a stored voice. Renaming to the same
+    /// name is a no-op upstream, so this is the only way to save such a voice.
+    func confirmableSpeakers(sessionID: MeetingSessionID) async -> [ConfirmableSpeaker] {
+        guard let session = await self.load(sessionID),
+              let records = try? await self.deps.sidecars.speakers(for: sessionID) else { return [] }
+        return Self.confirmable(session: session, records: records)
+    }
+
+    private static func confirmable(session: MeetingSession, records: [SessionSpeakerID: MeetAISpeakerRecord]) -> [ConfirmableSpeaker] {
+        session.activeSpeakers.compactMap { speaker in
+            let name = speaker.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !speaker.isLocalUser, let record = records[speaker.id],
+                  record.nameSource == .llm, record.embedding != nil,
+                  name == record.lastAppliedName, !MeetAITranscript.isDefaultSpeakerName(name)
+            else { return nil }
+            return ConfirmableSpeaker(speakerID: speaker.id, name: name)
+        }
+    }
+
+    /// Enrols the speaker's stored voice under its current AI-assigned name and marks the name as the
+    /// user's. Runs in the session's queue. False when the speaker is no longer confirmable.
+    func confirmSpeakerName(sessionID: MeetingSessionID, speakerID: SessionSpeakerID) async -> Bool {
+        var saved = false
+        await self.enqueue(sessionID) { processor in
+            guard let session = await processor.load(sessionID) else { return }
+            do {
+                var records = try await processor.deps.sidecars.speakers(for: sessionID)
+                guard let candidate = Self.confirmable(session: session, records: records).first(where: { $0.speakerID == speakerID }),
+                      let embedding = records[speakerID]?.embedding,
+                      let profile = processor.deps.profiles.enroll(name: candidate.name, embedding: embedding)
+                else { return }
+                records[speakerID]?.matchedProfileID = profile.id
+                records[speakerID]?.nameSource = .user
+                try await processor.deps.sidecars.saveSpeakers(records, for: sessionID)
+                saved = true
+            } catch {
+                DebugLogger.shared.warning("MeetAI couldn't save the speaker's voice: \(error.localizedDescription)", source: "MeetAI")
+            }
+        }.value
+        return saved
+    }
+
     func captureEmbeddings(_ session: MeetingSession) async {
         do {
             let directory = try await self.deps.sessionDirectory(session.id)

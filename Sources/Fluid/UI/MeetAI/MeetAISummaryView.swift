@@ -8,6 +8,7 @@ struct MeetAISummaryView: View {
     @Environment(\.theme) private var theme
     @State private var record: MeetAISummaryRecord?
     @State private var style: MeetAISummaryStyle = MeetAISettings.shared.summaryStyle
+    @State private var confirmable: [MeetAISessionProcessor.ConfirmableSpeaker] = []
 
     private var isBusy: Bool { self.processor.busySessions.contains(self.session.id) }
     private var isStale: Bool { self.record.map { $0.transcriptHash != MeetAITranscript.hash(for: self.session) } ?? false }
@@ -52,6 +53,21 @@ struct MeetAISummaryView: View {
                 }
             }
 
+            ForEach(self.confirmable, id: \.speakerID) { speaker in
+                HStack(spacing: self.theme.metrics.spacing.sm) {
+                    Label("AI named a speaker \(speaker.name).", systemImage: "person.wave.2")
+                        .font(self.theme.typography.caption)
+                        .foregroundStyle(self.theme.palette.secondaryText)
+                    Button("Save this voice as \(speaker.name)") {
+                        Task {
+                            _ = await self.processor.confirmSpeakerName(sessionID: self.session.id, speakerID: speaker.speakerID)
+                            await self.reload()
+                        }
+                    }
+                    .disabled(self.isBusy)
+                }
+            }
+
             if let record {
                 if MeetAISummaryStyle(rawValue: record.style) == nil {
                     Text("Summary from the previous MeetAI version")
@@ -73,6 +89,7 @@ struct MeetAISummaryView: View {
     private func reload() async {
         self.record = try? await MeetAISidecarStore.shared.summary(for: self.session.id)
         if let saved = self.record.flatMap({ MeetAISummaryStyle(rawValue: $0.style) }) { self.style = saved }
+        self.confirmable = await self.processor.confirmableSpeakers(sessionID: self.session.id)
     }
 
     /// The style picker here is per meeting; the global default is set only in the MeetAI settings sheet.
