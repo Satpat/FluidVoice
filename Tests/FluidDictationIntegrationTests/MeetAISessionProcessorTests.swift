@@ -400,3 +400,124 @@ final class MeetAISessionProcessorTests: XCTestCase {
         XCTAssertEqual(records[session.speakers[1].id]?.lastAppliedName, "Sam")
     }
 }
+
+@MainActor
+final class MeetAITranslatorTests: XCTestCase {
+    private let bengali = "আমি কাল অফিসে যাব"
+    private let hindi = "मैं कल दफ्तर जाऊंगा"
+
+    private func session(_ texts: [String]) -> MeetingSession {
+        MeetAIFixtures.session(
+            speakers: [("You", true), ("Speaker 1", false)],
+            lines: texts.enumerated().map { .init(speaker: 1, start: Double($0.offset) * 10, end: Double($0.offset) * 10 + 9, text: $0.element) }
+        )
+    }
+
+    private func reply(_ session: MeetingSession, _ english: [String: String]) -> String {
+        let items = session.transcriptSegments.compactMap { segment -> String? in
+            english[segment.text].map { "{\"id\": \"\(segment.id.uuidString)\", \"english\": \"\($0)\"}" }
+        }
+        return "```json\n[\(items.joined(separator: ","))]\n```"
+    }
+
+    func testIndicDetectionCoversScriptsAndIgnoresEnglish() {
+        XCTAssertTrue(MeetAITranslator.isIndic(self.bengali))
+        XCTAssertTrue(MeetAITranslator.isIndic(self.hindi))
+        XCTAssertTrue(MeetAITranslator.isIndic("So the \(self.bengali) is what he said"), "mixed turns still count")
+        XCTAssertFalse(MeetAITranslator.isIndic("I mean, appendix it is."))
+        XCTAssertFalse(MeetAITranslator.isIndic("Ok আ"), "a single stray character is not a translation candidate")
+        XCTAssertFalse(MeetAITranslator.isIndic("Mijn foams alle de laerdfully 어제"))
+        XCTAssertFalse(MeetAITranslator.isIndic(""))
+    }
+
+    func testEnglishOnlyMeetingMakesNoLLMCall() async throws {
+        let llm = FakeLLM()
+        let result = try await MeetAITranslator.translate(session: self.session(["Hello there", "All good"]), existing: [:], llm: llm)
+        XCTAssertTrue(result.isEmpty)
+        XCTAssertTrue(llm.prompts.isEmpty)
+    }
+
+    func testTranslatesOnlyIndicSegmentsAndKeepsOriginalText() async throws {
+        let session = self.session(["Hello there", self.bengali, self.hindi])
+        let llm = FakeLLM(replies: [self.reply(session, [self.bengali: "I will go to the office tomorrow", self.hindi: "I will go to the office tomorrow."])])
+        let result = try await MeetAITranslator.translate(session: session, existing: [:], llm: llm)
+
+        XCTAssertEqual(llm.prompts.count, 1)
+        XCTAssertFalse(llm.prompts[0].contains("Hello there"), "English segments are never sent")
+        XCTAssertEqual(result.count, 2)
+        let bengaliSegment = try XCTUnwrap(session.transcriptSegments.first { $0.text == self.bengali })
+        XCTAssertEqual(result[bengaliSegment.id.uuidString]?.english, "I will go to the office tomorrow")
+        XCTAssertEqual(MeetAITranslator.english(for: bengaliSegment, in: result), "I will go to the office tomorrow")
+        XCTAssertEqual(bengaliSegment.text, self.bengali)
+    }
+
+    func testExistingTranslationsAreReusedAndEditedSegmentsAreRetranslated() async throws {
+        var session = self.session([self.bengali, self.hindi])
+        let first = FakeLLM(replies: [self.reply(session, [self.bengali: "one", self.hindi: "two"])])
+        var records = try await MeetAITranslator.translate(session: session, existing: [:], llm: first)
+
+        let unchanged = FakeLLM()
+        records = try await MeetAITranslator.translate(session: session, existing: records, llm: unchanged)
+        XCTAssertTrue(unchanged.prompts.isEmpty, "nothing changed, nothing to translate")
+
+        session.transcriptSegments[1].text = "মুদি দোকানে যাব"
+        let second = FakeLLM(replies: [self.reply(session, ["মুদি দোকানে যাব": "three"])])
+        records = try await MeetAITranslator.translate(session: session, existing: records, llm: second)
+        XCTAssertEqual(second.prompts.count, 1)
+        XCTAssertEqual(MeetAITranslator.english(for: session.transcriptSegments[0], in: records), "one")
+        XCTAssertEqual(MeetAITranslator.english(for: session.transcriptSegments[1], in: records), "three")
+    }
+
+    func testStaleRecordIsHiddenWhenSegmentTextChanges() async throws {
+        var session = self.session([self.bengali])
+        let llm = FakeLLM(replies: [self.reply(session, [self.bengali: "one"])])
+        let records = try await MeetAITranslator.translate(session: session, existing: [:], llm: llm)
+        session.transcriptSegments[0].text = "অন্য কিছু"
+        XCTAssertNil(MeetAITranslator.english(for: session.transcriptSegments[0], in: records))
+    }
+
+    func testMalformedReplyLeavesSegmentsUntranslatedWithoutThrowing() async throws {
+        let session = self.session([self.bengali])
+        let llm = FakeLLM(replies: ["Sorry, I cannot help with that."])
+        let result = try await MeetAITranslator.translate(session: session, existing: [:], llm: llm)
+        XCTAssertTrue(result.isEmpty)
+    }
+
+    func testReplyForUnknownIDsIsIgnored() async throws {
+        let session = self.session([self.bengali])
+        let llm = FakeLLM(replies: ["[{\"id\": \"\(UUID().uuidString)\", \"english\": \"ghost\"}]"])
+        let result = try await MeetAITranslator.translate(session: session, existing: [:], llm: llm)
+        XCTAssertTrue(result.isEmpty)
+    }
+
+    func testLargeMeetingsAreSentInSeveralBatches() async throws {
+        let long = String(repeating: "আমি কাল অফিসে যাব ", count: 40)
+        let session = self.session(Array(repeating: long, count: 12))
+        let llm = FakeLLM(replies: [])
+        _ = try await MeetAITranslator.translate(session: session, existing: [:], llm: llm)
+        XCTAssertGreaterThan(llm.prompts.count, 1)
+    }
+
+    func testLLMFailurePropagatesSoTheCallerCanKeepOriginals() async {
+        let llm = FakeLLM(error: MeetAILLMError("no provider"))
+        do {
+            _ = try await MeetAITranslator.translate(session: self.session([self.bengali]), existing: [:], llm: llm)
+            XCTFail("Expected the provider error")
+        } catch {
+            XCTAssertEqual(error as? MeetAILLMError, MeetAILLMError("no provider"))
+        }
+    }
+
+    func testSidecarRoundTripsTranslationsAndRemovesEmpty() async throws {
+        let root = try MeetAIFixtures.tempDirectory(self)
+        let store = MeetAISidecarStore(paths: MeetAIPaths(supportRoot: root))
+        let id = UUID()
+        let record = MeetAITranslationRecord(english: "hello", sourceHash: "h")
+        try await store.saveTranslations(["a": record], for: id)
+        let loaded = try await store.translations(for: id)
+        XCTAssertEqual(loaded, ["a": record])
+        try await store.saveTranslations([:], for: id)
+        let cleared = try await store.translations(for: id)
+        XCTAssertTrue(cleared.isEmpty)
+    }
+}

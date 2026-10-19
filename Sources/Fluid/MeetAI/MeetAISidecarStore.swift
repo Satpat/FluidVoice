@@ -71,6 +71,14 @@ actor MeetAISidecarStore {
         try self.write(record, id, "summary.json")
     }
 
+    func translations(for id: MeetingSessionID) throws -> [String: MeetAITranslationRecord] {
+        try self.read([String: MeetAITranslationRecord].self, id, "translations.json") ?? [:]
+    }
+
+    func saveTranslations(_ records: [String: MeetAITranslationRecord], for id: MeetingSessionID) throws {
+        try self.write(records.isEmpty ? nil : records, id, "translations.json")
+    }
+
     func qa(for id: MeetingSessionID) throws -> [MeetAIQARecord] {
         try self.read([MeetAIQARecord].self, id, "qa.json") ?? []
     }
