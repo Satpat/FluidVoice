@@ -5410,7 +5410,7 @@ final class SettingsStore: ObservableObject {
             case .whisperMedium:
                 return 5.0
             case .whisperLargeTurbo:
-                return 6.0
+                return 3.0 // Q8 GGUF is ~0.85 GB; confirm against measured RSS
             case .whisperLarge:
                 return 8.0
             }

@@ -37,6 +37,23 @@ private final class DeletionFixtureProvider: TranscriptionProvider {
 
 @MainActor
 final class VoiceModelDeletionTests: XCTestCase {
+    func testInsufficientMemoryDoesNotClearCachedModel() async {
+        let provider = DeletionFixtureProvider()
+        provider.prepareBody = {
+            throw NSError(domain: "WhisperProvider", code: WhisperProvider.insufficientMemoryErrorCode)
+        }
+
+        do {
+            try await ASRService().prepareProviderRecoveryForTesting(provider, modelsAlreadyCached: true)
+            XCTFail("Expected insufficient-memory error")
+        } catch {
+            XCTAssertEqual((error as NSError).code, WhisperProvider.insufficientMemoryErrorCode)
+        }
+
+        XCTAssertEqual(provider.clearCalls, 0)
+        XCTAssertEqual(provider.prepareCalls, 1)
+    }
+
     private func makeNoHardwareController(for asr: ASRService) -> DirectCoreAudioLifecycleController {
         DirectCoreAudioLifecycleController(
             packetHandler: asr.recoveryPacketHandlerForTesting,

@@ -6826,6 +6826,11 @@ final class ASRService: ObservableObject {
                 // checkpoint. Explicit Update/Delete owns that choice instead.
                 throw error
             }
+            let nsError = error as NSError
+            if nsError.domain == "WhisperProvider", nsError.code == WhisperProvider.insufficientMemoryErrorCode {
+                // Low RAM is not a corrupt cache; clearing would delete a good model and re-download it.
+                throw error
+            }
             firstError = error
             DebugLogger.shared.error("ASRService: First prepare attempt for \(provider.name) failed after \(String(format: "%.2f", Date().timeIntervalSince(start)))s", source: "ASRService")
             DebugLogger.shared.warning(

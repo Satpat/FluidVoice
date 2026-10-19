@@ -5,6 +5,9 @@ import TranscribeCpp
 final class WhisperProvider: TranscriptionProvider {
     let name = "Whisper (Universal)"
 
+    /// Error code for a model that fits on disk but not in RAM right now; the cache is fine.
+    static let insufficientMemoryErrorCode = -4
+
     var isAvailable: Bool {
         guard case .success = Self.backendInitialization else { return false }
         if CPUArchitecture.isAppleSilicon {
@@ -222,7 +225,7 @@ final class WhisperProvider: TranscriptionProvider {
             DebugLogger.shared.error("WhisperProvider: \(errorMessage)", source: "WhisperProvider")
             throw NSError(
                 domain: "WhisperProvider",
-                code: -4,
+                code: Self.insufficientMemoryErrorCode,
                 userInfo: [NSLocalizedDescriptionKey: errorMessage]
             )
         }
