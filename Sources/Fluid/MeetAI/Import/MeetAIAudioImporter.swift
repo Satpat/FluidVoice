@@ -55,7 +55,8 @@ final class MeetAIAudioImporter: ObservableObject {
                 title: title,
                 languageCode: SettingsStore.shared.meetingRecordingDefaults.languageCode ?? "en",
                 startedAt: startedAt,
-                tracks: [.init(kind: .microphone, samples: samples, echoProtection: .acousticallyClosed)]
+                tracks: [.init(kind: .microphone, samples: samples, echoProtection: .acousticallyClosed)],
+                transcriptionEngine: SettingsStore.shared.meetingRecordingDefaults.transcriptionEngine
             )
         } catch {
             self.status = .failed(error.localizedDescription)

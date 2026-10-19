@@ -141,6 +141,7 @@ nonisolated struct MeetingRecordingDefaults: Codable, Equatable, Sendable {
     var microphoneCoreAudioUID: String?
     var microphoneRole: MeetingMicrophoneRole
     var languageCode: String? = nil
+    var transcriptionEngine: MeetingTranscriptionEngine? = nil
 
     static let unconfigured = Self(
         isConfigured: false,
@@ -1190,12 +1191,11 @@ nonisolated struct MeetingSession: Codable, Identifiable, Equatable, Sendable {
                 throw MeetingModelValidationError.missingSegmentSpeaker
             }
         }
-        for attempt in self.processingAttempts {
-            if let languageCode = attempt.languageCode,
-               languageCode != self.languageCode
-            {
-                throw MeetingModelValidationError.unsupportedLanguage
-            }
+        // Only the newest attempt must match: re-transcribing may switch the meeting language.
+        if let languageCode = self.processingAttempts.last?.languageCode,
+           languageCode != self.languageCode
+        {
+            throw MeetingModelValidationError.unsupportedLanguage
         }
     }
 

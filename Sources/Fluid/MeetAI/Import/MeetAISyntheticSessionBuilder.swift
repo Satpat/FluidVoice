@@ -40,7 +40,12 @@ nonisolated enum MeetAISyntheticSessionBuilder {
         startedHostTime: 0, machTimebaseNumerator: 1, machTimebaseDenominator: 1, firstPresentationTime: nil
     )
 
-    static func configuration(title: String, languageCode: String, hasApplicationAudio: Bool) -> MeetingCaptureConfiguration {
+    static func configuration(
+        title: String,
+        languageCode: String,
+        hasApplicationAudio: Bool,
+        transcriptionEngine: MeetingTranscriptionEngine? = nil
+    ) -> MeetingCaptureConfiguration {
         MeetingCaptureConfiguration(
             mode: hasApplicationAudio ? .onlineCall : .inRoom,
             title: title,
@@ -48,7 +53,8 @@ nonisolated enum MeetAISyntheticSessionBuilder {
             application: hasApplicationAudio
                 ? MeetingApplicationIdentity(bundleIdentifier: self.importBundleIdentifier, displayName: "Imported recording")
                 : nil,
-            microphone: MeetingMicrophoneIdentity(captureDeviceID: self.importDeviceID, displayName: "Imported audio")
+            microphone: MeetingMicrophoneIdentity(captureDeviceID: self.importDeviceID, displayName: "Imported audio"),
+            transcriptionEngine: transcriptionEngine
         )
     }
 
@@ -78,11 +84,17 @@ nonisolated enum MeetAISyntheticSessionBuilder {
         languageCode: String,
         startedAt: Date,
         duration: TimeInterval,
-        trackKinds: [MeetingAudioTrackKind]
+        trackKinds: [MeetingAudioTrackKind],
+        transcriptionEngine: MeetingTranscriptionEngine? = nil
     ) -> MeetingSession {
         var session = MeetingSession(
             id: id,
-            configuration: self.configuration(title: title, languageCode: languageCode, hasApplicationAudio: trackKinds.contains(.applicationAudio)),
+            configuration: self.configuration(
+                title: title,
+                languageCode: languageCode,
+                hasApplicationAudio: trackKinds.contains(.applicationAudio),
+                transcriptionEngine: transcriptionEngine
+            ),
             startedAt: startedAt,
             timebase: self.timebase
         )

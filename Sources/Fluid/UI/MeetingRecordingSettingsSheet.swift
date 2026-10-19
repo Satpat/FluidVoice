@@ -80,8 +80,13 @@ struct MeetingRecordingSettingsSheet: View {
         self._selectedSection = State(initialValue: initialSection)
     }
 
+    /// Catalog models whose language list the picker shows for the chosen engine.
+    private var languageModels: [SettingsStore.SpeechModel] {
+        [self.draft.transcriptionEngine.speechModel ?? .parakeetTDT]
+    }
+
     private var canSave: Bool {
-        guard VoiceEngineLanguageCatalog.parakeetV3LanguageIDs.contains(self.draft.languageCode) else { return false }
+        guard self.draft.transcriptionEngine.supportsLanguage(self.draft.languageCode) else { return false }
         guard self.microphones.contains(where: { $0.id == self.draft.selectedMicrophoneID }) else { return false }
         return self.draft.mode == .inRoom
             || self.draft.usesAutomaticApplication
@@ -279,18 +284,35 @@ struct MeetingRecordingSettingsSheet: View {
 
             FluidManagementGroup(title: "Transcript language") {
                 MeetingAdaptiveSetupRow(
+                    title: "Transcription model",
+                    detail: "Whisper is slower and needs more memory, but covers Bengali, Hindi and other Indian languages."
+                ) {
+                    Picker("Transcription model", selection: self.$draft.transcriptionEngine) {
+                        ForEach(MeetingTranscriptionEngine.allCases, id: \.self) { engine in
+                            Text(engine.displayName).tag(engine)
+                        }
+                    }
+                    .fluidDropdownStyle(fillsWidth: true)
+                    .accessibilityLabel("Meeting transcription model")
+                    .onChange(of: self.draft.transcriptionEngine) { _, engine in
+                        if !engine.supportsLanguage(self.draft.languageCode) { self.draft.languageCode = "en" }
+                    }
+                }
+                MeetingAdaptiveSetupRow(
                     title: "Language",
-                    detail: "Final transcripts support 25 languages. Live captions are English-only."
+                    detail: self.draft.transcriptionEngine == .parakeet
+                        ? "Final transcripts support 25 languages. Live captions are English-only."
+                        : "Pick the one language spoken most. Live captions are English-only."
                 ) {
                     Menu {
                         Picker("Meeting language", selection: self.$draft.languageCode) {
-                            ForEach(VoiceEngineLanguageCatalog.allLanguages(availableModels: [.parakeetTDT])) { language in
+                            ForEach(VoiceEngineLanguageCatalog.allLanguages(availableModels: self.languageModels)) { language in
                                 Text(language.displayName).tag(language.id)
                             }
                         }
                         .pickerStyle(.inline)
                     } label: {
-                        Text(VoiceEngineLanguageCatalog.language(id: self.draft.languageCode, availableModels: [.parakeetTDT])?.displayName ?? "Choose language…")
+                        Text(VoiceEngineLanguageCatalog.language(id: self.draft.languageCode, availableModels: self.languageModels)?.displayName ?? "Choose language…")
                     }
                     .fluidDropdownStyle(fillsWidth: true)
                     .accessibilityLabel("Meeting transcript language")
@@ -599,5 +621,72 @@ private struct MeetingAdaptiveSetupRow<Content: View>: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
+    }
+}
+
+
+struct MeetingRetranscribeDraft: Identifiable {
+    let sessionID: MeetingSessionID
+    var engine: MeetingTranscriptionEngine
+    var languageCode: String
+    var id: MeetingSessionID { self.sessionID }
+
+    init(session: MeetingSession) {
+        self.sessionID = session.id
+        self.engine = session.transcriptionEngine ?? .parakeet
+        self.languageCode = session.languageCode
+    }
+}
+
+/// Re-runs one meeting from its saved audio, optionally with another model and language.
+struct MeetingRetranscribeSheet: View {
+    @State private var draft: MeetingRetranscribeDraft
+    let onConfirm: (MeetingTranscriptionEngine, String) -> Void
+    let onCancel: () -> Void
+
+    init(
+        draft: MeetingRetranscribeDraft,
+        onConfirm: @escaping (MeetingTranscriptionEngine, String) -> Void,
+        onCancel: @escaping () -> Void
+    ) {
+        self._draft = State(initialValue: draft)
+        self.onConfirm = onConfirm
+        self.onCancel = onCancel
+    }
+
+    private var languageModels: [SettingsStore.SpeechModel] {
+        [self.draft.engine.speechModel ?? .parakeetTDT]
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Re-transcribe Meeting")
+                .font(.headline)
+            Text("Transcription, speaker labels and summary are regenerated from the saved audio. Edits and speaker corrections in the current transcript are replaced.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Picker("Model", selection: self.$draft.engine) {
+                ForEach(MeetingTranscriptionEngine.allCases, id: \.self) { Text($0.displayName).tag($0) }
+            }
+            .onChange(of: self.draft.engine) { _, engine in
+                if !engine.supportsLanguage(self.draft.languageCode) { self.draft.languageCode = "en" }
+            }
+            Picker("Language", selection: self.$draft.languageCode) {
+                ForEach(VoiceEngineLanguageCatalog.allLanguages(availableModels: self.languageModels)) { language in
+                    Text(language.displayName).tag(language.id)
+                }
+            }
+            HStack {
+                Spacer()
+                Button("Cancel", role: .cancel) { self.onCancel() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Re-transcribe") { self.onConfirm(self.draft.engine, self.draft.languageCode) }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!self.draft.engine.supportsLanguage(self.draft.languageCode))
+            }
+        }
+        .padding(20)
+        .frame(width: 440)
     }
 }

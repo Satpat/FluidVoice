@@ -10,12 +10,13 @@ enum MeetAISessionImport {
         title: String,
         languageCode: String,
         startedAt: Date,
-        tracks: [MeetAISyntheticSessionBuilder.TrackAudio]
+        tracks: [MeetAISyntheticSessionBuilder.TrackAudio],
+        transcriptionEngine: MeetingTranscriptionEngine? = nil
     ) async throws -> MeetingSession {
         let duration = (tracks.map { Double($0.samples.count) }.max() ?? 0) / MeetAISyntheticSessionBuilder.sampleRate
         var session = MeetAISyntheticSessionBuilder.audioSessionShell(
             id: id, title: title, languageCode: languageCode, startedAt: startedAt,
-            duration: duration, trackKinds: tracks.map(\.kind)
+            duration: duration, trackKinds: tracks.map(\.kind), transcriptionEngine: transcriptionEngine
         )
         try await store.create(session)
         do {

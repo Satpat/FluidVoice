@@ -1842,6 +1842,45 @@ final class MeetingRecoveryTests: XCTestCase {
         XCTAssertNil(coordinator.activeSession)
     }
 
+    func testRetranscribeOverrideSwitchesEngineAndLanguageForStoredSession() async throws {
+        let dir = self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = MeetingSessionStore(rootDirectory: dir)
+        let session = self.makeSession(
+            state: .completed,
+            endedAt: Date(),
+            audioTracks: [self.makeMicrophoneTrack(chunks: [self.makeFinalizedChunk()])]
+        )
+        try await store.create(session)
+        let coordinator = MeetingSessionCoordinator(
+            store: store,
+            capture: StubCaptureController(),
+            processing: StubProcessingController(),
+            audioArbiter: StubArbiter()
+        )
+        await coordinator.ensureRestored()
+
+        do {
+            _ = try await coordinator.retryProcessing(
+                sessionID: session.id,
+                override: .init(engine: .parakeet, languageCode: "bn")
+            )
+            XCTFail("Parakeet cannot transcribe Bengali")
+        } catch {
+            XCTAssertEqual(error as? MeetingModelValidationError, .unsupportedLanguage)
+        }
+
+        let result = try await coordinator.retryProcessing(
+            sessionID: session.id,
+            override: .init(engine: .whisperTurbo, languageCode: "bn")
+        )
+        XCTAssertEqual(result.state, .completed)
+        let loaded = try await store.load(id: session.id)
+        let persisted = try XCTUnwrap(loaded)
+        XCTAssertEqual(persisted.transcriptionEngine, .whisperTurbo)
+        XCTAssertEqual(persisted.languageCode, "bn")
+    }
+
     // MARK: - Test 11: retry-by-id displaces a passive recovery offer
 
     func testRetryByIDDisplacesPassiveOffer() async throws {

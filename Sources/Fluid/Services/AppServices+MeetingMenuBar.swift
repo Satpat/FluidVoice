@@ -61,7 +61,8 @@ extension AppServices {
             platform: application.map { MeetingPlatformProfile(identifier: $0.bundleIdentifier, displayName: $0.displayName) },
             application: application,
             microphone: microphone,
-            timestampDefaultTitle: true
+            timestampDefaultTitle: true,
+            transcriptionEngine: defaults.transcriptionEngine
         )
     }
 }

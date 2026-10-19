@@ -332,7 +332,8 @@ final class MeetingSessionCoordinator: ObservableObject {
             languageCode: SettingsStore.shared.meetingRecordingDefaults.languageCode ?? "en",
             application: application,
             microphone: microphone,
-            timestampDefaultTitle: true
+            timestampDefaultTitle: true,
+            transcriptionEngine: SettingsStore.shared.meetingRecordingDefaults.transcriptionEngine
         )
     }
 
@@ -647,12 +648,21 @@ final class MeetingSessionCoordinator: ObservableObject {
         return try await self.retryProcessing(sessionID: activeSession.id)
     }
 
+    /// A re-transcription override: run this session again with another engine and language.
+    struct RetranscriptionOverride: Equatable {
+        var engine: MeetingTranscriptionEngine
+        var languageCode: String
+    }
+
     @discardableResult
-    func retryProcessing(sessionID: MeetingSessionID) async throws -> MeetingSession {
+    func retryProcessing(
+        sessionID: MeetingSessionID,
+        override: RetranscriptionOverride? = nil
+    ) async throws -> MeetingSession {
         guard self.retryTask == nil else { throw MeetingCoordinatorError.activityInProgress }
         let task = Task { @MainActor [weak self] () throws -> MeetingSession in
             guard let self else { throw MeetingCoordinatorError.noActiveMeeting }
-            return try await self.performRetryProcessing(sessionID: sessionID)
+            return try await self.performRetryProcessing(sessionID: sessionID, override: override)
         }
         self.retryTask = task
         do {
@@ -665,7 +675,10 @@ final class MeetingSessionCoordinator: ObservableObject {
         }
     }
 
-    private func performRetryProcessing(sessionID: MeetingSessionID) async throws -> MeetingSession {
+    private func performRetryProcessing(
+        sessionID: MeetingSessionID,
+        override: RetranscriptionOverride? = nil
+    ) async throws -> MeetingSession {
         await self.ensureRestored()
         guard self.stopTask == nil,
               self.interruptionTask == nil,
@@ -690,8 +703,16 @@ final class MeetingSessionCoordinator: ObservableObject {
             }
         }
 
-        guard let session = try await self.store.load(id: sessionID) else {
+        guard var session = try await self.store.load(id: sessionID) else {
             throw MeetingCoordinatorError.noActiveMeeting
+        }
+        // Stored (history) sessions only; the active-session branch above keeps its own engine.
+        if let override {
+            guard override.engine.supportsLanguage(override.languageCode) else {
+                throw MeetingModelValidationError.unsupportedLanguage
+            }
+            session.transcriptionEngine = override.engine
+            session.languageCode = override.languageCode
         }
         // Re-validate: another operation may have started while we awaited the load above.
         guard self.stopTask == nil,
