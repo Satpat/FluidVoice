@@ -19,6 +19,9 @@ nonisolated struct MeetingBackendID: RawRepresentable, Hashable, Codable, Sendab
     /// Local Parakeet TDT v2 ASR + Nemotron-3 diarization composite.
     static let parakeetNemotron = MeetingBackendID(rawValue: "local-parakeet-tdt-v2-nemotron-3-v1")
 
+    /// Per-meeting Whisper path: the legacy in-pipeline workflow pinned to the session's Whisper model.
+    static let whisperCompatibility = MeetingBackendID(rawValue: "legacy-whisper-v1")
+
     /// Single source of truth for new meeting-processing attempts. Keep explicit stored selections
     /// untouched; this value applies only when no preference has been recorded.
     static let productionDefault: MeetingBackendID = .parakeetNemotron

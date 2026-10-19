@@ -24,6 +24,12 @@ final class MeetingTranscriptionBackendRegistry {
         registry.register(.legacyCompatibility) { context in
             MeetingLegacyCompatibilityBackend(legacyExecutor: context.legacyExecutor)
         }
+        registry.register(.whisperCompatibility) { context in
+            MeetingLegacyCompatibilityBackend(
+                legacyExecutor: context.legacyExecutor,
+                descriptor: MeetingLegacyCompatibilityBackend.whisperDescriptor
+            )
+        }
         registry.register(.parakeetNemotron) { context in
             MeetingParakeetNemotronBackend(runtimeFactory: context.parakeetNemotronRuntimeFactory)
         }

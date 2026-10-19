@@ -577,6 +577,7 @@ private final class MeetingProviderLanguagePin {
         case apple(String)
         case cohere(SettingsStore.CohereLanguage)
         case nemotron(SettingsStore.NemotronLanguage)
+        case whisper(String)
     }
 
     private enum Restoration {
@@ -584,6 +585,7 @@ private final class MeetingProviderLanguagePin {
         case apple(String)
         case cohere(SettingsStore.CohereLanguage)
         case nemotron(SettingsStore.NemotronLanguage)
+        case whisper(String?)
     }
 
     let languageCode: String
@@ -599,9 +601,12 @@ private final class MeetingProviderLanguagePin {
         self.languageCode = route.language.id
         self.settings = settings
         switch route.binding {
-        case .automatic, .whisper:
+        case .automatic:
             self.desired = .none
             self.restoration = .none
+        case let .whisper(code):
+            self.desired = .whisper(code)
+            self.restoration = .whisper(settings.selectedWhisperLanguageCode)
         case let .appleSpeech(localeIdentifier):
             self.desired = .apple(localeIdentifier)
             self.restoration = .apple(settings.selectedAppleSpeechLocaleIdentifier)
@@ -621,6 +626,7 @@ private final class MeetingProviderLanguagePin {
         case let .apple(identifier): self.settings.selectedAppleSpeechLocaleIdentifier = identifier
         case let .cohere(language): self.settings.selectedCohereLanguage = language
         case let .nemotron(language): self.settings.selectedNemotronLanguage = language
+        case let .whisper(code): self.settings.selectedWhisperLanguageCode = code
         }
     }
 
@@ -634,6 +640,8 @@ private final class MeetingProviderLanguagePin {
             self.settings.selectedCohereLanguage = language
         case let .nemotron(language):
             self.settings.selectedNemotronLanguage = language
+        case let .whisper(code):
+            self.settings.selectedWhisperLanguageCode = code
         }
     }
 }
@@ -1400,7 +1408,8 @@ final class MeetingProcessingPipeline: MeetingProcessingControlling {
         sessionDirectory: URL,
         progress: @escaping @MainActor (MeetingProcessingStage) -> Void
     ) async throws -> MeetingProcessingResult {
-        guard VoiceEngineLanguageCatalog.parakeetV3LanguageIDs.contains(session.languageCode) else {
+        let engine = session.transcriptionEngine ?? .parakeet
+        guard engine.supportsLanguage(session.languageCode) else {
             throw MeetingProcessingError.unsupportedLanguage
         }
         guard session.audioTracks.contains(where: { !$0.chunks.isEmpty }) else {
@@ -1410,7 +1419,7 @@ final class MeetingProcessingPipeline: MeetingProcessingControlling {
         // The selection is read exactly once, here, and every later decision in this attempt uses
         // the local copy. Re-reading the preference after an await could split one attempt across
         // two backends — planning under one, failing the legacy callback against another.
-        let backendID = self.backendIDProvider(session.languageCode)
+        let backendID = engine == .whisperTurbo ? .whisperCompatibility : self.backendIDProvider(session.languageCode)
         DebugLogger.shared.info(
             "Meeting final processing selected backend=\(backendID.rawValue)",
             source: "MeetingProcessingPipeline"
@@ -1798,7 +1807,11 @@ final class MeetingProcessingPipeline: MeetingProcessingControlling {
         let asrService = self.asrServiceProvider()
         guard !asrService.isRunning else { throw MeetingProcessingError.dictationActive }
 
-        let selectedModel = SettingsStore.shared.selectedSpeechModel
+        // A Whisper meeting runs its own model; the global selection is swapped for this attempt only.
+        let previousModel = SettingsStore.shared.selectedSpeechModel
+        let selectedModel = session.transcriptionEngine?.speechModel ?? previousModel
+        if selectedModel != previousModel { SettingsStore.shared.selectedSpeechModel = selectedModel }
+        defer { if selectedModel != previousModel { SettingsStore.shared.selectedSpeechModel = previousModel } }
         guard let languagePin = MeetingProviderLanguagePin(
             languageCode: session.languageCode,
             model: selectedModel,

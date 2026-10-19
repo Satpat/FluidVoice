@@ -28,14 +28,31 @@ final class MeetingLegacyCompatibilityBackend: MeetingTranscriptionBackend {
         ]
     )
 
-    var descriptor: MeetingBackendDescriptor {
-        Self.descriptor
-    }
+    /// Same workflow as `descriptor`, selected per meeting for Whisper sessions and therefore
+    /// accepting every Whisper language instead of English only.
+    static let whisperDescriptor = MeetingBackendDescriptor(
+        id: .whisperCompatibility,
+        version: "1",
+        execution: .local,
+        supportedLanguageCodes: VoiceEngineLanguageCatalog.whisperSupportedLanguageCodes,
+        supportedTrackKinds: Set(MeetingAudioTrackKind.allCases),
+        supportedFinalPrecisions: [.utterance],
+        resultContract: .legacyResult,
+        knownLimits: MeetingLegacyCompatibilityBackend.descriptor.knownLimits + [
+            "Runs Whisper Large Turbo; no vocabulary boosting. Mixed-language speech is transcribed in the one language chosen for the meeting.",
+        ]
+    )
+
+    let descriptor: MeetingBackendDescriptor
 
     private let legacyExecutor: MeetingLegacyBackendExecutor
 
-    init(legacyExecutor: @escaping MeetingLegacyBackendExecutor) {
+    init(
+        legacyExecutor: @escaping MeetingLegacyBackendExecutor,
+        descriptor: MeetingBackendDescriptor = MeetingLegacyCompatibilityBackend.descriptor
+    ) {
         self.legacyExecutor = legacyExecutor
+        self.descriptor = descriptor
     }
 
     func plan(_ request: MeetingBackendRequest) throws -> MeetingBackendPlan {

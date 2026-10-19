@@ -505,7 +505,7 @@ final class MeetingTranscriptionBackendTests: XCTestCase {
     func testDefaultRegistryUsesProductionDefaultAndKeepsLegacyRollback() throws {
         let registry = MeetingTranscriptionBackendRegistry.makeDefault()
         XCTAssertEqual(registry.defaultBackendID, .productionDefault)
-        XCTAssertEqual(registry.registeredBackendIDs, [.legacyCompatibility, .parakeetNemotron])
+        XCTAssertEqual(registry.registeredBackendIDs, [.legacyCompatibility, .whisperCompatibility, .parakeetNemotron])
 
         let backend = try registry.makeBackend(
             id: registry.defaultBackendID,
@@ -538,6 +538,42 @@ final class MeetingTranscriptionBackendTests: XCTestCase {
     }
 
     // MARK: - Pipeline dispatch
+
+    func testWhisperSessionDispatchesToWhisperBackendAndAcceptsBengali() async throws {
+        var session = self.makeSession(languageCode: "bn")
+        session.transcriptionEngine = .whisperTurbo
+        var defaultUsed = false
+        let registry = MeetingTranscriptionBackendRegistry(defaultBackendID: Self.fixtureBackendID)
+        registry.register(Self.fixtureBackendID) { [self] _ in
+            defaultUsed = true
+            return FixtureMeetingBackend(descriptor: self.makeFixtureDescriptor()) { plan in
+                .legacyCompatibility(self.makeResult(attemptID: plan.attemptID, text: "parakeet"))
+            }
+        }
+        var whisperPlan: MeetingBackendPlan?
+        registry.register(.whisperCompatibility) { [self] _ in
+            FixtureMeetingBackend(descriptor: self.makeFixtureDescriptor(id: .whisperCompatibility)) { plan in
+                whisperPlan = plan
+                return .legacyCompatibility(self.makeResult(attemptID: plan.attemptID, text: "whisper"))
+            }
+        }
+
+        let result = try await self.makePipeline(registry: registry, backendID: nil).process(
+            session: session,
+            sessionDirectory: FileManager.default.temporaryDirectory,
+            progress: { _ in }
+        )
+
+        XCTAssertEqual(result.segments.map(\.text), ["whisper"])
+        XCTAssertEqual(whisperPlan?.backendID, .whisperCompatibility)
+        XCTAssertFalse(defaultUsed)
+    }
+
+    func testWhisperBackendDescriptorAcceptsIndianLanguagesWhileLegacyStaysEnglishOnly() {
+        let whisper = MeetingLegacyCompatibilityBackend.whisperDescriptor.supportedLanguageCodes
+        XCTAssertTrue(["en", "bn", "hi"].allSatisfy(whisper.contains))
+        XCTAssertEqual(MeetingLegacyCompatibilityBackend.descriptor.supportedLanguageCodes, ["en"])
+    }
 
     func testPipelineDispatchesToTheInjectedBackendBeforeAnyModelWork() async throws {
         let session = self.makeSession()
