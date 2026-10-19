@@ -571,13 +571,13 @@ nonisolated enum MeetingLocalSpeakerEvidenceSelector {
 }
 
 @MainActor
-private final class MeetingProviderLanguagePin {
+final class MeetingProviderLanguagePin {
     private enum Desired {
         case none
         case apple(String)
         case cohere(SettingsStore.CohereLanguage)
         case nemotron(SettingsStore.NemotronLanguage)
-        case whisper(String)
+        case whisper(String?)
     }
 
     private enum Restoration {
@@ -594,6 +594,16 @@ private final class MeetingProviderLanguagePin {
     private let restoration: Restoration
 
     init?(languageCode: String, model: SettingsStore.SpeechModel, settings: SettingsStore) {
+        if languageCode == MeetingTranscriptionEngine.autoLanguageCode {
+            // Auto-detect clears the forced language so Whisper detects it per recording.
+            guard model == .whisperLargeTurbo else { return nil }
+            self.languageCode = languageCode
+            self.settings = settings
+            self.desired = .whisper(nil)
+            self.restoration = .whisper(settings.selectedWhisperLanguageCode)
+            self.apply()
+            return
+        }
         guard let route = VoiceEngineLanguageCatalog.routes(
             forLanguageID: languageCode,
             availableModels: [model]
@@ -1513,7 +1523,7 @@ final class MeetingProcessingPipeline: MeetingProcessingControlling {
                 if self.managesModelResidency, summaryProvider != nil {
                     processed.postProcessing = await MeetingPostProcessingRegistry.shared.process(
                         sessionID: session.id,
-                        language: session.languageCode,
+                        language: session.languageCode == MeetingTranscriptionEngine.autoLanguageCode ? "en" : session.languageCode,
                         result: processed,
                         directory: sessionDirectory,
                         provider: summaryProvider

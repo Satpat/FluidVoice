@@ -569,9 +569,32 @@ final class MeetingTranscriptionBackendTests: XCTestCase {
         XCTAssertFalse(defaultUsed)
     }
 
+    func testWhisperLanguagePinAutoDetectsByClearingLanguageAndRestores() throws {
+        let settings = SettingsStore.shared
+        let original = settings.selectedWhisperLanguageCode
+        defer { settings.selectedWhisperLanguageCode = original }
+        settings.selectedWhisperLanguageCode = "en"
+
+        let auto = try XCTUnwrap(MeetingProviderLanguagePin(
+            languageCode: MeetingTranscriptionEngine.autoLanguageCode, model: .whisperLargeTurbo, settings: settings
+        ))
+        XCTAssertNil(settings.selectedWhisperLanguageCode, "auto-detect leaves Whisper to detect per recording")
+        auto.restore()
+        XCTAssertEqual(settings.selectedWhisperLanguageCode, "en")
+
+        let bengali = try XCTUnwrap(MeetingProviderLanguagePin(languageCode: "bn", model: .whisperLargeTurbo, settings: settings))
+        XCTAssertEqual(settings.selectedWhisperLanguageCode, "bn")
+        bengali.restore()
+        XCTAssertEqual(settings.selectedWhisperLanguageCode, "en")
+
+        XCTAssertNil(MeetingProviderLanguagePin(
+            languageCode: MeetingTranscriptionEngine.autoLanguageCode, model: .parakeetTDT, settings: settings
+        ), "auto-detect is a Whisper-only choice")
+    }
+
     func testWhisperBackendDescriptorAcceptsIndianLanguagesWhileLegacyStaysEnglishOnly() {
         let whisper = MeetingLegacyCompatibilityBackend.whisperDescriptor.supportedLanguageCodes
-        XCTAssertTrue(["en", "bn", "hi"].allSatisfy(whisper.contains))
+        XCTAssertTrue(["en", "bn", "hi", MeetingTranscriptionEngine.autoLanguageCode].allSatisfy(whisper.contains))
         XCTAssertEqual(MeetingLegacyCompatibilityBackend.descriptor.supportedLanguageCodes, ["en"])
     }
 

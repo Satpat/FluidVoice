@@ -1679,6 +1679,19 @@ final class MeetingSessionModelTests: XCTestCase {
         self.assertConfigurationValidationError(.unsupportedLanguage, configuration: configuration)
     }
 
+    func testAutoDetectLanguageIsValidOnlyForWhisper() throws {
+        var configuration = MeetingModelFixture.makeOnlineConfiguration()
+        configuration.languageCode = MeetingTranscriptionEngine.autoLanguageCode
+        self.assertConfigurationValidationError(.unsupportedLanguage, configuration: configuration)
+        configuration.transcriptionEngine = .parakeet
+        self.assertConfigurationValidationError(.unsupportedLanguage, configuration: configuration)
+        configuration.transcriptionEngine = .whisperTurbo
+        XCTAssertNoThrow(try configuration.validate())
+
+        let session = MeetingSession(configuration: configuration, timebase: MeetingModelFixture.makeSession().timebase)
+        XCTAssertNoThrow(try session.validateForPersistence())
+    }
+
     func testSessionKeepsTranscriptionEngineAndOldSessionsDecodeAsParakeet() throws {
         var configuration = MeetingModelFixture.makeOnlineConfiguration()
         configuration.languageCode = "bn"

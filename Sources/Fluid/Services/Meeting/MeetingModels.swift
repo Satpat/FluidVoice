@@ -268,6 +268,9 @@ nonisolated enum MeetingTranscriptionEngine: String, Codable, CaseIterable, Send
     case parakeet
     case whisperTurbo
 
+    /// Whisper-only sentinel: no language is forced, so Whisper detects it for each recording.
+    static let autoLanguageCode = "auto"
+
     var displayName: String {
         switch self {
         case .parakeet: return "Parakeet (fast, English + 24 European languages)"
@@ -283,10 +286,20 @@ nonisolated enum MeetingTranscriptionEngine: String, Codable, CaseIterable, Send
         }
     }
 
+    /// Language to pick after switching to this engine: Whisper defaults to auto-detect so a
+    /// stale English selection cannot force Whisper onto Bengali or Hindi speech.
+    func defaultLanguageCode(keeping current: String) -> String {
+        switch self {
+        case .whisperTurbo: return Self.autoLanguageCode
+        case .parakeet: return self.supportsLanguage(current) ? current : "en"
+        }
+    }
+
     func supportsLanguage(_ code: String) -> Bool {
         switch self {
         case .parakeet: return VoiceEngineLanguageCatalog.parakeetV3LanguageIDs.contains(code)
-        case .whisperTurbo: return VoiceEngineLanguageCatalog.whisperSupportedLanguageCodes.contains(code)
+        case .whisperTurbo:
+            return code == Self.autoLanguageCode || VoiceEngineLanguageCatalog.whisperSupportedLanguageCodes.contains(code)
         }
     }
 }

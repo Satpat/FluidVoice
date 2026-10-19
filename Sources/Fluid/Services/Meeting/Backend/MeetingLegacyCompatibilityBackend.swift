@@ -34,7 +34,7 @@ final class MeetingLegacyCompatibilityBackend: MeetingTranscriptionBackend {
         id: .whisperCompatibility,
         version: "1",
         execution: .local,
-        supportedLanguageCodes: VoiceEngineLanguageCatalog.whisperSupportedLanguageCodes,
+        supportedLanguageCodes: VoiceEngineLanguageCatalog.whisperSupportedLanguageCodes.union([MeetingTranscriptionEngine.autoLanguageCode]),
         supportedTrackKinds: Set(MeetingAudioTrackKind.allCases),
         supportedFinalPrecisions: [.utterance],
         resultContract: .legacyResult,

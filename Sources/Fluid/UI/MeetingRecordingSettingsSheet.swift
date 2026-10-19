@@ -295,24 +295,29 @@ struct MeetingRecordingSettingsSheet: View {
                     .fluidDropdownStyle(fillsWidth: true)
                     .accessibilityLabel("Meeting transcription model")
                     .onChange(of: self.draft.transcriptionEngine) { _, engine in
-                        if !engine.supportsLanguage(self.draft.languageCode) { self.draft.languageCode = "en" }
+                        self.draft.languageCode = engine.defaultLanguageCode(keeping: self.draft.languageCode)
                     }
                 }
                 MeetingAdaptiveSetupRow(
                     title: "Language",
                     detail: self.draft.transcriptionEngine == .parakeet
                         ? "Final transcripts support 25 languages. Live captions are English-only."
-                        : "Pick the one language spoken most. Live captions are English-only."
+                        : "Auto-detect lets Whisper pick the language of each speaker turn. Live captions are English-only."
                 ) {
                     Menu {
                         Picker("Meeting language", selection: self.$draft.languageCode) {
+                            if self.draft.transcriptionEngine == .whisperTurbo {
+                                Text("Auto-detect (recommended)").tag(MeetingTranscriptionEngine.autoLanguageCode)
+                            }
                             ForEach(VoiceEngineLanguageCatalog.allLanguages(availableModels: self.languageModels)) { language in
                                 Text(language.displayName).tag(language.id)
                             }
                         }
                         .pickerStyle(.inline)
                     } label: {
-                        Text(VoiceEngineLanguageCatalog.language(id: self.draft.languageCode, availableModels: self.languageModels)?.displayName ?? "Choose language…")
+                        Text(self.draft.languageCode == MeetingTranscriptionEngine.autoLanguageCode
+                            ? "Auto-detect"
+                            : VoiceEngineLanguageCatalog.language(id: self.draft.languageCode, availableModels: self.languageModels)?.displayName ?? "Choose language…")
                     }
                     .fluidDropdownStyle(fillsWidth: true)
                     .accessibilityLabel("Meeting transcript language")
@@ -670,9 +675,12 @@ struct MeetingRetranscribeSheet: View {
                 ForEach(MeetingTranscriptionEngine.allCases, id: \.self) { Text($0.displayName).tag($0) }
             }
             .onChange(of: self.draft.engine) { _, engine in
-                if !engine.supportsLanguage(self.draft.languageCode) { self.draft.languageCode = "en" }
+                self.draft.languageCode = engine.defaultLanguageCode(keeping: self.draft.languageCode)
             }
             Picker("Language", selection: self.$draft.languageCode) {
+                if self.draft.engine == .whisperTurbo {
+                    Text("Auto-detect (recommended)").tag(MeetingTranscriptionEngine.autoLanguageCode)
+                }
                 ForEach(VoiceEngineLanguageCatalog.allLanguages(availableModels: self.languageModels)) { language in
                     Text(language.displayName).tag(language.id)
                 }
