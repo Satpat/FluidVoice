@@ -370,6 +370,8 @@ struct MeetingResultCanvas: View {
     @State private var isShowingAssignSpeakers = false
     @State private var assignSpeakersFocus: SessionSpeakerID?
     @State private var copied = false
+    @State private var translations: [String: MeetAITranslationRecord] = [:]
+    @ObservedObject private var meetAI = MeetAISessionProcessor.shared
     @State private var copyRevision = 0
     @State private var documentSection: MeetingDocumentSection = .transcript
     @ObservedObject private var summaryActivity = MeetingSummaryActivityCoordinator.shared
@@ -501,7 +503,8 @@ struct MeetingResultCanvas: View {
                                     playback: self.playback,
                                     isLoadingAudio: self.playback.activeSegmentID == row.segment.id && self.playback.isLoading,
                                     onPlayAudio: { self.playback.toggle(sessionID: self.session.id, segmentID: row.segment.id) },
-                                    onEditText: { if self.isQuiescent { self.pendingEditedSegment = row.segment } }
+                                    onEditText: { if self.isQuiescent { self.pendingEditedSegment = row.segment } },
+                                    englishText: MeetAITranslator.english(for: row.segment, in: self.translations)
                                 )
                             }
                         }
@@ -523,6 +526,9 @@ struct MeetingResultCanvas: View {
                 },
                 onCancel: { self.pendingEditedSegment = nil }
             )
+        }
+        .task(id: "\(self.session.id)-\(self.meetAI.busySessions.contains(self.session.id))-\(self.session.updatedAt.timeIntervalSince1970)") {
+            self.translations = (try? await MeetAISidecarStore.shared.translations(for: self.session.id)) ?? [:]
         }
         .onDisappear { self.playback.stop() }
         .onChange(of: self.session.id) { _, _ in self.playback.stop() }
@@ -1064,6 +1070,8 @@ private struct MeetingTranscriptSegmentRow: View {
     let isLoadingAudio: Bool
     let onPlayAudio: () -> Void
     let onEditText: () -> Void
+    /// MeetAI's English translation of an Indian-language segment, shown under the original.
+    var englishText: String? = nil
 
     @Environment(\.theme) private var theme
 
@@ -1102,6 +1110,15 @@ private struct MeetingTranscriptSegmentRow: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .simultaneousGesture(TapGesture(count: 2).onEnded { if self.isQuiescent { self.onEditText() } })
                     .accessibilityAction(named: Text("Edit text")) { if self.isQuiescent { self.onEditText() } }
+                if let englishText = self.englishText {
+                    Text(englishText)
+                        .font(self.theme.typography.body)
+                        .foregroundStyle(self.theme.palette.secondaryText)
+                        .lineSpacing(5)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .accessibilityLabel("English translation: \(englishText)")
+                }
                 if self.segment.isEcho {
                     Text("Probable echo").font(self.theme.typography.caption).foregroundStyle(.secondary)
                 }
@@ -1126,6 +1143,7 @@ private struct MeetingTranscriptSegmentRow: View {
         .accessibilityElement(children: .contain)
         .accessibilityLabel(
             "\(MeetingTranscriptExporter.timestampText(self.segment.start.seconds)), \(self.speakerName), \(self.segment.text)"
+                + (self.englishText.map { ". English translation: \($0)" } ?? "")
         )
     }
 

@@ -2,14 +2,21 @@ import Foundation
 
 /// Single source of truth for rendering a `MeetingSession` transcript as plain text or JSON.
 nonisolated enum MeetingTranscriptExporter {
-    static func text(for session: MeetingSession, includeEchoes: Bool = false) -> String {
+    /// `translations` (MeetAI sidecar) adds an indented English line under translated segments.
+    static func text(
+        for session: MeetingSession,
+        includeEchoes: Bool = false,
+        translations: [String: MeetAITranslationRecord] = [:]
+    ) -> String {
         let speakerNames = Dictionary(uniqueKeysWithValues: session.activeSpeakers.map { ($0.id, $0.displayName) })
         let segments = session.transcriptSegments
             .filter { includeEchoes || !$0.isEcho }
             .sorted { $0.start.seconds < $1.start.seconds }
         return segments.map { segment in
             let speaker = Self.speakerLabel(for: segment, in: session, speakerNames: speakerNames)
-            return "[\(Self.timestampText(segment.start.seconds))] \(speaker): \(segment.text)"
+            let line = "[\(Self.timestampText(segment.start.seconds))] \(speaker): \(segment.text)"
+            guard let english = MeetAITranslator.english(for: segment, in: translations) else { return line }
+            return "\(line)\n    English: \(english)"
         }.joined(separator: "\n\n")
     }
 

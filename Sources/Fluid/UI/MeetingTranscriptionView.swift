@@ -1246,13 +1246,28 @@ struct MeetingTranscriptionView: View {
     }
 
     private func copyTranscript(_ session: MeetingSession, includeEchoes: Bool) {
-        let text = MeetingTranscriptExporter.text(for: session, includeEchoes: includeEchoes)
-        guard !text.isEmpty else { return }
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(text, forType: .string)
+        Task {
+            let translations = (try? await MeetAISidecarStore.shared.translations(for: session.id)) ?? [:]
+            let text = MeetingTranscriptExporter.text(for: session, includeEchoes: includeEchoes, translations: translations)
+            guard !text.isEmpty else { return }
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(text, forType: .string)
+        }
     }
 
     private func exportTranscript(_ session: MeetingSession, format: MeetingTranscriptExportFormat, includeEchoes: Bool) {
+        Task {
+            let translations = (try? await MeetAISidecarStore.shared.translations(for: session.id)) ?? [:]
+            self.runTranscriptExport(session, format: format, includeEchoes: includeEchoes, translations: translations)
+        }
+    }
+
+    private func runTranscriptExport(
+        _ session: MeetingSession,
+        format: MeetingTranscriptExportFormat,
+        includeEchoes: Bool,
+        translations: [String: MeetAITranslationRecord]
+    ) {
         let panel = NSSavePanel()
         panel.nameFieldStringValue = "\(Self.sanitizedExportName(session.title)).\(format.fileExtension)"
         panel.message = "Exported transcripts are outside FluidVoice's retention controls and may be indexed or synced by other apps."
@@ -1261,7 +1276,7 @@ struct MeetingTranscriptionView: View {
         do {
             let data: Data
             switch format {
-            case .text: data = Data(MeetingTranscriptExporter.text(for: session, includeEchoes: includeEchoes).utf8)
+            case .text: data = Data(MeetingTranscriptExporter.text(for: session, includeEchoes: includeEchoes, translations: translations).utf8)
             case .json: data = try MeetingTranscriptExporter.json(for: session)
             }
             try data.write(to: url, options: .atomic)
