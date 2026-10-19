@@ -95,6 +95,10 @@ final class MeetAISessionProcessor: ObservableObject {
         if self.deps.settings.speakerMatching, let updated = await self.applyProfileMatches(session) {
             session = updated
         }
+        // Before naming, titling and summarising, so they read English. Never blocks the later steps.
+        if self.deps.settings.translateIndicSpeech {
+            await self.translateIndicSegments(session)
+        }
         if self.deps.settings.autoName, let updated = await self.applyLLMNames(session) {
             session = updated
         }
@@ -104,6 +108,24 @@ final class MeetAISessionProcessor: ObservableObject {
         if self.deps.settings.autoSummarize {
             await self.generateSummaryIfMissing(session)
         }
+    }
+
+    /// Translates Indian-language segments to English into the sidecar. Failures only log: the
+    /// original transcript is untouched and every later step still runs.
+    func translateIndicSegments(_ session: MeetingSession) async {
+        do {
+            let existing = try await self.deps.sidecars.translations(for: session.id)
+            let updated = try await MeetAITranslator.translate(session: session, existing: existing, llm: self.deps.llm)
+            if updated != existing {
+                try await self.deps.sidecars.saveTranslations(updated, for: session.id)
+            }
+        } catch {
+            DebugLogger.shared.warning("MeetAI translation skipped: \(error.localizedDescription)", source: "MeetAI")
+        }
+    }
+
+    private func translations(for id: MeetingSessionID) async -> [String: MeetAITranslationRecord] {
+        (try? await self.deps.sidecars.translations(for: id)) ?? [:]
     }
 
     func generateSummaryIfMissing(_ session: MeetingSession) async {
@@ -125,7 +147,12 @@ final class MeetAISessionProcessor: ObservableObject {
 
     private func writeSummary(_ session: MeetingSession, style: MeetAISummaryStyle) async {
         do {
-            let record = try await MeetAISummarizer.generate(session: session, style: style, llm: self.deps.llm)
+            let record = try await MeetAISummarizer.generate(
+                session: session,
+                style: style,
+                llm: self.deps.llm,
+                translations: await self.translations(for: session.id)
+            )
             try await self.deps.sidecars.saveSummary(record, for: session.id)
             self.summaryErrors[session.id] = nil
         } catch {
@@ -292,7 +319,7 @@ final class MeetAISessionProcessor: ObservableObject {
         let taken = Set(session.activeSpeakers.filter { !labels.contains($0.displayName) }.map { $0.displayName.lowercased() })
         do {
             let reply = try await self.deps.llm.completeAboutTranscript(
-                transcript: MeetAITranscript.text(for: session),
+                transcript: MeetAITranscript.text(for: session, translations: await self.translations(for: session.id)),
                 turns: [MeetAILLMTurn(role: "user", content: "Return the speaker-name JSON.")],
                 systemPrompt: MeetAISpeakerNamer.systemPrompt(labels: labels.sorted(), localLabel: MeetAITranscript.localUserLabel(in: session))
             )
@@ -316,7 +343,7 @@ final class MeetAISessionProcessor: ObservableObject {
         do {
             guard try await self.ownsTitleElseMarkUser(session) else { return nil }
             guard !MeetAITranscript.turns(for: session).isEmpty else { return nil }
-            let context = String(MeetAITranscript.text(for: session).prefix(4_000))
+            let context = String(MeetAITranscript.text(for: session, translations: await self.translations(for: session.id)).prefix(4_000))
             let raw = try await self.deps.llm.complete(systemPrompt: MeetAITitler.systemPrompt, turns: [MeetAILLMTurn(role: "user", content: context)])
             guard let title = MeetAITitler.clean(raw) else { return nil }
             // The LLM call can take minutes: re-check ownership on the current session on every attempt.

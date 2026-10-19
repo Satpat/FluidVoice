@@ -10,6 +10,7 @@ final class MeetAISettings: ObservableObject {
         static let summaryStyle = "MeetAISummaryStyle"
         static let autoName = "MeetAIAutoName"
         static let speakerMatching = "MeetAISpeakerMatching"
+        static let translateIndicSpeech = "MeetAITranslateIndicSpeech"
     }
 
     let defaults: UserDefaults
@@ -31,6 +32,12 @@ final class MeetAISettings: ObservableObject {
     var speakerMatching: Bool {
         get { self.bool(Key.speakerMatching) }
         set { self.set(newValue, Key.speakerMatching) }
+    }
+
+    /// Translate Bengali, Hindi and other Indian-language segments to English after each meeting.
+    var translateIndicSpeech: Bool {
+        get { self.bool(Key.translateIndicSpeech) }
+        set { self.set(newValue, Key.translateIndicSpeech) }
     }
 
     private func bool(_ key: String) -> Bool {

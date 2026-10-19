@@ -2,8 +2,18 @@ import Foundation
 
 nonisolated enum MeetAITranscript {
     /// Prompt text: upstream's own rendering, so names and echo filtering match the UI.
-    static func text(for session: MeetingSession) -> String {
-        MeetingSummaryInput.transcript(for: session)
+    /// Segments with a current English translation are rendered in English, so names, titles,
+    /// summaries and answers make sense for Bengali/Hindi speech. `hash(for:)` stays on the
+    /// original text.
+    static func text(for session: MeetingSession, translations: [String: MeetAITranslationRecord] = [:]) -> String {
+        guard !translations.isEmpty else { return MeetingSummaryInput.transcript(for: session) }
+        var english = session
+        for index in english.transcriptSegments.indices {
+            if let translated = MeetAITranslator.english(for: english.transcriptSegments[index], in: translations) {
+                english.transcriptSegments[index].text = translated
+            }
+        }
+        return MeetingSummaryInput.transcript(for: english)
     }
 
     /// `Label: text` per non-echo turn, in time order. Excludes the title, so retitling does not

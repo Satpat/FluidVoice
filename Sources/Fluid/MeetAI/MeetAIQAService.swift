@@ -49,8 +49,9 @@ final class MeetAIQAService: ObservableObject {
         }
         turns.append(MeetAILLMTurn(role: "user", content: question))
         do {
+            let translations = (try? await self.sidecars.translations(for: self.sessionID)) ?? [:]
             let answer = try await self.llm.completeAboutTranscript(
-                transcript: MeetAITranscript.text(for: session),
+                transcript: MeetAITranscript.text(for: session, translations: translations),
                 turns: turns,
                 systemPrompt: Self.systemPrompt(localLabel: MeetAITranscript.localUserLabel(in: session))
             ).trimmingCharacters(in: .whitespacesAndNewlines)

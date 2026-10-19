@@ -16,12 +16,17 @@ enum MeetAISummarizer {
         }
     }
 
-    static func generate(session: MeetingSession, style: MeetAISummaryStyle, llm: any MeetAILLMCompleting) async throws -> MeetAISummaryRecord {
+    static func generate(
+        session: MeetingSession,
+        style: MeetAISummaryStyle,
+        llm: any MeetAILLMCompleting,
+        translations: [String: MeetAITranslationRecord] = [:]
+    ) async throws -> MeetAISummaryRecord {
         guard !MeetAITranscript.turns(for: session).isEmpty else {
             throw MeetAILLMError("This meeting has no transcript to summarise.")
         }
         let reply = try await llm.completeAboutTranscript(
-            transcript: MeetAITranscript.text(for: session),
+            transcript: MeetAITranscript.text(for: session, translations: translations),
             turns: [MeetAILLMTurn(role: "user", content: style.userPrompt)],
             systemPrompt: self.systemPrompt(style: style, localLabel: MeetAITranscript.localUserLabel(in: session))
         )
