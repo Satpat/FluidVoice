@@ -166,6 +166,7 @@ struct MeetingTranscriptionView: View {
     @State private var selectedHistorySessionID: MeetingSessionID?
     @State private var pendingDeleteSessionID: MeetingSessionID?
     @State private var pendingDeleteAudioSessionID: MeetingSessionID?
+    @State private var pendingRetranscribeSessionID: MeetingSessionID?
     @State private var draftMeetingAudioRetentionPolicy = SettingsStore.shared.meetingAudioRetentionPolicy
     // Reopen history on each visit; narrow-window selection must not hide it permanently.
     @State private var isMeetingHistoryVisible = true
@@ -254,6 +255,7 @@ struct MeetingTranscriptionView: View {
                             onRevealAudio: self.revealCapturedAudio,
                             onExportAudio: self.exportAudio,
                             onExportTranscript: { self.exportTranscript($0, format: $1, includeEchoes: false) },
+                            onRetranscribeRequest: { self.pendingRetranscribeSessionID = $0 },
                             onDeleteAudioRequest: { self.pendingDeleteAudioSessionID = $0 },
                             onDeleteRequest: { self.pendingDeleteSessionID = $0 },
                             onRename: { self.renameMeetingSession(sessionID: $0, to: $1) },
@@ -383,6 +385,21 @@ struct MeetingTranscriptionView: View {
             }
         } message: {
             Text("The transcript stays; the audio files are deleted from this Mac.")
+        }
+        .alert(
+            "Re-transcribe Meeting?",
+            isPresented: Binding(
+                get: { self.pendingRetranscribeSessionID != nil },
+                set: { if !$0 { self.pendingRetranscribeSessionID = nil } }
+            )
+        ) {
+            Button("Cancel", role: .cancel) { self.pendingRetranscribeSessionID = nil }
+            Button("Re-transcribe") {
+                if let id = self.pendingRetranscribeSessionID { self.retryProcessingSession(id: id) }
+                self.pendingRetranscribeSessionID = nil
+            }
+        } message: {
+            Text("Transcription, speaker labels and summary are regenerated from the saved audio. Edits and speaker corrections in the current transcript are replaced.")
         }
     }
 
@@ -1569,6 +1586,7 @@ private struct MeetingHistoryInspector: View {
     let onRevealAudio: (MeetingSession) -> Void
     let onExportAudio: (MeetingSession) -> Void
     let onExportTranscript: (MeetingSession, MeetingTranscriptExportFormat) -> Void
+    let onRetranscribeRequest: (MeetingSessionID) -> Void
     let onDeleteAudioRequest: (MeetingSessionID) -> Void
     let onDeleteRequest: (MeetingSessionID) -> Void
     let onRename: (MeetingSessionID, String) -> Void
@@ -1779,6 +1797,12 @@ private struct MeetingHistoryInspector: View {
         if session.hasRetryableAudio, session.state == .failed || session.state == .interrupted {
             Button("Retry Transcription", systemImage: "arrow.clockwise") {
                 self.onRetry(session.id)
+            }
+            .disabled(!self.isQuiescent)
+        }
+        if session.hasRetryableAudio, session.state == .completed {
+            Button("Re-transcribe…", systemImage: "arrow.clockwise") {
+                self.onRetranscribeRequest(session.id)
             }
             .disabled(!self.isQuiescent)
         }
