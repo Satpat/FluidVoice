@@ -1664,6 +1664,38 @@ final class MeetingSessionModelTests: XCTestCase {
         }
     }
 
+    func testWhisperEngineAcceptsBengaliAndHindiWhileParakeetRejectsThem() {
+        var configuration = MeetingModelFixture.makeOnlineConfiguration()
+        for code in ["bn", "hi"] {
+            configuration.languageCode = code
+            configuration.transcriptionEngine = nil
+            self.assertConfigurationValidationError(.unsupportedLanguage, configuration: configuration)
+            configuration.transcriptionEngine = .parakeet
+            self.assertConfigurationValidationError(.unsupportedLanguage, configuration: configuration)
+            configuration.transcriptionEngine = .whisperTurbo
+            XCTAssertNoThrow(try configuration.validate())
+        }
+        configuration.languageCode = "xx"
+        self.assertConfigurationValidationError(.unsupportedLanguage, configuration: configuration)
+    }
+
+    func testSessionKeepsTranscriptionEngineAndOldSessionsDecodeAsParakeet() throws {
+        var configuration = MeetingModelFixture.makeOnlineConfiguration()
+        configuration.languageCode = "bn"
+        configuration.transcriptionEngine = .whisperTurbo
+        let session = MeetingSession(configuration: configuration, timebase: MeetingModelFixture.makeSession().timebase)
+        XCTAssertEqual(session.transcriptionEngine, .whisperTurbo)
+        XCTAssertNoThrow(try session.validateForPersistence())
+
+        let decoded = try JSONDecoder().decode(MeetingSession.self, from: JSONEncoder().encode(session))
+        XCTAssertEqual(decoded.transcriptionEngine, .whisperTurbo)
+
+        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(MeetingModelFixture.makeSession())) as? [String: Any])
+        json.removeValue(forKey: "transcriptionEngine")
+        let old = try JSONDecoder().decode(MeetingSession.self, from: JSONSerialization.data(withJSONObject: json))
+        XCTAssertNil(old.transcriptionEngine)
+    }
+
     func testProcessingAttemptLanguageMustMatchSessionLanguage() {
         self.assertSessionValidationError(.unsupportedLanguage) {
             $0.processingAttempts[0].languageCode = "fr"

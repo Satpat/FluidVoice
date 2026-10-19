@@ -261,6 +261,35 @@ nonisolated struct MeetingPlatformProfile: Codable, Equatable, Sendable {
     }
 }
 
+/// Final-transcript engine pinned per meeting. A missing value on stored configurations and
+/// sessions means Parakeet, so older sessions decode unchanged.
+nonisolated enum MeetingTranscriptionEngine: String, Codable, CaseIterable, Sendable {
+    case parakeet
+    case whisperTurbo
+
+    var displayName: String {
+        switch self {
+        case .parakeet: return "Parakeet (fast, English + 24 European languages)"
+        case .whisperTurbo: return "Whisper Large Turbo (99 languages incl. Bengali, Hindi)"
+        }
+    }
+
+    /// The dictation speech model this engine runs; nil for the pinned Parakeet backend.
+    var speechModel: SettingsStore.SpeechModel? {
+        switch self {
+        case .parakeet: return nil
+        case .whisperTurbo: return .whisperLargeTurbo
+        }
+    }
+
+    func supportsLanguage(_ code: String) -> Bool {
+        switch self {
+        case .parakeet: return VoiceEngineLanguageCatalog.parakeetV3LanguageIDs.contains(code)
+        case .whisperTurbo: return VoiceEngineLanguageCatalog.whisperSupportedLanguageCodes.contains(code)
+        }
+    }
+}
+
 nonisolated struct MeetingCaptureConfiguration: Codable, Equatable, Sendable {
     static let defaultChunkDuration: TimeInterval = 60
 
@@ -272,6 +301,7 @@ nonisolated struct MeetingCaptureConfiguration: Codable, Equatable, Sendable {
     var microphone: MeetingMicrophoneIdentity
     var chunkDuration: TimeInterval
     var timestampDefaultTitle: Bool? = nil
+    var transcriptionEngine: MeetingTranscriptionEngine? = nil
 
     init(
         mode: MeetingCaptureMode,
@@ -281,8 +311,10 @@ nonisolated struct MeetingCaptureConfiguration: Codable, Equatable, Sendable {
         application: MeetingApplicationIdentity? = nil,
         microphone: MeetingMicrophoneIdentity,
         chunkDuration: TimeInterval = Self.defaultChunkDuration,
-        timestampDefaultTitle: Bool = false
+        timestampDefaultTitle: Bool = false,
+        transcriptionEngine: MeetingTranscriptionEngine? = nil
     ) {
+        self.transcriptionEngine = transcriptionEngine
         self.mode = mode
         self.title = title
         self.languageCode = languageCode
@@ -294,7 +326,7 @@ nonisolated struct MeetingCaptureConfiguration: Codable, Equatable, Sendable {
     }
 
     func validate() throws {
-        guard VoiceEngineLanguageCatalog.parakeetV3LanguageIDs.contains(self.languageCode) else {
+        guard (self.transcriptionEngine ?? .parakeet).supportsLanguage(self.languageCode) else {
             throw MeetingModelValidationError.unsupportedLanguage
         }
         guard !self.microphone.captureDeviceID.isEmpty else {
@@ -872,6 +904,8 @@ nonisolated struct MeetingSession: Codable, Identifiable, Equatable, Sendable {
     /// Present only for automatically named recordings; cleared when the user renames one.
     var defaultTitleBase: String? = nil
     var languageCode: String
+    /// Nil means Parakeet (sessions written before engine selection existed).
+    var transcriptionEngine: MeetingTranscriptionEngine? = nil
     var mode: MeetingCaptureMode
     var platform: MeetingPlatformProfile?
     var capturedApplication: MeetingApplicationIdentity?
@@ -920,6 +954,7 @@ nonisolated struct MeetingSession: Codable, Identifiable, Equatable, Sendable {
             "\($0) · \(startedAt.formatted(.dateTime.year().month(.abbreviated).day().hour().minute()))"
         } ?? configuration.title
         self.languageCode = configuration.languageCode
+        self.transcriptionEngine = configuration.transcriptionEngine
         self.mode = configuration.mode
         self.platform = configuration.platform
         self.capturedApplication = configuration.application
@@ -1048,7 +1083,7 @@ nonisolated struct MeetingSession: Codable, Identifiable, Equatable, Sendable {
         else {
             throw MeetingModelValidationError.unsupportedSchema(self.schemaVersion)
         }
-        guard VoiceEngineLanguageCatalog.parakeetV3LanguageIDs.contains(self.languageCode) else {
+        guard (self.transcriptionEngine ?? .parakeet).supportsLanguage(self.languageCode) else {
             throw MeetingModelValidationError.unsupportedLanguage
         }
         guard !self.selectedMicrophone.captureDeviceID.isEmpty else {

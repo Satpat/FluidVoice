@@ -347,7 +347,7 @@ enum VoiceEngineLanguageCatalog {
         return languageMap
     }()
 
-    private static let whisperSupportedLanguageCodes: Set<String> = [
+    nonisolated static let whisperSupportedLanguageCodes: Set<String> = [
         "af", "am", "ar", "as", "az", "ba", "be", "bg", "bn", "bo",
         "br", "bs", "ca", "cs", "cy", "da", "de", "el", "en", "es",
         "et", "eu", "fa", "fi", "fo", "fr", "gl", "gu", "ha", "haw",
