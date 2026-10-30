@@ -65,7 +65,7 @@ struct MeetAILLM: MeetAILLMCompleting {
             apiKey: provider.apiKey,
             streaming: false,
             tools: [],
-            temperature: settings.isTemperatureUnsupported(provider.model) ? nil : 0.3,
+            temperature: settings.isTemperatureUnsupported(provider.model, baseURL: provider.baseURL) ? nil : 0.3,
             maxTokens: settings.isReasoningModel(provider.model) ? 32_000 : nil,
             extraParameters: Self.reasoningParameters(model: provider.model, providerID: provider.providerID)
         )

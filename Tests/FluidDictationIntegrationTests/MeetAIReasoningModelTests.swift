@@ -9,7 +9,7 @@ final class MeetAIReasoningModelTests: XCTestCase {
         let reasoning = ["gpt-6.1-sol", "gpt-6", "gpt-6-mini", "openai/gpt-6.1", "azure/gpt-6.1-sol"]
         for model in reasoning {
             XCTAssertTrue(SettingsStore.shared.isReasoningModel(model), "\(model) needs max_completion_tokens")
-            XCTAssertTrue(SettingsStore.shared.isTemperatureUnsupported(model), "\(model) rejects temperature")
+            XCTAssertTrue(SettingsStore.shared.isTemperatureUnsupported(model, baseURL: "https://api.openai.com/v1"), "\(model) rejects temperature")
         }
         let chat = ["gpt-4.1", "gpt-4o", "gpt-4o-mini", "gpt-3.5-turbo", "gpt-4.1-nano"]
         for model in chat {
