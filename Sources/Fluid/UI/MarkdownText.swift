@@ -101,32 +101,36 @@ struct MarkdownText: View {
             : result
     }
 
+    // One Text for the whole answer: SwiftUI selection cannot cross separate Text views, so a
+    // stack of blocks only let one paragraph be selected and copied at a time.
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            ForEach(self.blocks) { block in
-                self.render(block)
-            }
+        self.blocks.enumerated().reduce(Text(verbatim: "")) { text, item in
+            guard item.offset > 0 else { return Self.render(item.element) }
+            let separator = Self.isListItem(item.element) && Self.isListItem(self.blocks[item.offset - 1]) ? "\n" : "\n\n"
+            return Text("\(text)\(separator)\(Self.render(item.element))")
         }
+        .fixedSize(horizontal: false, vertical: true)
     }
 
-    @ViewBuilder
-    private func render(_ block: Block) -> some View {
+    private static func render(_ block: Block) -> Text {
         switch block.kind {
         case .header(let level):
-            Text(block.text)
+            return Text(block.text)
                 .font(Self.headerFont(level))
                 .fontWeight(.semibold)
         case .listItem(let ordinal):
-            HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text(block.isOrdered ? "\(ordinal)." : (block.depth > 1 ? "◦" : "•"))
-                    .foregroundColor(.secondary)
-                Text(block.text)
-            }
-            .padding(.leading, CGFloat(8 + 16 * max(0, block.depth - 1)))
+            let indent = String(repeating: "    ", count: max(0, block.depth - 1))
+            let marker = Text(verbatim: "\(indent)  \(block.isOrdered ? "\(ordinal)." : (block.depth > 1 ? "◦" : "•"))  ")
+                .foregroundColor(.secondary)
+            return Text("\(marker)\(Text(block.text))")
         default:
-            Text(block.text)
-                .padding(.leading, CGFloat(16 * block.depth))
+            return Text("\(String(repeating: "    ", count: block.depth))\(Text(block.text))")
         }
+    }
+
+    private static func isListItem(_ block: Block) -> Bool {
+        if case .listItem = block.kind { return true }
+        return false
     }
 
     private static func headerFont(_ level: Int) -> Font {

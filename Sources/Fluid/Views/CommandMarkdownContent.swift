@@ -250,8 +250,12 @@ struct CommandMarkdownContent: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            ForEach(self.model.blocks) { block in
-                self.blockView(block.content)
+            ForEach(self.sections, id: \.first?.id) { section in
+                if self.prose(section[0].content) == nil {
+                    self.blockView(section[0].content)
+                } else {
+                    self.proseView(section)
+                }
             }
         }
         .font(self.theme.typography.body)
@@ -264,28 +268,56 @@ struct CommandMarkdownContent: View {
         .onDisappear { self.model.stop() }
     }
 
+    /// Runs of prose blocks, each shown as one Text: SwiftUI selection cannot cross separate Text
+    /// views, so per-block views only let one paragraph be selected and copied at a time.
+    private var sections: [[CommandMarkdownBlock]] {
+        var sections: [[CommandMarkdownBlock]] = []
+        for block in self.model.blocks {
+            if self.prose(block.content) != nil, let last = sections.last?.last, self.prose(last.content) != nil {
+                sections[sections.count - 1].append(block)
+            } else {
+                sections.append([block])
+            }
+        }
+        return sections
+    }
+
+    private func proseView(_ blocks: [CommandMarkdownBlock]) -> some View {
+        blocks.indices.reduce(Text(verbatim: "")) { text, index in
+            let block = self.prose(blocks[index].content) ?? Text(verbatim: "")
+            guard index > 0 else { return block }
+            let isList: (CommandMarkdownBlock.Content) -> Bool = { if case .listItem = $0 { return true }; return false }
+            let separator = isList(blocks[index].content) && isList(blocks[index - 1].content) ? "\n" : "\n\n"
+            return Text("\(text)\(separator)\(block)")
+        }
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    /// The block as inline text, or nil for blocks that need their own layout.
+    private func prose(_ block: CommandMarkdownBlock.Content) -> Text? {
+        switch block {
+        case let .paragraph(text):
+            return Text(text)
+        case let .heading(text, level):
+            return Text(text)
+                .font(level == 1 ? self.theme.typography.title : (level == 2 ? self.theme.typography.statement.weight(.semibold) : self.theme.typography.sectionTitle))
+        case let .listItem(text, marker, depth):
+            let bullet = Text(verbatim: "\(String(repeating: "    ", count: depth))\(marker)  ")
+                .foregroundStyle(self.theme.palette.secondaryText)
+            return Text("\(bullet)\(Text(text))")
+        case let .quote(text):
+            return Text("\(Text(verbatim: "│ "))\(Text(text))").foregroundStyle(self.theme.palette.secondaryText)
+        case .code, .table, .divider:
+            return nil
+        }
+    }
+
     @ViewBuilder
     private func blockView(_ block: CommandMarkdownBlock.Content) -> some View {
         switch block {
-        case let .paragraph(text):
-            Text(text).fixedSize(horizontal: false, vertical: true)
-        case let .heading(text, level):
-            Text(text)
-                .font(level == 1 ? self.theme.typography.title : (level == 2 ? self.theme.typography.statement.weight(.semibold) : self.theme.typography.sectionTitle))
-                .padding(.top, 6)
-                .accessibilityAddTraits(.isHeader)
-        case let .listItem(text, marker, depth):
-            HStack(alignment: .firstTextBaseline, spacing: 10) {
-                Text(marker).foregroundStyle(self.theme.palette.secondaryText).frame(minWidth: 14, alignment: .trailing)
-                Text(text).fixedSize(horizontal: false, vertical: true)
-            }
-            .padding(.leading, CGFloat(depth) * 18)
-        case let .quote(text):
-            HStack(alignment: .top, spacing: 12) {
-                Rectangle().fill(self.theme.palette.separator).frame(width: 3)
-                Text(text).foregroundStyle(self.theme.palette.secondaryText).fixedSize(horizontal: false, vertical: true)
-            }
-            .fixedSize(horizontal: false, vertical: true)
+        case .paragraph, .heading, .listItem, .quote:
+            // Shown by proseView.
+            EmptyView()
         case let .code(code, language):
             CommandCodeBlock(code: code, language: language)
         case let .table(headers, rows):
