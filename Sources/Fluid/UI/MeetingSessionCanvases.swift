@@ -447,6 +447,9 @@ struct MeetingResultCanvas: View {
                 if self.documentSection == .summary {
                     MeetingSummaryView(session: self.session, isQuiescent: self.isQuiescent)
                         .id("\(self.session.id)-\(self.session.updatedAt)")
+                    // MeetAI H2: voice confirmations and the earlier MeetAI summary.
+                    MeetAISummaryView(session: self.session)
+                        .id(self.session.id)
                 } else if self.documentSection == .ask {
                     MeetAIQAPanel(session: self.session)
                         .id(self.session.id)

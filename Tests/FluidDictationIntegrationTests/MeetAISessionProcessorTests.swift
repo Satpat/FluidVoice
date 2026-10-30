@@ -130,7 +130,6 @@ final class MeetAISessionProcessorTests: XCTestCase {
         let defaults = UserDefaults(suiteName: "meetai-tests-\(UUID().uuidString)")!
         let settings = MeetAISettings(defaults: defaults)
         settings.autoName = false
-        settings.autoSummarize = false
         let mutator = FakeMutator(session)
         let processor = MeetAISessionProcessor(dependencies: .init(
             sidecars: sidecars,

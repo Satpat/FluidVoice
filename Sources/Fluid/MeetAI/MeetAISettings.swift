@@ -6,8 +6,6 @@ final class MeetAISettings: ObservableObject {
     static let shared = MeetAISettings(defaults: .standard)
 
     enum Key {
-        static let autoSummarize = "MeetAIAutoSummarize"
-        static let summaryStyle = "MeetAISummaryStyle"
         static let autoName = "MeetAIAutoName"
         static let speakerMatching = "MeetAISpeakerMatching"
         static let translateIndicSpeech = "MeetAITranslateIndicSpeech"
@@ -17,11 +15,6 @@ final class MeetAISettings: ObservableObject {
 
     init(defaults: UserDefaults) {
         self.defaults = defaults
-    }
-
-    var autoSummarize: Bool {
-        get { self.bool(Key.autoSummarize) }
-        set { self.set(newValue, Key.autoSummarize) }
     }
 
     var autoName: Bool {

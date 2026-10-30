@@ -40,7 +40,6 @@ final class MeetAINamingTitleTests: XCTestCase {
         let sidecars = MeetAISidecarStore(paths: paths)
         let settings = MeetAISettings(defaults: UserDefaults(suiteName: "meetai-tests-\(UUID().uuidString)")!)
         settings.speakerMatching = false
-        settings.autoSummarize = false
         let mutator = FakeMutator(session)
         let processor = MeetAISessionProcessor(dependencies: .init(
             sidecars: sidecars, profiles: MeetAISpeakerProfileStore(fileURL: paths.profilesFile), settings: settings,

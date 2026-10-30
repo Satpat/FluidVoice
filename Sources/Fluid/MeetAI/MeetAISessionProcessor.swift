@@ -43,7 +43,6 @@ final class MeetAISessionProcessor: ObservableObject {
     static let maximumMutationRetries = 10
 
     @Published private(set) var busySessions: Set<MeetingSessionID> = []
-    @Published var summaryErrors: [MeetingSessionID: String] = [:]
 
     let deps: Dependencies
     private var chains: [MeetingSessionID: (token: UUID, task: Task<Void, Never>)] = [:]
@@ -95,7 +94,7 @@ final class MeetAISessionProcessor: ObservableObject {
         if self.deps.settings.speakerMatching, let updated = await self.applyProfileMatches(session) {
             session = updated
         }
-        // Before naming, titling and summarising, so they read English. Never blocks the later steps.
+        // Before naming and titling, so they read English. Never blocks the later steps.
         if self.deps.settings.translateIndicSpeech {
             await self.translateIndicSegments(session)
         }
@@ -104,9 +103,6 @@ final class MeetAISessionProcessor: ObservableObject {
         }
         if let updated = await self.applyTitle(session) {
             session = updated
-        }
-        if self.deps.settings.autoSummarize {
-            await self.generateSummaryIfMissing(session)
         }
     }
 
@@ -126,39 +122,6 @@ final class MeetAISessionProcessor: ObservableObject {
 
     private func translations(for id: MeetingSessionID) async -> [String: MeetAITranslationRecord] {
         (try? await self.deps.sidecars.translations(for: id)) ?? [:]
-    }
-
-    func generateSummaryIfMissing(_ session: MeetingSession) async {
-        do {
-            guard try await self.deps.sidecars.summary(for: session.id) == nil else { return }
-        } catch {
-            return
-        }
-        await self.writeSummary(session, style: self.deps.settings.summaryStyle)
-    }
-
-    /// Summary tab's Generate/Regenerate. Runs in the session's queue.
-    func regenerateSummary(sessionID: MeetingSessionID, style: MeetAISummaryStyle) async {
-        await self.enqueue(sessionID) { processor in
-            guard let session = await processor.load(sessionID) else { return }
-            await processor.writeSummary(session, style: style)
-        }.value
-    }
-
-    private func writeSummary(_ session: MeetingSession, style: MeetAISummaryStyle) async {
-        do {
-            let record = try await MeetAISummarizer.generate(
-                session: session,
-                style: style,
-                llm: self.deps.llm,
-                translations: await self.translations(for: session.id)
-            )
-            try await self.deps.sidecars.saveSummary(record, for: session.id)
-            self.summaryErrors[session.id] = nil
-        } catch {
-            self.summaryErrors[session.id] = error.localizedDescription
-            DebugLogger.shared.warning("MeetAI summary failed: \(error.localizedDescription)", source: "MeetAI")
-        }
     }
 
     func handleCorrection(sessionID: MeetingSessionID) async {
