@@ -1353,7 +1353,7 @@ struct MeetingTranscriptionView: View {
             let data: Data
             switch format {
             case .text: data = Data(MeetingTranscriptExporter.text(for: session, includeEchoes: includeEchoes, translations: translations).utf8)
-            case .markdown: data = Data(MeetingTranscriptExporter.markdown(for: session, includeEchoes: includeEchoes).utf8)
+            case .markdown: data = Data(MeetingTranscriptExporter.markdown(for: session, includeEchoes: includeEchoes, translations: translations).utf8)
             case .json: data = try MeetingTranscriptExporter.json(for: session)
             }
             try data.write(to: url, options: .atomic)

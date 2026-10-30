@@ -2,7 +2,7 @@ import Foundation
 
 /// Single source of truth for rendering a `MeetingSession` transcript as plain text, Markdown or JSON.
 nonisolated enum MeetingTranscriptExporter {
-    /// `translations` (MeetAI sidecar) adds an indented English line under translated segments.
+    /// `translations` (MeetAI sidecar) adds an English line under translated segments (also in `markdown`).
     static func text(
         for session: MeetingSession,
         includeEchoes: Bool = false,
@@ -20,7 +20,11 @@ nonisolated enum MeetingTranscriptExporter {
         }.joined(separator: "\n\n")
     }
 
-    static func markdown(for session: MeetingSession, includeEchoes: Bool = false) -> String {
+    static func markdown(
+        for session: MeetingSession,
+        includeEchoes: Bool = false,
+        translations: [String: MeetAITranslationRecord] = [:]
+    ) -> String {
         let speakerNames = Dictionary(uniqueKeysWithValues: session.activeSpeakers.map { ($0.id, $0.displayName) })
         let title = Self.markdownHeading(session.title)
         let segments = session.transcriptSegments
@@ -31,6 +35,9 @@ nonisolated enum MeetingTranscriptExporter {
             let speaker = Self.markdownHeading(Self.speakerLabel(for: segment, in: session, speakerNames: speakerNames))
             blocks.append("### [\(Self.timestampText(segment.start.seconds))] \(speaker)")
             blocks.append(Self.escapeMarkdown(segment.text))
+            if let english = MeetAITranslator.english(for: segment, in: translations) {
+                blocks.append("> English: \(Self.markdownHeading(english))")
+            }
         }
         return blocks.joined(separator: "\n\n") + "\n"
     }

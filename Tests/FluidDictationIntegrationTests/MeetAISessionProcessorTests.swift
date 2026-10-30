@@ -524,6 +524,20 @@ final class MeetAITranslatorTests: XCTestCase {
         XCTAssertEqual(text.components(separatedBy: "English:").count - 1, 1)
     }
 
+    func testMarkdownExportAddsEnglishUnderTranslatedSegmentsOnly() {
+        let session = self.session(["Hello there", self.bengali])
+        let bengaliSegment = session.transcriptSegments[1]
+        let records = [bengaliSegment.id.uuidString: MeetAITranslationRecord(
+            english: "I will go to the office tomorrow", sourceHash: MeetAITranslator.hash(self.bengali)
+        )]
+
+        XCTAssertFalse(MeetingTranscriptExporter.markdown(for: session).contains("English"))
+
+        let markdown = MeetingTranscriptExporter.markdown(for: session, translations: records)
+        XCTAssertTrue(markdown.contains("> English: I will go to the office tomorrow"))
+        XCTAssertEqual(markdown.components(separatedBy: "English:").count - 1, 1)
+    }
+
     func testSidecarRoundTripsTranslationsAndRemovesEmpty() async throws {
         let root = try MeetAIFixtures.tempDirectory(self)
         let store = MeetAISidecarStore(paths: MeetAIPaths(supportRoot: root))
