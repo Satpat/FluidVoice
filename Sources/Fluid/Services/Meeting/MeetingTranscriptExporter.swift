@@ -1,6 +1,6 @@
 import Foundation
 
-/// Single source of truth for rendering a `MeetingSession` transcript as plain text or JSON.
+/// Single source of truth for rendering a `MeetingSession` transcript as plain text, Markdown or JSON.
 nonisolated enum MeetingTranscriptExporter {
     /// `translations` (MeetAI sidecar) adds an indented English line under translated segments.
     static func text(
@@ -18,6 +18,37 @@ nonisolated enum MeetingTranscriptExporter {
             guard let english = MeetAITranslator.english(for: segment, in: translations) else { return line }
             return "\(line)\n    English: \(english)"
         }.joined(separator: "\n\n")
+    }
+
+    static func markdown(for session: MeetingSession, includeEchoes: Bool = false) -> String {
+        let speakerNames = Dictionary(uniqueKeysWithValues: session.activeSpeakers.map { ($0.id, $0.displayName) })
+        let title = Self.markdownHeading(session.title)
+        let segments = session.transcriptSegments
+            .filter { includeEchoes || !$0.isEcho }
+            .sorted { $0.start.seconds < $1.start.seconds }
+        var blocks = ["# \(title)", "## Transcript"]
+        for segment in segments {
+            let speaker = Self.markdownHeading(Self.speakerLabel(for: segment, in: session, speakerNames: speakerNames))
+            blocks.append("### [\(Self.timestampText(segment.start.seconds))] \(speaker)")
+            blocks.append(Self.escapeMarkdown(segment.text))
+        }
+        return blocks.joined(separator: "\n\n") + "\n"
+    }
+
+    private static func markdownHeading(_ text: String) -> String {
+        self.escapeMarkdown(text.components(separatedBy: .newlines).joined(separator: " "))
+    }
+
+    private static func escapeMarkdown(_ text: String) -> String {
+        var escaped = ""
+        escaped.reserveCapacity(text.utf8.count)
+        for character in text {
+            if "\\`*_{}[]<>()#+-.!|>".contains(character) {
+                escaped.append("\\")
+            }
+            escaped.append(character)
+        }
+        return escaped
     }
 
     /// Single resolver for the label shown next to a segment, shared by text export and

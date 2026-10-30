@@ -100,8 +100,9 @@ struct BottomWaveformView: View {
     /// Drawn at display rate so the bars move on springs instead of stepping with each level tick.
     @ViewBuilder
     private var barsView: some View {
-        // The panel stays alive while hidden; never tick the simulation unless it is on screen.
-        if !self.contentState.isBottomOverlayPresented || self.isReleaseAnimationActive || self.contentState.isProcessing {
+        // Waiting bars are static. Starting a 50 Hz Canvas before first PCM
+        // needlessly competes with the capture-start continuation on main.
+        if !self.contentState.isBottomOverlayPresented || self.isWaitingForMicrophone || self.isReleaseAnimationActive || self.contentState.isProcessing {
             self.bars(heights: Array(repeating: self.minHeight, count: self.barCount))
         } else {
             TimelineView(.animation(minimumInterval: 1.0 / 50.0)) { timeline in
@@ -140,6 +141,9 @@ struct BottomWaveformView: View {
 /// first and ripples outward, the spectrum tilts the shape, and a slow idle wave keeps the
 /// bars breathing while the user is quiet.
 final class WaveformSimulation {
+    // Explicitly nonisolated: on macOS 15.4+ the synthesized main-actor deinit can abort until the OS runtime has the fix (swiftlang/swift#88036).
+    nonisolated deinit {}
+
     private var heights: [CGFloat] = []
     private var velocities: [CGFloat] = []
     private var energyHistory: [CGFloat] = Array(repeating: 0, count: 32)

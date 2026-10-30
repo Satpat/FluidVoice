@@ -277,6 +277,9 @@ protocol PrivateAIIntegrationProviding: Sendable {
         streamHandler: PrivateAIStreamHandler?
     ) async throws -> PrivateAIIntegrationService.EnhancementResult
     func summarizeMeeting(_ transcript: String, style: String) async throws -> String
+    /// `instructions` replaces the built-in guidance for a custom summary; `thinking` lets the
+    /// model reason before it answers.
+    func summarizeMeeting(_ transcript: String, style: String, instructions: String, thinking: Bool) async throws -> String
     func rewrite(
         _ inputText: String,
         systemPrompt: String,
@@ -288,6 +291,11 @@ protocol PrivateAIIntegrationProviding: Sendable {
 extension PrivateAIIntegrationProviding {
     func summarizeMeeting(_: String, style _: String) async throws -> String {
         throw PrivateAIUnavailableError()
+    }
+
+    /// A provider that predates these arguments still summarizes the built-in types.
+    func summarizeMeeting(_ transcript: String, style: String, instructions _: String, thinking _: Bool) async throws -> String {
+        try await self.summarizeMeeting(transcript, style: style)
     }
 
     func residencySnapshot() async throws -> MeetingResidentModel? {
@@ -392,9 +400,14 @@ enum PrivateAIProviderFeature {
     }
 
     nonisolated static func verificationFingerprint(for modelID: String) -> String {
-        let backendPreference = UserDefaults.standard.string(forKey: SettingsStore.privateAIBackendPreferenceDefaultsKey)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
+        self.verificationFingerprint(
+            for: modelID,
+            backendPreference: UserDefaults.standard.string(forKey: SettingsStore.privateAIBackendPreferenceDefaultsKey)
+        )
+    }
+
+    nonisolated static func verificationFingerprint(for modelID: String, backendPreference: String?) -> String {
+        let backendPreference = backendPreference?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let normalizedBackendPreference: String
         if let backendPreference,
            !backendPreference.isEmpty,

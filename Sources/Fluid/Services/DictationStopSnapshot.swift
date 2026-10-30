@@ -2,6 +2,12 @@ import AppKit
 
 /// One immutable decision for a normal dictation, made before awaiting ASR finalization.
 struct DictationStopSnapshot {
+    /// Command/Edit can reuse the running capture without changing its original field or formatting context.
+    static func captureStartingContext(reusingCapture: Bool, capture: () -> Void) {
+        guard !reusingCapture else { return }
+        capture()
+    }
+
     let target: TypingService.RecordingTargetContext?
     private(set) var appInfo: (name: String, bundleId: String, windowTitle: String)
     let route: DictationProviderRoute

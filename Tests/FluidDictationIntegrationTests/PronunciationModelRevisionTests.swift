@@ -56,6 +56,42 @@ final class PronunciationModelRevisionTests: XCTestCase {
         #endif
     }
 
+    func testFamilySelectionPrefersExactEligibleProfileAndPreservesStorage() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("profiles.json")
+        let store = PronunciationDictionaryStore(fileURL: url)
+        let id = UUID()
+        let target = ParakeetSpeechModelCatalog.mini.pronunciationModelKey
+        let source = Self.profile(entryID: id, key: "parakeet-v2")
+        try await store.upsert(dictionaryEntryID: id, label: source.label, modelKey: source.modelKey, enrollments: source.enrollments)
+        let before = try Data(contentsOf: url)
+        let shared = await store.sharedProfiles(modelKey: target, hiddenSize: source.hiddenSize)
+        XCTAssertEqual(shared.map(\.modelKey), [source.modelKey])
+        XCTAssertEqual(shared.first?.enrollments, source.enrollments)
+        XCTAssertEqual(try Data(contentsOf: url), before, "Family reads never relabel or rewrite enrollment data")
+        let incompatible = await store.sharedProfiles(modelKey: target, hiddenSize: source.hiddenSize + 1)
+        XCTAssertTrue(incompatible.isEmpty)
+        let unrelated = await store.sharedProfiles(modelKey: "whisper", hiddenSize: source.hiddenSize)
+        XCTAssertTrue(unrelated.isEmpty)
+        let exact = Self.profile(entryID: id, key: target)
+        var incomplete = exact
+        incomplete.enrollments = Array(exact.enrollments.prefix(1))
+        XCTAssertEqual(PronunciationDictionaryStore.selectSharedProfiles([source, incomplete], modelKey: target, hiddenSize: 2), [source])
+        for ordered in [[source, exact], [exact, source]] {
+            XCTAssertEqual(PronunciationDictionaryStore.selectSharedProfiles(ordered, modelKey: target, hiddenSize: 2), [exact])
+        }
+        let keys = ParakeetSpeechModelCatalog.descriptors.map(\.pronunciationModelKey)
+        for sourceKey in keys {
+            for targetKey in keys {
+                XCTAssertTrue(ParakeetSpeechModelCatalog.sharesPronunciationFamily(sourceKey, with: targetKey))
+            }
+        }
+        for invalid in ["", "whisper", "parakeet-v4", "fluid-parakeet-mini:sha256:bad"] {
+            XCTAssertFalse(ParakeetSpeechModelCatalog.sharesPronunciationFamily(invalid, with: target))
+        }
+    }
+
     func testOldNegativeFramesAreInactiveAndRemainStoredWithoutAReadMutation() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -94,9 +130,7 @@ final class PronunciationModelRevisionTests: XCTestCase {
         let old = Self.profile(entryID: id, key: descriptor.modelID)
         let current = Self.profile(entryID: id, key: descriptor.pronunciationModelKey)
         let notice = DictionaryPronunciationRevisionPolicy.notice(profiles: [old], descriptor: descriptor, entryIDs: [id])
-        XCTAssertTrue(notice?.contains("FluidVoice") == true)
-        XCTAssertTrue(notice?.contains("need retraining") == true)
-        XCTAssertTrue(notice?.contains("text corrections remain saved") == true)
+        XCTAssertNil(notice, "Parakeet family recordings remain available after a model update")
         XCTAssertNil(DictionaryPronunciationRevisionPolicy.notice(profiles: [old, current], descriptor: descriptor, entryIDs: [id]))
         XCTAssertNil(DictionaryPronunciationRevisionPolicy.notice(profiles: [old], descriptor: descriptor, entryIDs: []))
         XCTAssertNil(DictionaryPronunciationRevisionPolicy.notice(profiles: [old], descriptor: ParakeetSpeechModelCatalog.pico, entryIDs: [id]))
@@ -136,23 +170,22 @@ final class PronunciationModelRevisionTests: XCTestCase {
     #endif
 
     #if arch(arm64)
-    func testLoadedOldCompactRevisionMatchesOnlyItsOwnEnrollmentVectors() {
+    func testExplicitMatchingSharesParakeetFamilyWithoutMixingStoredEnrollments() {
         let descriptor = ParakeetSpeechModelCatalog.mini
         let oldKey = descriptor.modelID + ":sha256:" + String(repeating: "a", count: 64)
         let old = Self.profile(entryID: UUID(), key: oldKey)
         let latest = Self.profile(entryID: UUID(), key: descriptor.pronunciationModelKey)
         XCTAssertTrue(DictionaryPronunciationReferences.make(profiles: [old]).isEmpty)
         let oldReferences = DictionaryPronunciationReferences.make(profiles: [old, latest], compatibleModelKey: oldKey)
-        XCTAssertEqual(oldReferences.count, 3)
-        XCTAssertTrue(oldReferences.allSatisfy { $0.profile.modelKey == oldKey })
+        XCTAssertEqual(oldReferences.count, 6)
+        XCTAssertEqual(Set(oldReferences.map { $0.profile.modelKey }), [oldKey, descriptor.pronunciationModelKey])
         let latestReferences = DictionaryPronunciationReferences.make(profiles: [old, latest], compatibleModelKey: descriptor.pronunciationModelKey)
-        XCTAssertEqual(latestReferences.count, 3)
-        XCTAssertTrue(latestReferences.allSatisfy { $0.profile.modelKey == descriptor.pronunciationModelKey })
+        XCTAssertEqual(latestReferences.count, 6)
         var mixed = old
         mixed.enrollments[0] = latest.enrollments[0]
         XCTAssertTrue(DictionaryPronunciationReferences.make(profiles: [mixed], compatibleModelKey: oldKey).isEmpty)
         let unversioned = Self.profile(entryID: UUID(), key: descriptor.modelID)
-        XCTAssertTrue(DictionaryPronunciationReferences.make(profiles: [unversioned], compatibleModelKey: descriptor.modelID).isEmpty)
+        XCTAssertEqual(DictionaryPronunciationReferences.make(profiles: [unversioned], compatibleModelKey: descriptor.modelID).count, 3)
     }
 
     func testNormalProviderPreparationKeepsCompleteOldWeightsAndTheirActualPronunciationKey() async throws {

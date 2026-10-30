@@ -50,7 +50,7 @@ nonisolated enum ParakeetSpeechModelCatalog {
             }
         }
 
-        /// Encoder vectors are compatible only with the checkpoint that produced them.
+        /// Retain the source checkpoint identity when sharing dictionary profiles across the family.
         /// Legacy v2/v3 keep their established persisted keys byte for byte.
         var pronunciationModelKey: String {
             switch self.variant {
@@ -252,6 +252,25 @@ nonisolated enum ParakeetSpeechModelCatalog {
     )
 
     static let descriptors = [ParakeetSpeechModelCatalog.v2, ParakeetSpeechModelCatalog.v3, ParakeetSpeechModelCatalog.mini, ParakeetSpeechModelCatalog.pico]
+
+    /// Dictionary sharing is separate from the exact identity used to load model files.
+    static func sharesPronunciationFamily(_ source: String, with target: String) -> Bool {
+        self.isParakeetPronunciationKey(source) && self.isParakeetPronunciationKey(target)
+    }
+
+    private static func isParakeetPronunciationKey(_ key: String) -> Bool {
+        if key == "parakeet-v2" || key == "parakeet-v3" { return true }
+        for descriptor in [self.mini, self.pico] {
+            if key == descriptor.modelID { return true }
+            let prefix = descriptor.modelID + ":sha256:"
+            guard key.hasPrefix(prefix) else { continue }
+            let hash = key.dropFirst(prefix.count)
+            return hash.utf8.count == 64 && hash.utf8.allSatisfy {
+                (48...57).contains($0) || (97...102).contains($0)
+            }
+        }
+        return false
+    }
 
     static func descriptor(forModelID modelID: String) -> Descriptor? {
         self.descriptors.first { $0.modelID == modelID }

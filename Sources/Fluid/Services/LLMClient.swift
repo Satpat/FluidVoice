@@ -66,19 +66,38 @@ final nonisolated class LLMClient: @unchecked Sendable {
     /// Default timeout for LLM requests (30 seconds)
     static let defaultTimeoutSeconds: TimeInterval = 30
 
-    /// URLSession configured with appropriate timeouts
-    private let session: URLSession
+    /// Pooled connections idle longer than this can be dead on some network paths: the next
+    /// request stalls ~6.5 s before failing with -1005 (#1016). Requests under ~60 s apart were fine.
+    static let idleConnectionLimit: TimeInterval = 45
+
+    /// URLSession configured with appropriate timeouts; replaced after an idle gap.
+    private var session: URLSession
+    private let idleConnectionLimit: TimeInterval
+    private let sessionLock = NSLock()
+    private var activeRequests = 0
+    private var lastRequestEnd: Date?
+
+    /// Learns which models reject `temperature` so later requests stop sending it.
+    private let temperatureSupport: ModelTemperatureSupport
 
     private init() {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = Self.defaultTimeoutSeconds
         config.timeoutIntervalForResource = Self.defaultTimeoutSeconds * 2 // Allow extra time for resource loading
         self.session = URLSession(configuration: config)
+        self.temperatureSupport = .shared
+        self.idleConnectionLimit = Self.idleConnectionLimit
     }
 
     /// Test seam for deterministic transport fixtures; callers own the session configuration.
-    init(session: URLSession) {
+    init(
+        session: URLSession,
+        temperatureSupport: ModelTemperatureSupport = .shared,
+        idleConnectionLimit: TimeInterval = LLMClient.idleConnectionLimit
+    ) {
         self.session = session
+        self.temperatureSupport = temperatureSupport
+        self.idleConnectionLimit = idleConnectionLimit
     }
 
     // MARK: - Response Types
@@ -90,6 +109,8 @@ final nonisolated class LLMClient: @unchecked Sendable {
         let content: String
         /// Parsed tool calls for agentic modes (nil if none)
         let toolCalls: [ToolCall]
+        /// Non-streaming completion metadata; callers can reject partial text without changing other workflows.
+        var isIncomplete = false
     }
 
     struct ToolCall: @unchecked Sendable {
@@ -125,7 +146,7 @@ final nonisolated class LLMClient: @unchecked Sendable {
         let apiKey: String
         let streaming: Bool
         let tools: [[String: Any]]
-        let temperature: Double?
+        var temperature: Double?
 
         /// Optional token limit (max_tokens or max_completion_tokens depending on model)
         var maxTokens: Int?
@@ -198,6 +219,17 @@ final nonisolated class LLMClient: @unchecked Sendable {
             let response = try await self.executeWithRetry(request: request, config: config)
             self.benchmark(config, "call_return")
             return response
+        } catch let LLMError.httpError(400, body) where config.temperature != nil && body.lowercased().contains("temperature") {
+            // Models keep dropping `temperature` (Opus 4.7+, Haiku 5.5, gpt-5...). The 400 arrives
+            // before any streamed output, so retrying once without it cannot duplicate text.
+            DebugLogger.shared.warning(
+                "LLMClient: \(config.model) rejected temperature; retrying without it",
+                source: "LLMClient"
+            )
+            self.temperatureSupport.record([config.model: false], baseURL: config.baseURL)
+            var retryConfig = config
+            retryConfig.temperature = nil
+            return try await self.call(retryConfig)
         } catch {
             self.benchmark(config, "call_fail")
             throw error
@@ -206,17 +238,19 @@ final nonisolated class LLMClient: @unchecked Sendable {
 
     /// Execute request with retry logic (extracted for timeout wrapper)
     private func executeWithRetry(request: URLRequest, config: Config) async throws -> Response {
+        let session = self.acquireSession()
+        defer { self.releaseSession() }
         var lastError: Error?
         for attempt in 1...config.maxRetries {
             do {
                 self.benchmark(config, "attempt_start attempt=\(attempt)")
                 if config.streaming {
                     if self.isResponsesRequest(request) {
-                        return try await self.processResponsesStreaming(request: request, config: config)
+                        return try await self.processResponsesStreaming(request: request, config: config, session: session)
                     }
-                    return try await self.processStreaming(request: request, config: config)
+                    return try await self.processStreaming(request: request, config: config, session: session)
                 } else {
-                    return try await self.processNonStreaming(request: request, config: config)
+                    return try await self.processNonStreaming(request: request, config: config, session: session)
                 }
             } catch let error as URLError where self.isRetryableError(error) {
                 lastError = LLMError.networkError(error)
@@ -237,6 +271,30 @@ final nonisolated class LLMClient: @unchecked Sendable {
         throw lastError ?? LLMError.networkError(
             NSError(domain: "LLMClient", code: -1, userInfo: [NSLocalizedDescriptionKey: "Request failed after retries"])
         )
+    }
+
+    /// Returns the session for one call, replacing it first if no request ran for longer than
+    /// `idleConnectionLimit`, so a connection the network path dropped is not reused (#1016).
+    private func acquireSession() -> URLSession {
+        self.sessionLock.withLock {
+            if self.activeRequests == 0, let lastEnd = self.lastRequestEnd {
+                let idle = Date().timeIntervalSince(lastEnd)
+                if idle > self.idleConnectionLimit {
+                    DebugLogger.shared.debug("LLMClient: Opening a fresh connection after \(Int(idle)) s idle", source: "LLMClient")
+                    self.session.finishTasksAndInvalidate()
+                    self.session = URLSession(configuration: self.session.configuration)
+                }
+            }
+            self.activeRequests += 1
+            return self.session
+        }
+    }
+
+    private func releaseSession() {
+        self.sessionLock.withLock {
+            self.activeRequests -= 1
+            self.lastRequestEnd = Date()
+        }
     }
 
     // MARK: - Request Building
@@ -496,10 +554,10 @@ final nonisolated class LLMClient: @unchecked Sendable {
 
     // MARK: - Non-Streaming Response
 
-    private func processNonStreaming(request: URLRequest, config: Config) async throws -> Response {
+    private func processNonStreaming(request: URLRequest, config: Config, session: URLSession) async throws -> Response {
         DebugLogger.shared.debug("LLMClient: Making non-streaming request to \(request.url?.absoluteString ?? "unknown")", source: "LLMClient")
 
-        let (data, response) = try await self.session.data(for: request)
+        let (data, response) = try await session.data(for: request)
         self.benchmark(config, "response_data bytes=\(data.count)")
 
         if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
@@ -514,24 +572,33 @@ final nonisolated class LLMClient: @unchecked Sendable {
             throw LLMError.invalidResponse
         }
 
-        let parsed: Response
+        var parsed: Response
         if self.isResponsesRequest(request) {
             parsed = try self.parseResponsesResponse(json)
+            let status = json["status"] as? String
+            let output = json["output"] as? [[String: Any]] ?? []
+            parsed.isIncomplete = (status != nil && status != "completed") ||
+                json["incomplete_details"] is [String: Any] ||
+                output.contains { $0["status"] as? String == "incomplete" }
         } else {
             guard let choices = json["choices"] as? [[String: Any]],
                   let choice = choices.first,
                   let message = choice["message"] as? [String: Any]
             else { throw LLMError.invalidResponse }
             parsed = self.parseMessageResponse(message)
+            // Only truncation counts; compatible servers use varied names for a normal stop.
+            if let reason = choice["finish_reason"] as? String {
+                parsed.isIncomplete = ["length", "max_tokens", "content_filter"].contains(reason.lowercased())
+            }
         }
         self.benchmark(config, "response_decoded")
         return parsed
     }
 
-    private func processResponsesStreaming(request: URLRequest, config: Config) async throws -> Response {
+    private func processResponsesStreaming(request: URLRequest, config: Config, session: URLSession) async throws -> Response {
         DebugLogger.shared.debug("LLMClient: Starting Responses streaming request to \(request.url?.absoluteString ?? "unknown")", source: "LLMClient")
 
-        let (bytes, response) = try await self.session.bytes(for: request)
+        let (bytes, response) = try await session.bytes(for: request)
         self.benchmark(config, "response_headers")
 
         if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
@@ -639,10 +706,10 @@ final nonisolated class LLMClient: @unchecked Sendable {
         return parsed
     }
 
-    private func processStreaming(request: URLRequest, config: Config) async throws -> Response {
+    private func processStreaming(request: URLRequest, config: Config, session: URLSession) async throws -> Response {
         DebugLogger.shared.debug("LLMClient: Starting streaming request to \(request.url?.absoluteString ?? "unknown")", source: "LLMClient")
 
-        let (bytes, response) = try await self.session.bytes(for: request)
+        let (bytes, response) = try await session.bytes(for: request)
         self.benchmark(config, "response_headers")
 
         // Check for HTTP errors

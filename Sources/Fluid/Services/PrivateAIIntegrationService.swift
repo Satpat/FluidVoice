@@ -67,12 +67,17 @@ actor PrivateAIIntegrationService {
     #endif
 
     /// Called only inside the meeting residency scope, after other models are suspended.
-    static func summarizeMeeting(_ transcript: String, style: String) async throws -> String {
+    static func summarizeMeeting(
+        _ transcript: String,
+        style: String,
+        instructions: String = "",
+        thinking: Bool = true
+    ) async throws -> String {
         guard await MeetingModelResidencyCoordinator.shared.phase == .summary else {
             throw MeetingModelResidencyError.staleGrant
         }
         do {
-            let output = try await provider.summarizeMeeting(transcript, style: style)
+            let output = try await provider.summarizeMeeting(transcript, style: style, instructions: instructions, thinking: thinking)
             await Task { await self.provider.unloadCachedRuntime(reason: "meeting summary complete") }.value
             return output
         } catch {
@@ -121,7 +126,10 @@ actor PrivateAIIntegrationService {
     private nonisolated(unsafe) static var installedModelCache: [String: (installed: Bool, checkedAt: TimeInterval)] = [:]
     private nonisolated static let installedModelCacheLifetime: TimeInterval = 2
 
-    nonisolated static func isModelInstalled(_ model: PrivateAIRegisteredModel) -> Bool {
+    nonisolated static func isModelInstalled(_ model: PrivateAIRegisteredModel, useCache: Bool = true) -> Bool {
+        // Event-driven presentation refreshes must see removals even when an
+        // older, concurrent check populated the short-lived runtime cache.
+        if !useCache { return self.provider.isModelInstalled(model) }
         let now = ProcessInfo.processInfo.systemUptime
         self.installedModelCacheLock.lock()
         let cached = self.installedModelCache[model.id]
@@ -137,10 +145,13 @@ actor PrivateAIIntegrationService {
         return installed
     }
 
+    nonisolated static let installedModelsDidChangeNotification = Notification.Name("PrivateAIInstalledModelsDidChange")
+
     nonisolated static func invalidateInstalledModelCache() {
         self.installedModelCacheLock.lock()
         self.installedModelCache.removeAll()
         self.installedModelCacheLock.unlock()
+        NotificationCenter.default.post(name: self.installedModelsDidChangeNotification, object: nil)
     }
 
     nonisolated static func canRemoveInstalledModel(_ model: PrivateAIRegisteredModel) -> Bool {
@@ -247,12 +258,14 @@ actor PrivateAIIntegrationService {
     @MainActor private static var updateAdmissions: [UUID: UUID] = [:]
 
     nonisolated static func commitModelUpdate(_ token: PrivateAIModelUpdateToken) async {
+        defer { self.invalidateInstalledModelCache() }
         guard let admission = await MainActor.run(body: { Self.updateAdmissions.removeValue(forKey: token.id) }) else { return }
         await self.provider.commitModelUpdate(token)
         await MeetingModelResidencyCoordinator.shared.endOperation(admission)
     }
 
     nonisolated static func rollbackModelUpdate(_ token: PrivateAIModelUpdateToken) async {
+        defer { self.invalidateInstalledModelCache() }
         guard let admission = await MainActor.run(body: { Self.updateAdmissions.removeValue(forKey: token.id) }) else { return }
         await self.provider.rollbackModelUpdate(token)
         await MeetingModelResidencyCoordinator.shared.endOperation(admission)

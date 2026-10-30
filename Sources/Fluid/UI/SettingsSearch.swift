@@ -12,6 +12,7 @@ import SwiftUI
 
 enum SettingsSearchTarget: Hashable {
     case general
+    case fluidMeet
     case launchAtStartup
     case showWindowAtLogin
     case dockVisibility
@@ -29,6 +30,7 @@ enum SettingsSearchTarget: Hashable {
     case editModeShortcut
     case cancelRecordingShortcut
     case pasteLastTranscriptionShortcut
+    case meetingRecordingShortcut
     case activationMode
     case holdSpaceToMute
     case copyToClipboard
@@ -74,6 +76,9 @@ enum SettingsSearchTarget: Hashable {
 
     var section: SettingsSection {
         switch self {
+        case .fluidMeet:
+            return .fluidMeet
+
         case .general,
              .launchAtStartup,
              .showWindowAtLogin,
@@ -106,7 +111,7 @@ enum SettingsSearchTarget: Hashable {
 
         case .shortcuts, .globalHotkey, .primaryDictationShortcuts,
              .commandModeShortcut, .editModeShortcut, .cancelRecordingShortcut,
-             .pasteLastTranscriptionShortcut:
+             .pasteLastTranscriptionShortcut, .meetingRecordingShortcut:
             return .shortcuts
 
         case .notifications, .aiEnhancementFailures, .microphoneChanges, .pasteCheck:
@@ -137,6 +142,7 @@ extension SettingsSection {
     var searchTarget: SettingsSearchTarget {
         switch self {
         case .general: return .general
+        case .fluidMeet: return .fluidMeet
         case .dictation: return .dictation
         case .dictationFormatting: return .textFormatting
         case .shortcuts: return .shortcuts
@@ -191,6 +197,7 @@ struct SettingsSearchAvailability {
              .editModeShortcut,
              .cancelRecordingShortcut,
              .pasteLastTranscriptionShortcut,
+             .meetingRecordingShortcut,
              .activationMode,
              .copyToClipboard,
              .textInsertionMode,
@@ -230,6 +237,7 @@ enum SettingsSearchIndex {
     }
 
     private static let entries: [Entry] = [
+        .init(target: .fluidMeet, title: "Enable FluidMeet", terms: ["meetings recording disable turn off enable"]),
         .init(target: .general, title: "General", terms: ["app settings preferences"]),
         .init(
             target: .launchAtStartup,
@@ -288,6 +296,7 @@ enum SettingsSearchIndex {
             title: "Paste Last Transcription",
             terms: ["reinsert recent text hotkey shortcut clipboard"]
         ),
+        .init(target: .meetingRecordingShortcut, title: "Meeting Recording Shortcut", terms: ["FluidMeet start stop toggle recording keyboard hotkey"]),
         .init(target: .activationMode, title: "Activation Mode", terms: ["hold toggle hotkey behavior"]),
         .init(target: .holdSpaceToMute, title: "Hold Space to Mute", terms: ["pause microphone spacebar resume silence"]),
         .init(

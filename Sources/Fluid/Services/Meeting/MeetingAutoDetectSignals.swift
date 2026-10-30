@@ -82,20 +82,25 @@ nonisolated struct AudioProcessActivitySnapshot: Sendable, Equatable {
     var queryState: QueryState
 }
 
-/// Maps HAL process objects to the registered native application that owns them. Bundle IDs from
+/// Maps HAL process objects to the registered application that owns them. Native meeting apps by
+/// default; browsers only when asked, to read whether a browser still holds the microphone. Bundle IDs from
 /// HAL are advisory: helpers frequently report their own (or stale) IDs. Ownership is accepted
 /// only when the live executable is contained in the owning app bundle after symlink resolution.
 /// Ambiguous, missing, or malformed data is deliberately rejected.
 nonisolated enum MeetingAudioProcessResolver {
     // nil means unavailable; an empty result means available with no values.
-    // swiftlint:disable:next discouraged_optional_collection
-    static func activeOwnerInputByPID(snapshot: AudioProcessActivitySnapshot) -> [Int32: Bool]? {
+    // swiftlint:disable discouraged_optional_collection
+    static func activeOwnerInputByPID(
+        snapshot: AudioProcessActivitySnapshot,
+        owning isOwner: (String) -> Bool = MeetingAppRegistry.isNativeMeetingApp(bundleIdentifier:)
+    ) -> [Int32: Bool]? {
+        // swiftlint:enable discouraged_optional_collection
         guard snapshot.queryState == .valid else { return nil }
         var matches: [Int32: Bool] = [:]
         for process in snapshot.processes where process.isInputRunning || process.isOutputRunning {
             guard let path = canonicalPath(process.executablePath), process.processID > 0 else { return nil }
             let candidates = snapshot.owners.filter { owner in
-                guard MeetingAppRegistry.isNativeMeetingApp(bundleIdentifier: owner.bundleIdentifier),
+                guard isOwner(owner.bundleIdentifier),
                       let ownerPath = canonicalPath(owner.bundlePath), ownerPath.hasSuffix(".app")
                 else { return false }
                 guard path.hasPrefix(ownerPath + "/Contents/") else { return false }
@@ -153,6 +158,7 @@ protocol WindowSnapshotProviding: AnyObject {
 nonisolated struct BrowserTabURL: Sendable, Equatable {
     var host: String
     var path: String
+    var callState: MeetingBrowserCallState = .unknown
 }
 
 @MainActor
@@ -645,44 +651,74 @@ final class CoreAudioMicActivitySignal: MicActivitySignalProviding {
 
 @MainActor
 final class CoreAudioProcessActivityProvider: AudioProcessActivityProviding {
+    // LaunchServices may block while reading NSRunningApplication properties.
+    // Keep it away from both MainActor and the audio topology control queue.
+    private nonisolated static let ownerQueue = DispatchQueue(label: "com.fluidvoice.meeting-process-owners", qos: .utility)
+    private let readOwners: @Sendable () -> [MeetingProcessOwner]
+    private let readActivity: @Sendable ([MeetingProcessOwner]) -> AudioProcessActivitySnapshot
+
+    init(
+        readOwners: @escaping @Sendable () -> [MeetingProcessOwner] = CoreAudioProcessActivityProvider.runningOwners,
+        readActivity: @escaping @Sendable ([MeetingProcessOwner]) -> AudioProcessActivitySnapshot = CoreAudioProcessActivityProvider.readAudioActivity
+    ) {
+        self.readOwners = readOwners
+        self.readActivity = readActivity
+    }
+
     func snapshot() async -> AudioProcessActivitySnapshot {
-        let owners = NSWorkspace.shared.runningApplications.compactMap { app -> MeetingProcessOwner? in
+        let readOwners = self.readOwners
+        let owners = await withCheckedContinuation { continuation in
+            Self.ownerQueue.async { continuation.resume(returning: readOwners()) }
+        }
+        guard !Task.isCancelled else {
+            return AudioProcessActivitySnapshot(processes: [], owners: [], queryState: .unknown)
+        }
+        let readActivity = self.readActivity
+        return await AudioTopologyListenerExecution.perform { readActivity(owners) }
+    }
+
+    private nonisolated static func runningOwners() -> [MeetingProcessOwner] {
+        // AppKit documents runningApplications and these properties as thread safe.
+        // The returned value contains no NSRunningApplication instances.
+        NSWorkspace.shared.runningApplications.compactMap { app -> MeetingProcessOwner? in
+            // Browsers are listed too: their microphone tells when a web meeting is over.
             guard let bundle = app.bundleIdentifier,
-                  MeetingAppRegistry.isNativeMeetingApp(bundleIdentifier: bundle),
+                  MeetingAppRegistry.tier(forBundleIdentifier: bundle) != nil,
                   !app.isTerminated, app.processIdentifier > 0,
                   let path = app.bundleURL?.path else { return nil }
             return MeetingProcessOwner(processID: app.processIdentifier, bundleIdentifier: bundle, bundlePath: path)
         }
-        return await AudioTopologyListenerExecution.perform {
-            guard #available(macOS 14.4, *) else {
-                return AudioProcessActivitySnapshot(processes: [], owners: [], queryState: .unknown)
-            }
-            guard let processIDs = Self.processObjectIDs() else {
-                return AudioProcessActivitySnapshot(processes: [], owners: owners, queryState: .unknown)
-            }
-            var queryFailed = false
-            let processes = processIDs.compactMap { processObjectID -> AudioProcessDescriptor? in
-                guard let input = Self.isRunning(processObjectID, selector: kAudioProcessPropertyIsRunningInput),
-                      let output = Self.isRunning(processObjectID, selector: kAudioProcessPropertyIsRunningOutput)
-                else { queryFailed = true; return nil }
-                guard input || output else { return nil }
-                guard let pid = Self.processID(for: processObjectID), pid > 0,
-                      let path = Self.executablePath(for: pid),
-                      Self.processID(for: processObjectID) == pid
-                else { queryFailed = true; return nil }
-                return AudioProcessDescriptor(
-                    processID: pid,
-                    bundleIdentifier: Self.bundleIdentifier(for: processObjectID),
-                    executablePath: path,
-                    isInputRunning: input,
-                    isOutputRunning: output
-                )
-            }
-            // Missing executable identity is not equivalent to silence. Keep the whole sample
-            // unknown so the detector preserves continuity without inventing an inactive edge.
-            let state: AudioProcessActivitySnapshot.QueryState = queryFailed ? .unknown : .valid
-            return AudioProcessActivitySnapshot(processes: processes, owners: owners, queryState: state)
+    }
+
+    private nonisolated static func readAudioActivity(owners: [MeetingProcessOwner]) -> AudioProcessActivitySnapshot {
+        guard #available(macOS 14.4, *) else {
+            return AudioProcessActivitySnapshot(processes: [], owners: [], queryState: .unknown)
         }
+        guard let processIDs = processObjectIDs() else {
+            return AudioProcessActivitySnapshot(processes: [], owners: owners, queryState: .unknown)
+        }
+        var queryFailed = false
+        let processes = processIDs.compactMap { processObjectID -> AudioProcessDescriptor? in
+            guard let input = Self.isRunning(processObjectID, selector: kAudioProcessPropertyIsRunningInput),
+                  let output = Self.isRunning(processObjectID, selector: kAudioProcessPropertyIsRunningOutput)
+            else { queryFailed = true; return nil }
+            guard input || output else { return nil }
+            guard let pid = Self.processID(for: processObjectID), pid > 0,
+                  let path = Self.executablePath(for: pid),
+                  Self.processID(for: processObjectID) == pid
+            else { queryFailed = true; return nil }
+            return AudioProcessDescriptor(
+                processID: pid,
+                bundleIdentifier: Self.bundleIdentifier(for: processObjectID),
+                executablePath: path,
+                isInputRunning: input,
+                isOutputRunning: output
+            )
+        }
+        // Missing executable identity is not equivalent to silence. Keep the whole sample
+        // unknown so the detector preserves continuity without inventing an inactive edge.
+        let state: AudioProcessActivitySnapshot.QueryState = queryFailed ? .unknown : .valid
+        return AudioProcessActivitySnapshot(processes: processes, owners: owners, queryState: state)
     }
 
     private nonisolated static func processID(for objectID: AudioObjectID) -> Int32? {
@@ -961,7 +997,8 @@ final class AXBrowserTabReader: BrowserTabReading {
         let windowElement = window as! AXUIElement
 
         let document = self.stringAttribute(windowElement, attribute: "AXDocument")
-        if let document, let url = self.parse(document) {
+        let documentURL = document.flatMap(self.parse)
+        if let url = documentURL, !MeetingBrowserCallEvidence.supports(url) {
             return .found(url)
         }
 
@@ -970,6 +1007,7 @@ final class AXBrowserTabReader: BrowserTabReading {
         if let found = self.findWebAreaURL(root: windowElement, depth: 0, budget: &budget, timedOut: &timedOut) {
             return .found(found)
         }
+        if let documentURL { return .found(documentURL) }
         return timedOut ? .timedOut : .notFound("document=\(document == nil ? "nil" : "set") webarea=miss")
     }
 
@@ -987,7 +1025,8 @@ final class AXBrowserTabReader: BrowserTabReading {
             guard budget > 0 else { return nil }
             let role = self.stringAttribute(child, attribute: kAXRoleAttribute as String) ?? ""
             if role == "AXWebArea" {
-                if let urlString = self.stringAttribute(child, attribute: "AXURL"), let url = self.parse(urlString) {
+                if let urlString = self.stringAttribute(child, attribute: "AXURL"), var url = self.parse(urlString) {
+                    url.callState = MeetingBrowserCallAXReader.state(webArea: child, url: url)
                     return url
                 }
                 continue

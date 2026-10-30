@@ -4,6 +4,79 @@ import XCTest
 
 @MainActor
 final class UpdatePromptIntegrationTests: XCTestCase {
+    func testRollbackListOnlyOffersOlderInstallableReleases() async throws {
+        let context = try UpdateTestContext()
+        defer { context.cleanup() }
+        for (version, downloadable, expected) in [
+            ("v0.0.1", true, ["v0.0.1"]),
+            ("v99.0.0", true, []),
+            ("v0.0.1", false, []),
+        ] {
+            context.fixture.setReply(version: version, downloadable: downloadable)
+            let options = try await context.updater.fetchRecentReleaseBuildOptions(
+                owner: "altic-dev", repo: "Fluid-oss", olderThanCurrent: true
+            )
+            XCTAssertEqual(options.map(\.version), expected)
+            XCTAssertFalse(context.updater.isUpdateInProgress, "Listing versions never starts installation")
+        }
+    }
+
+    func testSelectedRollbackInstallsOnlyTheExactOlderRelease() async throws {
+        let context = try UpdateTestContext()
+        defer { context.cleanup() }
+        context.fixture.setReply(version: "v0.0.1")
+        var installs = 0
+        context.updater.simulationInstallHandler = { installs += 1 }
+        try await context.updater.installPreviousRelease(version: "v0.0.1")
+        XCTAssertEqual(installs, 1)
+        XCTAssertFalse(context.updater.isUpdateInProgress)
+        XCTAssertNil(context.defaults.object(forKey: SettingsStore.UpdateKeys.betaReleasesEnabled))
+        for selected in ["v0.0.2", "v99.0.0"] {
+            context.fixture.setReply(version: "v99.0.0")
+            do {
+                try await context.updater.installPreviousRelease(version: selected)
+                XCTFail("A missing or newer release must never install")
+            } catch {}
+        }
+        XCTAssertEqual(installs, 1)
+        XCTAssertFalse(context.updater.isUpdateInProgress)
+    }
+
+    func testFailedRollbackReleasesGateForRetry() async throws {
+        let context = try UpdateTestContext()
+        defer { context.cleanup() }
+        context.fixture.setReply(version: "v0.0.1")
+        context.updater.simulationInstallHandler = { throw URLError(.cannotConnectToHost) }
+        do {
+            try await context.updater.installPreviousRelease(version: "v0.0.1")
+            XCTFail("Expected installation failure")
+        } catch {}
+        XCTAssertFalse(context.updater.isUpdateInProgress)
+        var installs = 0
+        context.updater.simulationInstallHandler = { installs += 1 }
+        try await context.updater.installPreviousRelease(version: "v0.0.1")
+        XCTAssertEqual(installs, 1)
+    }
+
+    func testRollbackRejectsConcurrentInstallAndCancelledDiscovery() async throws {
+        let context = try UpdateTestContext()
+        defer { context.cleanup() }
+        context.fixture.setReply(version: "v0.0.1", held: true)
+        var installs = 0
+        context.updater.simulationInstallHandler = { installs += 1 }
+        let pending = Task { try await context.updater.installPreviousRelease(version: "v0.0.1") }
+        try await self.waitFor { context.fixture.requestCount == 1 }
+        do {
+            try await context.updater.installPreviousRelease(version: "v0.0.1")
+            XCTFail("Concurrent operations must be rejected")
+        } catch {}
+        pending.cancel()
+        context.fixture.release()
+        do { try await pending.value; XCTFail("Cancelled request must not install") } catch {}
+        XCTAssertEqual(installs, 0)
+        XCTAssertFalse(context.updater.isUpdateInProgress)
+    }
+
     func testPopupPreferenceBackupDecodesFalseAndMissingLegacyField() throws {
         var payload = SettingsStore.shared.makeBackupPayload()
         payload.showUpdatePopups = false
@@ -13,6 +86,78 @@ final class UpdatePromptIntegrationTests: XCTestCase {
         legacy.removeValue(forKey: "showUpdatePopups")
         let legacyData = try JSONSerialization.data(withJSONObject: legacy)
         XCTAssertNil(try JSONDecoder().decode(SettingsBackupPayload.self, from: legacyData).showUpdatePopups)
+    }
+
+    func testOnlyLaunchesRightAfterLoginCountAsSessionRestore() {
+        let login = Date(timeIntervalSinceReferenceDate: 1000)
+        func restored(_ offset: TimeInterval?) -> Bool {
+            LoginSessionLaunch.startedWithLoginSession(
+                processStart: offset.map(login.addingTimeInterval),
+                consoleLogin: login
+            )
+        }
+        XCTAssertTrue(restored(0))
+        XCTAssertTrue(restored(4), "macOS reopens apps seconds after login")
+        XCTAssertTrue(restored(LoginSessionLaunch.restoreWindow))
+        XCTAssertFalse(restored(LoginSessionLaunch.restoreWindow + 1), "opening the app later is a manual launch")
+        XCTAssertFalse(restored(3600))
+        XCTAssertFalse(restored(-1), "a start before the login record is not trusted")
+        XCTAssertFalse(restored(nil), "an unknown start time shows the window")
+        XCTAssertFalse(
+            LoginSessionLaunch.startedWithLoginSession(processStart: login, consoleLogin: nil),
+            "an unknown login time shows the window"
+        )
+    }
+
+    func testMainWindowIsRecognizedWhateverPageTitleItShows() {
+        func window(title: String, identifier: String?, style: NSWindow.StyleMask = [.titled]) -> NSWindow {
+            let window = NSWindow(contentRect: .zero, styleMask: style, backing: .buffered, defer: true)
+            window.isReleasedWhenClosed = false
+            window.title = title
+            window.identifier = identifier.map { NSUserInterfaceItemIdentifier($0) }
+            return window
+        }
+        let delegate = AppDelegate()
+        XCTAssertTrue(delegate.isMainWindow(window(title: "Stats", identifier: "main-AppWindow-1")))
+        XCTAssertTrue(delegate.isMainWindow(window(title: "FluidVoice", identifier: nil)))
+        XCTAssertFalse(delegate.isMainWindow(window(title: "Stats", identifier: nil)), "another titled window is not the main window")
+        XCTAssertFalse(delegate.isMainWindow(window(title: "Stats", identifier: "main-AppWindow-1", style: [.borderless])))
+        let floating = window(title: "Stats", identifier: "main-AppWindow-1")
+        floating.level = .floating
+        XCTAssertFalse(delegate.isMainWindow(floating))
+    }
+
+    func testMenuBarReusesHiddenMainWindowAndExcludesOtherWindows() {
+        final class CandidateWindow: NSWindow {
+            var minimized = false
+            var keyEligible = true
+            override var isMiniaturized: Bool { self.minimized }
+            override var canBecomeKey: Bool { self.keyEligible }
+        }
+        let window = CandidateWindow(contentRect: .zero, styleMask: [.titled], backing: .buffered, defer: true)
+        window.isReleasedWhenClosed = false
+        window.identifier = NSUserInterfaceItemIdentifier("main-AppWindow-1")
+        window.title = "Stats"
+        window.alphaValue = 0
+        let manager = MenuBarManager()
+        XCTAssertTrue(manager.isFluidMainWindow(window), "a concealed page-titled window must be reused")
+        XCTAssertEqual(window.alphaValue, 0, "recognition must not reveal the window")
+        XCTAssertFalse(window.isVisible, "recognition must not order the window front")
+        window.title = "General"
+        XCTAssertTrue(manager.isFluidMainWindow(window))
+        window.identifier = nil
+        XCTAssertFalse(manager.isFluidMainWindow(window), "unrelated page-titled windows stay excluded")
+        window.title = "FluidVoice"
+        XCTAssertTrue(manager.isFluidMainWindow(window), "legacy hosted windows remain supported")
+        window.level = .floating
+        XCTAssertFalse(manager.isFluidMainWindow(window), "floating captions must stay excluded")
+        window.level = .normal
+        window.minimized = true
+        XCTAssertFalse(manager.isFluidMainWindow(window), "minimized windows keep the existing menu policy")
+        window.minimized = false
+        window.keyEligible = false
+        XCTAssertFalse(manager.isFluidMainWindow(window), "non-key windows stay excluded")
+        window.close()
     }
 
     func testOnlyOlderCopiesAtTheSameLocationAreSuperseded() {
@@ -487,13 +632,19 @@ private final nonisolated class UpdateFixture: @unchecked Sendable {
 
     var requestCount: Int { self.lock.withLock { self.count } }
 
-    func setReply(version: String?, status: Int = 200, held: Bool = false) {
+    func setReply(version: String?, status: Int = 200, held: Bool = false, downloadable: Bool = false) {
         self.lock.withLock {
             self.status = status
             self.held = held
             self.body = version.map {
-                """
-                [{"tag_name":"\($0)","prerelease":false,"assets":[]}]
+                let raw = $0.hasPrefix("v") ? String($0.dropFirst()) : $0
+                let assets = downloadable
+                    ? """
+                    [{"name":"fluid-oss-\(raw).zip","content_type":"application/zip","browser_download_url":"https://example.com/build.zip"}]
+                    """
+                    : "[]"
+                return """
+                [{"tag_name":"\($0)","prerelease":false,"assets":\(assets)}]
                 """
             } ?? "[{\"tag_name\":\"v0.0.1\",\"prerelease\":false,\"assets\":[]}]"
         }
