@@ -264,8 +264,7 @@ struct MeetingAssignSpeakersSheet: View {
                         .disabled(self.isSaving)
                 }
             } else if speaker.isLocalUser || targets.isEmpty {
-                Text(speaker.isLocalUser ? "Your microphone voice is kept separate" :
-                    (speaker.trackKind == .microphone ? "No other microphone speakers" : "No other meeting-audio speakers"))
+                Text(speaker.isLocalUser ? "Your microphone voice is kept separate" : "No other speakers to merge with")
                     .font(self.theme.typography.caption)
                     .foregroundStyle(self.theme.palette.tertiaryText)
             }
@@ -274,8 +273,7 @@ struct MeetingAssignSpeakersSheet: View {
 
     private func mergeTargets(for speaker: MeetingSessionSpeaker) -> [MeetingSessionSpeaker] {
         self.speakers.filter {
-            $0.id != speaker.id && !$0.isLocalUser && $0.trackKind == speaker.trackKind
-                && self.edits.merges[$0.id] == nil
+            $0.id != speaker.id && !$0.isLocalUser && self.edits.merges[$0.id] == nil
         }
     }
 

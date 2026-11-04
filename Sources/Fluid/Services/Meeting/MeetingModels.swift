@@ -1172,7 +1172,7 @@ nonisolated struct MeetingSession: Codable, Identifiable, Equatable, Sendable {
         }
         let source = self.speakers[sourceIndex]
         let target = self.speakers[targetIndex]
-        guard !source.isLocalUser, !target.isLocalUser, source.trackKind == target.trackKind else {
+        guard !source.isLocalUser, !target.isLocalUser else {
             throw MeetingDomainError.cannotMergeSpeakers
         }
         for index in self.transcriptSegments.indices where self.transcriptSegments[index].speakerID == sourceID {

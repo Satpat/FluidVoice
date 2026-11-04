@@ -1701,14 +1701,16 @@ final class MeetingSessionModelTests: XCTestCase {
         }
     }
 
-    func testMergeSpeakersAcrossTracksThrows() throws {
+    /// One person can be heard on both tracks (e.g. a call participant bleeding into the microphone).
+    func testMergeSpeakersAcrossTracksMergesSegments() throws {
         var session = MeetingModelFixture.makeSession()
-        let targetID = UUID()
-        session.speakers.append(MeetingModelFixture.speaker(id: targetID, name: "Mic speaker", trackKind: .microphone))
+        let micID = UUID()
+        session.speakers.append(MeetingModelFixture.speaker(id: micID, name: "Mic speaker", trackKind: .microphone))
 
-        XCTAssertThrowsError(try session.mergeSpeakers(MeetingModelFixture.speakerID, into: targetID)) {
-            XCTAssertEqual($0 as? MeetingDomainError, .cannotMergeSpeakers)
-        }
+        try session.mergeSpeakers(micID, into: MeetingModelFixture.speakerID)
+
+        XCTAssertEqual(session.speakers.first(where: { $0.id == micID })?.mergedIntoSpeakerID, MeetingModelFixture.speakerID)
+        XCTAssertFalse(session.activeSpeakers.contains(where: { $0.id == micID }))
     }
 
     func testMergeLocalUserSpeakerThrows() throws {
