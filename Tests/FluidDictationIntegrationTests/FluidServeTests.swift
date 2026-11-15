@@ -243,6 +243,23 @@ final class FluidServeTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(FluidServeMeetings.entries(root: self.root).first).meeting.durationSeconds, 35)
     }
 
+    /// Summaries saved while the Mac was in another time zone are still the app's current summaries.
+    func testSummariesSavedInAnotherTimeZoneAreStillServed() throws {
+        var session = self.session(title: "Weekly sync")
+        try self.save(session)
+        let elsewhere = try XCTUnwrap(TimeZone(identifier: "Asia/Kathmandu"))
+        try self.saveSummary("Legacy recap.", style: "executive", for: session, transcriptHash: MeetingSummaryInput.fingerprint(MeetingSummaryInput.transcript(for: session, timeZone: elsewhere)))
+        try self.saveSummary("Titleless recap.", style: "detailed", for: session, transcriptHash: MeetingSummaryInput.contentFingerprint(for: session, timeZone: elsewhere), transcriptHashVersion: 2)
+        try self.saveSummary("Current recap.", style: "actions", for: session, transcriptHash: MeetingSummaryInput.zoneIndependentFingerprint(for: session), transcriptHashVersion: 3)
+        let entry = try XCTUnwrap(FluidServeMeetings.entries(root: self.root).first)
+        XCTAssertEqual(FluidServeMeetings.savedSummaries(for: entry).map(\.style), ["actions", "detailed", "executive"])
+
+        session.transcriptSegments[0].text = "Corrected transcript"
+        try self.save(session)
+        let corrected = try XCTUnwrap(FluidServeMeetings.entries(root: self.root).first)
+        XCTAssertEqual(FluidServeMeetings.savedSummaries(for: corrected), [])
+    }
+
     func testVersionedSummariesSurviveTitleChangesButNotTranscriptChanges() throws {
         var session = self.session(title: "Weekly sync")
         try self.save(session)

@@ -204,10 +204,12 @@ nonisolated enum FluidServeMeetings {
             .filter { $0.hasPrefix(prefix) && $0.hasSuffix(".json") }
             .sorted()
         guard !names.isEmpty else { return [] }
-        let legacyHash = self.fingerprint(self.summaryInput(for: entry.meeting))
         var contentSource = entry.meeting
         contentSource.title = ""
-        let contentHash = self.fingerprint(self.summaryInput(for: contentSource))
+        // Same rule as the app: version 3 reads the time in UTC; versions 1 and 2 used the Mac's zone of
+        // the day, so any offset in use at the meeting's start may have produced them.
+        let zones = self.candidateTimeZones(for: entry.meeting.startedAt)
+        let utc = TimeZone(secondsFromGMT: 0) ?? .gmt
         let customPromptHash = self.fingerprint(customPrompt.trimmingCharacters(in: .whitespacesAndNewlines))
         return names.compactMap { name in
             let style = String(name.dropFirst(prefix.count).dropLast(".json".count))
@@ -217,13 +219,14 @@ nonisolated enum FluidServeMeetings {
                   stored.promptHash == (style == "custom" ? customPromptHash : nil),
                   !stored.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             else { return nil }
-            let currentHash: String
+            let matches: Bool
             switch stored.transcriptHashVersion {
-            case nil: currentHash = legacyHash
-            case 2: currentHash = contentHash
+            case nil: matches = zones.contains { self.fingerprint(self.summaryInput(for: entry.meeting, timeZone: $0)) == stored.transcriptHash }
+            case 2: matches = zones.contains { self.fingerprint(self.summaryInput(for: contentSource, timeZone: $0)) == stored.transcriptHash }
+            case 3: matches = self.fingerprint(self.summaryInput(for: contentSource, timeZone: utc)) == stored.transcriptHash
             default: return nil
             }
-            guard stored.transcriptHash == currentHash else { return nil }
+            guard matches else { return nil }
             return SavedSummary(
                 style: style,
                 text: stored.text,
@@ -254,6 +257,20 @@ nonisolated enum FluidServeMeetings {
         Participants: \(meeting.activeSpeakers.map(\.displayName).joined(separator: ", "))
         ----------
         """ + "\n" + meeting.turns.map { "**\(self.speakerLabel(for: $0, in: meeting))**: \($0.text)" }.joined(separator: "\n")
+    }
+
+    /// One zone per UTC offset in use at `date`, this Mac's own first (mirrors `MeetingSummaryInput`).
+    static func candidateTimeZones(for date: Date) -> [TimeZone] {
+        let own = self.systemTimeZone()
+        var offsets: Set<Int> = [own.secondsFromGMT(for: date)]
+        var zones = [own]
+        for identifier in TimeZone.knownTimeZoneIdentifiers {
+            guard let zone = TimeZone(identifier: identifier),
+                  offsets.insert(zone.secondsFromGMT(for: date)).inserted
+            else { continue }
+            zones.append(zone)
+        }
+        return zones
     }
 
     static func fingerprint(_ text: String) -> String {

@@ -22,10 +22,11 @@ nonisolated enum MeetingSummaryKind: String, CaseIterable, Identifiable, Codable
 }
 
 nonisolated enum MeetingSummaryInput {
-    static func transcript(for session: MeetingSession) -> String {
+    static func transcript(for session: MeetingSession, timeZone: TimeZone = .current) -> String {
         let names = Dictionary(uniqueKeysWithValues: session.activeSpeakers.map { ($0.id, $0.displayName) })
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = timeZone
         formatter.dateStyle = .long
         formatter.timeStyle = .none
         let date = formatter.string(from: session.startedAt)
@@ -54,12 +55,34 @@ nonisolated enum MeetingSummaryInput {
         SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
-    static func contentFingerprint(for session: MeetingSession) -> String {
+    static func contentFingerprint(for session: MeetingSession, timeZone: TimeZone = .current) -> String {
         // Keep the title in the model's input, but exclude it from summary validity.
         var source = session
         source.title = ""
-        return self.fingerprint(self.transcript(for: source))
+        return self.fingerprint(self.transcript(for: source, timeZone: timeZone))
     }
+
+    /// Version 3: no title, and the meeting time read in UTC, so neither a rename nor the Mac
+    /// changing time zone (travel, a manual change) hides a saved summary. The model still sees local time.
+    static func zoneIndependentFingerprint(for session: MeetingSession) -> String {
+        self.contentFingerprint(for: session, timeZone: self.utc)
+    }
+
+    /// One zone per UTC offset in use at `date`, the Mac's own first. Versions 1 and 2 fingerprinted the
+    /// meeting time in whatever zone the Mac was in, so recognising them means trying each offset.
+    static func candidateTimeZones(for date: Date) -> [TimeZone] {
+        var offsets: Set<Int> = [TimeZone.current.secondsFromGMT(for: date)]
+        var zones = [TimeZone.current]
+        for identifier in TimeZone.knownTimeZoneIdentifiers {
+            guard let zone = TimeZone(identifier: identifier),
+                  offsets.insert(zone.secondsFromGMT(for: date)).inserted
+            else { continue }
+            zones.append(zone)
+        }
+        return zones
+    }
+
+    private static let utc = TimeZone(secondsFromGMT: 0) ?? .gmt
 }
 
 /// Keeps summary admission separate from ordinary processing, including cloud calls that
@@ -170,7 +193,7 @@ final class MeetingSummaryController: ObservableObject {
     }
 
     nonisolated struct SavedSummary: Codable {
-        static let currentTranscriptHashVersion = 2
+        static let currentTranscriptHashVersion = 3
 
         var transcriptHash: String
         let modelID: String
@@ -184,7 +207,8 @@ final class MeetingSummaryController: ObservableObject {
         var promptHash: String?
         /// Display name of an on-device model, whose ID is not meant to be read.
         var modelName: String?
-        /// Version 2 excludes the meeting title. A missing version uses the original full input.
+        /// Version 3 excludes the title and reads the time in UTC; version 2 excludes the title; a missing
+        /// version uses the original full input. Versions 1 and 2 used the Mac's time zone of the day.
         var transcriptHashVersion: Int?
 
         var provenance: String {
@@ -204,29 +228,36 @@ final class MeetingSummaryController: ObservableObject {
         }
 
         func isCurrent(session: MeetingSession, promptHash: String?) -> Bool {
-            let hash: String
+            self.providerID != nil && self.promptHash == promptHash && self.matchesTranscript(of: session)
+        }
+
+        func matchesTranscript(of session: MeetingSession) -> Bool {
             switch self.transcriptHashVersion {
             case nil:
-                hash = MeetingSummaryInput.fingerprint(MeetingSummaryInput.transcript(for: session))
+                return MeetingSummaryInput.candidateTimeZones(for: session.startedAt).contains {
+                    MeetingSummaryInput.fingerprint(MeetingSummaryInput.transcript(for: session, timeZone: $0)) == self.transcriptHash
+                }
+            case 2:
+                return MeetingSummaryInput.candidateTimeZones(for: session.startedAt).contains {
+                    MeetingSummaryInput.contentFingerprint(for: session, timeZone: $0) == self.transcriptHash
+                }
             case Self.currentTranscriptHashVersion:
-                hash = MeetingSummaryInput.contentFingerprint(for: session)
+                return MeetingSummaryInput.zoneIndependentFingerprint(for: session) == self.transcriptHash
             default:
                 return false
             }
-            return self.isCurrent(transcriptHash: hash, promptHash: promptHash)
         }
 
         /// Upgrade before saving a rename, while the original title can still verify old files.
         /// Each upgrade remains valid even if a later write (including the rename) fails.
         static func migrateLegacySummaries(in directory: URL, for session: MeetingSession) throws {
-            let legacyHash = MeetingSummaryInput.fingerprint(MeetingSummaryInput.transcript(for: session))
-            let contentHash = MeetingSummaryInput.contentFingerprint(for: session)
+            let contentHash = MeetingSummaryInput.zoneIndependentFingerprint(for: session)
             for kind in MeetingSummaryKind.allCases {
                 let url = directory.appendingPathComponent("manual-summary-\(kind.rawValue).json")
                 guard var saved = try? JSONDecoder().decode(Self.self, from: Data(contentsOf: url)),
-                      saved.transcriptHashVersion == nil,
+                      saved.transcriptHashVersion != Self.currentTranscriptHashVersion,
                       saved.providerID != nil,
-                      saved.transcriptHash == legacyHash
+                      saved.matchesTranscript(of: session)
                 else { continue }
                 saved.transcriptHash = contentHash
                 saved.transcriptHashVersion = Self.currentTranscriptHashVersion
@@ -331,7 +362,7 @@ final class MeetingSummaryController: ObservableObject {
             do {
                 try await MeetingSummaryActivityCoordinator.shared.withRemoteSummary {
                     let (transcript, contentHash) = await Task.detached(priority: .utility) {
-                        (MeetingSummaryInput.transcript(for: session), MeetingSummaryInput.contentFingerprint(for: session))
+                        (MeetingSummaryInput.transcript(for: session), MeetingSummaryInput.zoneIndependentFingerprint(for: session))
                     }.value
                     guard session.transcriptSegments.contains(where: { !$0.isEcho && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) else {
                         throw MeetingPostProcessingError.invalidOutput
@@ -397,7 +428,7 @@ final class MeetingSummaryController: ObservableObject {
             do {
                 try await MeetingSummaryActivityCoordinator.shared.withSummary(activity: asr) {
                     let (transcript, contentHash) = await Task.detached(priority: .utility) {
-                        (MeetingSummaryInput.transcript(for: session), MeetingSummaryInput.contentFingerprint(for: session))
+                        (MeetingSummaryInput.transcript(for: session), MeetingSummaryInput.zoneIndependentFingerprint(for: session))
                     }.value
                     guard transcript.utf8.count <= MeetingSummaryOnDevice.maximumTranscriptBytes else {
                         throw MeetingPostProcessingError.inputTooLarge

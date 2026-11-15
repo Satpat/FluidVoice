@@ -69,6 +69,42 @@ final class MeetingSummaryInputTests: XCTestCase {
         }
     }
 
+    /// The fingerprint used to include the meeting time in the Mac's time zone, so a Mac that moved
+    /// from Adelaide to Melbourne hid every saved summary. Summaries saved that way must still count,
+    /// and new ones must not depend on the time zone at all.
+    func testSummarySavedInAnotherTimeZoneIsStillCurrentAndNewOnesIgnoreTheZone() throws {
+        let session = self.session(origin: 0, segmentStart: 0, segmentEnd: 1, gapStart: 2, gapEnd: 3)
+        // +5:45 differs from any Mac running this test, so its time line always differs too.
+        let elsewhere = try XCTUnwrap(TimeZone(identifier: "Asia/Kathmandu"))
+        func saved(_ hash: String, version: Int?) -> MeetingSummaryController.SavedSummary {
+            MeetingSummaryController.SavedSummary(transcriptHash: hash, modelID: "model", text: "Recap.", providerID: "openai", transcriptHashVersion: version)
+        }
+        let legacy = saved(MeetingSummaryInput.fingerprint(MeetingSummaryInput.transcript(for: session, timeZone: elsewhere)), version: nil)
+        let titleless = saved(MeetingSummaryInput.contentFingerprint(for: session, timeZone: elsewhere), version: 2)
+        let current = saved(MeetingSummaryInput.zoneIndependentFingerprint(for: session), version: 3)
+
+        XCTAssertNotEqual(
+            MeetingSummaryInput.fingerprint(MeetingSummaryInput.transcript(for: session)),
+            legacy.transcriptHash,
+            "The time line differs between the zones; that is the difference under test"
+        )
+        XCTAssertEqual(MeetingSummaryController.SavedSummary.currentTranscriptHashVersion, 3)
+        XCTAssertEqual(
+            MeetingSummaryInput.zoneIndependentFingerprint(for: session),
+            MeetingSummaryInput.contentFingerprint(for: session, timeZone: try XCTUnwrap(TimeZone(secondsFromGMT: 0))),
+            "Version 3 reads the meeting time in UTC whatever zone the Mac is in (fv-serve relies on this)"
+        )
+        for summary in [legacy, titleless, current] {
+            XCTAssertTrue(summary.isCurrent(session: session, promptHash: nil), "version \(String(describing: summary.transcriptHashVersion))")
+        }
+
+        var edited = session
+        edited.transcriptSegments[0].text = "Corrected transcript"
+        for summary in [legacy, titleless, current] {
+            XCTAssertFalse(summary.isCurrent(session: edited, promptHash: nil), "An edited transcript still hides the summary")
+        }
+    }
+
     @MainActor
     func testSummaryCannotRunOutsideExclusiveModelScope() async {
         do {
