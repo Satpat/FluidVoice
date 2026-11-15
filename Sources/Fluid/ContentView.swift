@@ -37,7 +37,7 @@ nonisolated enum AIProcessingError: LocalizedError {
         }
     }
 
-    /// Configuration errors the user can fix in AI Providers.
+    /// Configuration errors the user can fix in AI Settings.
     var isConfigurationError: Bool {
         switch self {
         case .noVerifiedProvider, .missingAPIKey, .missingModel:
@@ -55,7 +55,7 @@ nonisolated enum DictationAIFailurePresentationPolicy {
 
     static func notificationMessage(for error: Error) -> String {
         if let aiError = error as? AIProcessingError, aiError.isConfigurationError {
-            return "\(aiError.localizedDescription). Open AI Providers to configure a provider."
+            return "\(aiError.localizedDescription). Open AI Settings to configure a provider."
         }
         return error.localizedDescription
     }
@@ -337,6 +337,7 @@ struct ContentView: View {
     @State private var showsReleaseHighlights = false
     @State private var recordingAppInfo: (name: String, bundleId: String, windowTitle: String)? = nil
     @State private var recordingPrecedingText: String = ""
+    @State private var dictationContextCapture: DictationContextCapture?
     @State private var recordingFocusTarget: TypingService.CapturedFocusTarget? = nil
 
     // Command Mode State
@@ -510,6 +511,9 @@ struct ContentView: View {
             .onReceive(NotificationCenter.default.publisher(for: .openCustomDictionaryFromVoiceEngine)) { _ in
                 self.navigateToApp(.customDictionary)
             }
+            .onReceive(NotificationCenter.default.publisher(for: .openScreenContextSettings)) { _ in
+                self.openSettings(.experimental)
+            }
             .onReceive(NotificationCenter.default.publisher(for: .fluidMeetEnabledChanged)) { _ in
                 if self.settings.fluidMeetEnabled, self.appServices.isUIReady {
                     self.menuBarManager.configure(meetingCoordinator: self.appServices.meetingSessionCoordinator)
@@ -583,9 +587,16 @@ struct ContentView: View {
             .onChange(of: self.audioObserver.inputAvailabilityTick) { _, _ in
                 self.refreshInputDevices()
             }
+            .onChange(of: self.settings.dictationScreenContextEnabled) { _, enabled in
+                if !enabled { self.cancelDictationContextCapture() }
+            }
+            .onChange(of: self.settings.editModeScreenContextRevision) { _, _ in
+                self.rewriteModeService.cancelOutdatedWindowCapture()
+            }
             .onDisappear {
                 Task { await self.asr.stopWithoutTranscription() }
                 self.cancelPrewarmDictationIfNeeded()
+                self.cancelDictationContextCapture()
                 // Note: Overlay lifecycle is now managed by MenuBarManager
                 // Note: NotchContentState handlers capture self (a struct value copy) and are
                 // intentionally kept alive so the overlay remains fully functional when the
@@ -696,6 +707,7 @@ struct ContentView: View {
                     Task { await self.asr.stopWithoutTranscription() }
                 }
                 self.cancelPrewarmDictationIfNeeded()
+                self.cancelDictationContextCapture()
                 self.clearActiveRecordingMode()
                 self.menuBarManager.setOverlayMode(.dictation)
             }
@@ -716,6 +728,7 @@ struct ContentView: View {
                     Task { await self.asr.stopWithoutTranscription() }
                 }
                 self.cancelPrewarmDictationIfNeeded()
+                self.cancelDictationContextCapture()
                 self.clearActiveRecordingMode()
                 self.menuBarManager.setOverlayMode(.dictation)
             }
@@ -736,6 +749,7 @@ struct ContentView: View {
                     Task { await self.asr.stopWithoutTranscription() }
                 }
                 self.cancelPrewarmDictationIfNeeded()
+                self.cancelDictationContextCapture()
                 self.clearActiveRecordingMode()
                 self.rewriteModeService.clearState()
                 self.menuBarManager.setOverlayMode(.dictation)
@@ -923,14 +937,14 @@ struct ContentView: View {
     }
 
     private func handleShortcutCaptureEvent(_ event: NSEvent) -> NSEvent? {
-        let eventModifiers = event.modifierFlags.intersection([.function, .command, .option, .control, .shift])
+        let eventModifiers = event.modifierFlags.intersection(HotkeyShortcut.shortcutModifierMask)
         let isRecordingAnyShortcut = self.isRecordingAnyShortcutCapture
         let recordingTarget = self.activeShortcutRecordingTarget
 
         if event.type == .keyDown {
             return self.handleShortcutKeyDownEvent(event, modifiers: eventModifiers, isRecordingAnyShortcut: isRecordingAnyShortcut, recordingTarget: recordingTarget)
         } else if event.type == .flagsChanged {
-            return self.handleShortcutFlagsChangedEvent(event, modifiers: eventModifiers, isRecordingAnyShortcut: isRecordingAnyShortcut, recordingTarget: recordingTarget)
+            return self.handleShortcutFlagsChangedEvent(event, modifiers: eventModifiers.intersection(HotkeyShortcut.relevantModifierMask), isRecordingAnyShortcut: isRecordingAnyShortcut, recordingTarget: recordingTarget)
         } else if event.type == .leftMouseDown || event.type == .rightMouseDown || event.type == .otherMouseDown {
             return self.handleShortcutMouseDownEvent(event, modifiers: eventModifiers, isRecordingAnyShortcut: isRecordingAnyShortcut, recordingTarget: recordingTarget)
         }
@@ -1150,7 +1164,7 @@ struct ContentView: View {
             switch old {
             case .commandMode:
                 // Close expanded command output notch if visible
-                if NotchOverlayManager.shared.isCommandOutputExpanded {
+                if NotchOverlayManager.shared.hasCommandOutputToDismiss {
                     DebugLogger.shared.debug("Closing expanded command notch on mode transition", source: "ContentView")
                     NotchOverlayManager.shared.hideExpandedCommandOutput()
                 }
@@ -1200,6 +1214,10 @@ struct ContentView: View {
             self.navigateToApp(.meetingTranscription)
         case .preferences:
             self.openSettings(.general)
+        case .aiSettings:
+            self.navigateToApp(.aiEnhancements)
+        case .cleanupStyles:
+            self.navigateToApp(.cleanupStyles)
         }
     }
 
@@ -1257,6 +1275,9 @@ struct ContentView: View {
     }
 
     func shortcutConflictMessage(for shortcut: HotkeyShortcut, target: ShortcutRecordingTarget) -> String? {
+        if target == .cancel, shortcut.isModifierOnlyShortcut {
+            return "Modifier-only keys can't cancel recording. Use Esc or include a regular key."
+        }
         if target == .meeting, !shortcut.isMeetingRecordingShortcut {
             return "Use a keyboard key with a modifier for meeting recording"
         }
@@ -1272,7 +1293,7 @@ struct ContentView: View {
 
         let replacingPrimaryIndex = target.primaryDictationReplacementIndex
         for (index, configuredShortcut) in self.primaryDictationShortcuts.enumerated() where replacingPrimaryIndex != index {
-            if configuredShortcut == shortcut {
+            if configuredShortcut.hasSameTrigger(as: shortcut) {
                 return "Duplicate with Primary Dictation Shortcut"
             }
             if shortcut.conflictsWith(configuredShortcut, includingKeyboardModifierPrefixes: target == .meeting) {
@@ -1299,7 +1320,7 @@ struct ContentView: View {
         ]
 
         for (otherTarget, configuredShortcut) in configuredShortcuts where otherTarget != target {
-            if configuredShortcut == shortcut {
+            if configuredShortcut.hasSameTrigger(as: shortcut) {
                 return "Duplicate with \(otherTarget.title)"
             }
             if shortcut.conflictsWith(configuredShortcut, includingKeyboardModifierPrefixes: target == .meeting || otherTarget == .meeting) {
@@ -1308,7 +1329,7 @@ struct ContentView: View {
         }
         for (otherTarget, configuredShortcut) in optionalConfiguredShortcuts where otherTarget != target {
             guard let configuredShortcut else { continue }
-            if configuredShortcut == shortcut {
+            if configuredShortcut.hasSameTrigger(as: shortcut) {
                 return "Duplicate with \(otherTarget.title)"
             }
             if shortcut.conflictsWith(configuredShortcut, includingKeyboardModifierPrefixes: target == .meeting || otherTarget == .meeting) {
@@ -1323,7 +1344,7 @@ struct ContentView: View {
             else {
                 continue
             }
-            if assignment.shortcut == shortcut {
+            if assignment.shortcut.hasSameTrigger(as: shortcut) {
                 return "Duplicate with Prompt Shortcut"
             }
             if shortcut.conflictsWith(assignment.shortcut, includingKeyboardModifierPrefixes: target == .meeting) {
@@ -1521,7 +1542,7 @@ struct ContentView: View {
 
             Section {
                 self.sidebarNavigationLink(.voiceEngine, title: "Voice Engine", systemImage: "waveform")
-                self.sidebarNavigationLink(.aiEnhancements, title: "AI Providers", systemImage: "cpu")
+                self.sidebarNavigationLink(.aiEnhancements, title: "AI Settings", systemImage: "cpu")
                 self.sidebarNavigationLink(.cleanupStyles, title: "Cleanup Styles", systemImage: "wand.and.stars")
                 self.sidebarNavigationLink(.customDictionary, title: "Custom Dictionary", systemImage: "text.book.closed.fill")
             } header: {
@@ -1717,7 +1738,8 @@ struct ContentView: View {
                 accessibilityEnabled: self.accessibilityEnabled,
                 savesTranscriptionHistory: SettingsStore.shared.saveTranscriptionHistory,
                 savesAudioWithTranscriptionHistory: SettingsStore.shared.saveAudioWithTranscriptionHistory,
-                overlayAtBottom: self.settings.overlayPosition == .bottom
+                overlayAtBottom: self.settings.overlayPosition == .bottom,
+                privateAIAvailable: PrivateAIProviderFeature.shared.isAvailable
             )
         )
     }
@@ -2519,6 +2541,52 @@ struct ContentView: View {
         self.captureRecordingFormattingContextIfNeeded()
     }
 
+    /// Starts reading the text around the cursor when the dictation model was
+    /// trained to use it. Every other model skips this entirely.
+    private func startDictationContextCaptureIfNeeded(for slot: SettingsStore.DictationShortcutSlot) {
+        self.cancelDictationContextCapture()
+        let route = DictationProviderRoute.resolve(
+            settings: .shared,
+            dictationSlot: slot,
+            appBundleID: self.recordingAppInfo?.bundleId
+        )
+        guard self.settings.dictationScreenContextEnabled, route.usesPrivateAI,
+              PrivateAIIntegrationService.readsDictationContext(model: route.model),
+              let target = NotchContentState.shared.recordingTargetContext,
+              target.pid != ProcessInfo.processInfo.processIdentifier
+        else { return }
+        self.dictationContextCapture = DictationContextCapture.start(
+            target: target,
+            textBeforeCursor: self.settings.needsDictationFormattingContext ? self.recordingPrecedingText : nil,
+            settings: .shared
+        )
+    }
+
+    private func cancelDictationContextCapture() {
+        self.dictationContextCapture?.cancel()
+        self.dictationContextCapture = nil
+    }
+
+    private func attachDictationContext(_ capture: DictationContextCapture, to stopSnapshot: inout DictationStopSnapshot?) async {
+        // Context must belong to the exact destination field and a supported local model.
+        guard self.settings.dictationScreenContextEnabled,
+              let snapshot = stopSnapshot, snapshot.usesAI, snapshot.route.usesPrivateAI,
+              PrivateAIIntegrationService.readsDictationContext(model: snapshot.route.model),
+              let target = snapshot.target, capture.matches(target)
+        else {
+            capture.cancel()
+            return
+        }
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        let context = await capture.result(timeout: .milliseconds(300))
+        guard self.settings.dictationScreenContextEnabled else { return }
+        stopSnapshot?.typingContext = context
+        self.appBench(
+            "dictation_context waitMs=\(Int(((ProcessInfo.processInfo.systemUptime - startedAt) * 1000).rounded())) "
+                + "beforeCursorChars=\(context?.textBeforeCursor?.count ?? 0) screenLines=\(context?.screenText?.count ?? 0)"
+        )
+    }
+
     private func captureDictationStopSnapshot(slot: SettingsStore.DictationShortcutSlot) -> DictationStopSnapshot {
         let current = TypingService.captureRecordingTargetContext()
         let ownPID = ProcessInfo.processInfo.processIdentifier
@@ -2806,6 +2874,13 @@ struct ContentView: View {
                 self.logDictationPromptTrace("Private AI Provider task", value: "dictationEnhancement")
                 self.logDictationPromptTrace("Input transcription (Q)", value: inputText)
                 self.logDictationPromptTrace("Selected context text", value: "<none (dictation mode)>")
+                if let typingContext = stopSnapshot?.typingContext {
+                    // Sizes only: the typed and screen text are never logged.
+                    self.logDictationPromptTrace(
+                        "Dictation context",
+                        value: "beforeCursorChars=\(typingContext.textBeforeCursor?.count ?? 0) screenLines=\(typingContext.screenText?.count ?? 0)"
+                    )
+                }
             }
 
             self.appBench("ai_private_call")
@@ -2827,7 +2902,9 @@ struct ContentView: View {
                     appName: appInfo.name,
                     bundleID: appInfo.bundleId,
                     windowTitle: appInfo.windowTitle,
-                    appVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
+                    appVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String,
+                    textBeforeCursor: stopSnapshot?.typingContext?.textBeforeCursor,
+                    screenText: stopSnapshot?.typingContext?.screenText
                 ),
                 streamHandler: streamHandler
             )
@@ -3042,6 +3119,11 @@ struct ContentView: View {
 
     // swiftlint:disable:next function_body_length
     private func processStoppedTranscription(route: DictationOutputRoute, pipelineID: String, toggleStopRequestedAt: TimeInterval?) async {
+        let contextCapture = self.dictationContextCapture
+        defer {
+            contextCapture?.cancel()
+            if self.dictationContextCapture === contextCapture { self.dictationContextCapture = nil }
+        }
         guard let summaryActivity = MeetingSummaryActivityCoordinator.shared.beginProcessing() else {
             MeetingSummaryActivityCoordinator.presentBusyError()
             return
@@ -3098,8 +3180,14 @@ struct ContentView: View {
         )
         self.appBench("asr_stop_return elapsedMs=\(Int(((ProcessInfo.processInfo.systemUptime - asrStopStartedAt) * 1000).rounded()))")
         self.completeDictationStopSnapshot(&stopSnapshot)
+        if let contextCapture, self.overlayLifecycleID == expectedOverlayLifecycleID,
+           self.cancelledOutputLifecycleID != expectedOverlayLifecycleID, !Task.isCancelled
+        {
+            await self.attachDictationContext(contextCapture, to: &stopSnapshot)
+        }
         let audioSnapshot = self.asr.consumeLastCompletedAudioSnapshot()
         let dictionaryLearningRecording = self.asr.consumeDictionaryLearningRecording()
+        let correctionRecording = self.asr.consumeCorrectionRecording()
         let transcriptionDurationMilliseconds = self.asr.consumeLastFinalTranscriptionDurationMs()
         let parakeetProcessingDurationMilliseconds = self.asr.consumeLastFinalParakeetProcessingMs()
         DebugLogger.shared.info(
@@ -3194,7 +3282,8 @@ struct ContentView: View {
             wasArmed: self.spokenSendArming.wasArmed
         )
         self.updateSpokenSendIndicatorForFinalParse(shouldSend: spokenSendParse.shouldSend)
-        let normalizedTranscribedText = spokenSendParse.text
+        let textNormalizer = await DictationTextNormalizationService.shared.formatter(for: spokenSendParse.text)
+        let normalizedTranscribedText = textNormalizer.normalize(spokenSendParse.text, phase: .beforeCleanup)
         var sendsExistingDraft = spokenSendParse.shouldSend &&
             normalizedTranscribedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
 
@@ -3273,6 +3362,7 @@ struct ContentView: View {
             finalText = normalizedTranscribedText
         }
 
+        finalText = textNormalizer.preservingLiteralCommands(in: finalText, from: normalizedTranscribedText)
         // Normalize literal command and mention syntax after AI cleanup and before final user preferences.
         finalText = ASRService.applyDictationLiteralFormatting(
             finalText,
@@ -3286,6 +3376,8 @@ struct ContentView: View {
         // Apply Continuous Dictation Mode after GAAV so smart caps use the field
         // context captured at recording start, and the trailing space enables chaining.
         finalText = ASRService.applyContinuousDictationFormatting(finalText, precedingText: stopSnapshot?.precedingText ?? self.recordingPrecedingText)
+        // Run after smart capitalization too: a continued sentence must not turn 5B into 5b.
+        finalText = textNormalizer.normalize(finalText, phase: .afterCleanup)
         finalText = ASRService.applyTerminalLiteralAutocompleteSpacing(
             finalText,
             appName: appInfo.name,
@@ -3477,7 +3569,7 @@ struct ContentView: View {
                     isOutputValid: { self.cancelledOutputLifecycleID != expectedOverlayLifecycleID }
                 )
                 self.logPipelineCompletion(
-                    outcome: String(describing: deliveryOutcome),
+                    outcome: deliveryOutcome.pipelineLogOutcome,
                     pipelineID: pipelineID,
                     pipelineStartedAt: pipelineStartedAt,
                     textReadyAt: finalTextReadyAt
@@ -3540,7 +3632,8 @@ struct ContentView: View {
                 AutomaticDictionaryCorrectionTracker.shared.beginObservingInsertion(
                     finalOutputPlan.plainText,
                     targetPID: typingTarget.pid,
-                    learningRecording: dictionaryLearningRecording
+                    learningRecording: dictionaryLearningRecording,
+                    correctionRecording: correctionRecording
                 )
                 self.appBench("dictionary_tracking_scheduled afterDeliveryUI=true")
             }
@@ -3602,8 +3695,10 @@ struct ContentView: View {
             if promptTest.sessionID == sessionID { promptTest.isProcessing = false }
         }
         do {
+            let textNormalizer = await DictationTextNormalizationService.shared.formatter(for: transcribedText)
+            let preparedText = textNormalizer.normalize(transcribedText, phase: .beforeCleanup)
             let result = try await self.processTextWithAI(
-                transcribedText,
+                preparedText,
                 overrideSystemPrompt: promptTest.usesBuiltInPrompt ? nil : promptTest.draftPromptText,
                 overrideProviderID: promptTest.draftProviderID,
                 overrideModel: promptTest.draftModel,
@@ -3611,7 +3706,7 @@ struct ContentView: View {
             )
             let appInfo = self.recordingAppInfo ?? self.getCurrentAppInfo()
             let literalFormattedResult = ASRService.applyDictationLiteralFormatting(
-                result,
+                textNormalizer.normalize(textNormalizer.preservingLiteralCommands(in: result, from: preparedText), phase: .afterCleanup),
                 appName: appInfo.name,
                 bundleID: appInfo.bundleId,
                 windowTitle: appInfo.windowTitle
@@ -3718,7 +3813,7 @@ struct ContentView: View {
         expectedOverlayLifecycleID: UInt64
     ) {
         self.logPipelineCompletion(
-            outcome: String(describing: outcome),
+            outcome: outcome.pipelineLogOutcome,
             pipelineID: pipelineID,
             pipelineStartedAt: pipelineStartedAt,
             textReadyAt: textReadyAt
@@ -3812,44 +3907,34 @@ struct ContentView: View {
         self.menuBarManager.finishProcessingKeepingOverlayVisible()
     }
 
-    private func showPrivateAIEditModeUnavailableIfNeeded() -> Bool {
-        let settings = SettingsStore.shared
-        let providerID = settings.rewriteModeLinkedToGlobal
-            ? settings.selectedProviderID
-            : settings.rewriteModeSelectedProviderID
-        guard PrivateFeatures.privateAIProvider,
-              providerID.trimmingCharacters(in: .whitespacesAndNewlines) ==
-              PrivateAIProviderFeature.shared.providerID
-        else {
-            return false
-        }
-
-        guard !self.asr.isRunningOrStarting,
-              !NotchContentState.shared.isProcessing
-        else {
-            return true
-        }
-
+    /// Shows why Edit Mode can't run, for a few seconds. A missing model only happens
+    /// when Edit Mode is set to run on this Mac, so only then is there a Download button.
+    private func showEditModeFailure(_ message: String) {
+        let needsModel = message == EditModeRoute.modelMissing.failureMessage
         self.menuBarManager.setOverlayMode(.edit)
         self.advanceOverlayLifecycle()
         let expectedOverlayLifecycleID = self.overlayLifecycleID
         self.menuBarManager.showRecordingOverlayImmediately()
         NotchContentState.shared.showAIProcessingFailure(
-            message: "Edit Mode cannot be used with Fluid-1",
-            canRetry: false
+            message: message,
+            canRetry: false,
+            downloadAction: needsModel ? {
+                EditModeModelController.shared.download()
+                self.menuBarManager.openAISettings()
+            } : nil
         )
         self.menuBarManager.finishProcessingKeepingOverlayVisible()
 
         Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 6_000_000_000)
+            try? await Task.sleep(for: .seconds(needsModel ? 10 : 6))
             guard self.overlayLifecycleID == expectedOverlayLifecycleID else { return }
             NotchContentState.shared.clearAIProcessingFailure()
             await self.menuBarManager.finishProcessingAndHideOverlay()
         }
-        return true
     }
 
     private func advanceOverlayLifecycle() {
+        self.cancelDictationContextCapture()
         self.spokenSendAutoStopTask?.cancel()
         self.spokenSendAutoStopTask = nil
         self.stopSpokenSendVoiceActivityMonitoring()
@@ -4268,6 +4353,7 @@ struct ContentView: View {
             DebugLogger.shared.info("Actions: stopping active recording before history action output", source: "ContentView")
             await self.asr.stopWithoutTranscription()
             self.cancelPrewarmDictationIfNeeded()
+            self.cancelDictationContextCapture()
         }
 
         let appInfo = self.getCurrentAppInfo()
@@ -4342,6 +4428,7 @@ struct ContentView: View {
             DebugLogger.shared.info("Actions: stopping active recording before reprocess", source: "ContentView")
             await self.asr.stopWithoutTranscription()
             self.cancelPrewarmDictationIfNeeded()
+            self.cancelDictationContextCapture()
         }
 
         self.setActiveRecordingMode(.dictate)
@@ -4354,12 +4441,14 @@ struct ContentView: View {
         var aiTokensPerSecond: Double?
         var aiFallbackNotificationError: String?
         let appInfo = self.getCurrentAppInfo()
-        let normalizedTranscribedText = ASRService.applySpokenPunctuationFormatting(
+        let punctuationFormattedText = ASRService.applySpokenPunctuationFormatting(
             transcribedText,
             appName: appInfo.name,
             bundleID: appInfo.bundleId,
             windowTitle: appInfo.windowTitle
         )
+        let textNormalizer = await DictationTextNormalizationService.shared.formatter(for: punctuationFormattedText)
+        let normalizedTranscribedText = textNormalizer.normalize(punctuationFormattedText, phase: .beforeCleanup)
         var finalText = normalizedTranscribedText
         let shouldUseAI = DictationAIPostProcessingGate.isConfigured(for: .primary, appBundleID: appInfo.bundleId)
         if shouldUseAI {
@@ -4389,6 +4478,7 @@ struct ContentView: View {
             )
         }
 
+        finalText = textNormalizer.preservingLiteralCommands(in: finalText, from: normalizedTranscribedText)
         finalText = ASRService.applyDictationLiteralFormatting(
             finalText,
             appName: appInfo.name,
@@ -4400,6 +4490,7 @@ struct ContentView: View {
             ? TypingService.textBeforeCursorInFocusedField()
             : ""
         finalText = ASRService.applyContinuousDictationFormatting(finalText, precedingText: precedingText)
+        finalText = textNormalizer.normalize(finalText, phase: .afterCleanup)
         finalText = ASRService.applyTerminalLiteralAutocompleteSpacing(
             finalText,
             appName: appInfo.name,
@@ -4538,12 +4629,17 @@ struct ContentView: View {
             self.rewriteModeService.clearState()
             self.hideOverlayAfterOutput()
         } else {
-            await self.menuBarManager.finishProcessingAndHideOverlay()
             DebugLogger.shared.error("Rewrite failed - no result", source: "ContentView")
+            if let message = self.rewriteModeService.lastErrorMessage {
+                self.showEditModeFailure(message)
+            } else {
+                await self.menuBarManager.finishProcessingAndHideOverlay()
+            }
         }
     }
 
     private func setActiveRecordingMode(_ mode: ActiveRecordingMode) {
+        if mode == .command || mode == .edit { self.cancelDictationContextCapture() }
         if mode != .dictate, mode != .promptMode {
             self.clearActiveDictationShortcutState()
         }
@@ -4593,6 +4689,7 @@ struct ContentView: View {
                     self.rewriteModeService.startWithoutSelection()
                 }
             }
+            self.startReadingEditWindow()
             self.menuBarManager.setOverlayMode(.edit)
         case .write, .rewrite:
             guard self.activeRecordingMode != .edit || NotchContentState.shared.mode == .dictation else { return }
@@ -4606,8 +4703,22 @@ struct ContentView: View {
                     self.rewriteModeService.startWithoutSelection()
                 }
             }
+            self.startReadingEditWindow()
             self.menuBarManager.setOverlayMode(.edit)
         }
+    }
+
+    /// Reads the front window for on-device Edit Mode. An API never gets it.
+    private func startReadingEditWindow() {
+        guard self.settings.editModeReadsScreen,
+              self.settings.effectiveRewriteModeProviderID == PrivateAIProviderFeature.shared.providerID,
+              let target = NotchContentState.shared.recordingTargetContext,
+              target.pid != ProcessInfo.processInfo.processIdentifier
+        else {
+            self.rewriteModeService.stopReadingWindow()
+            return
+        }
+        self.rewriteModeService.startReadingWindow(target: target)
     }
 
     private func handleLiveOverlayModeSwitch(_ mode: OverlayMode) {
@@ -4696,6 +4807,7 @@ struct ContentView: View {
                     TranscriptionSoundPlayer.shared.playStartSound()
                 }
                 self.captureRecordingContext()
+                self.startDictationContextCaptureIfNeeded(for: .primary)
                 self.prewarmPrivateAIDictationIfNeeded(for: .primary)
                 DebugLogger.shared.benchmark(
                     "APP_BENCH",
@@ -4708,6 +4820,7 @@ struct ContentView: View {
                 return
             }
             if startOutcome == .failed {
+                self.cancelDictationContextCapture()
                 self.menuBarManager.hideRecordingOverlayImmediately(reason: "asr_start_failed")
             }
         }
@@ -4742,6 +4855,7 @@ struct ContentView: View {
               self.activeRecordingMode == mode || self.activeRecordingMode == .none
         else { return }
         self.cancelPrewarmDictationIfNeeded()
+        self.cancelDictationContextCapture()
         self.clearActiveRecordingMode()
         self.menuBarManager.hideRecordingOverlayImmediately(reason: "capture_start_cancelled")
     }
@@ -4944,6 +5058,22 @@ struct ContentView: View {
     private func beginRewriteRecording() async {
         guard self.canBeginDictationRecording() else { return }
 
+        let editProviderID = SettingsStore.shared.effectiveRewriteModeProviderID
+        let editRoute = await Task.detached(priority: .userInitiated) {
+            EditModeRoute.current(providerID: editProviderID)
+        }.value
+        // The check above left the main thread, so what it allowed may have changed.
+        guard self.canBeginDictationRecording() else { return }
+        if let message = editRoute.failureMessage {
+            // A dictation in progress keeps going; only a fresh press has an overlay to use.
+            if !self.canSwitchActiveDictationCaptureMode { self.showEditModeFailure(message) }
+            return
+        }
+        if case .local = editRoute {
+            // Ready by the time the user stops speaking; never delays the recording.
+            Task { await PrivateAIIntegrationService.shared.prewarmEdit() }
+        }
+
         DictationStopSnapshot.captureStartingContext(reusingCapture: self.canSwitchActiveDictationCaptureMode) {
             self.captureRecordingContext()
         }
@@ -4967,6 +5097,7 @@ struct ContentView: View {
             // Text was selected - edit mode (with selected context)
             self.menuBarManager.setOverlayMode(.edit)
         }
+        self.startReadingEditWindow()
 
         // Set flag so stopAndProcessTranscription knows to process as rewrite
         self.setActiveRecordingMode(.edit)
@@ -5118,7 +5249,7 @@ struct ContentView: View {
         self.hotkeyManager?.setMeetingRecordingCallback {
             Task { @MainActor in
                 await self.menuBarManager.toggleMeetingRecordingFromShortcut {
-                    try await AppServices.shared.startMeetingRecordingFromMenuBar()
+                    MeetingRecordingSourcePromptController.shared.handleShortcut()
                 }
             }
         }
@@ -5165,7 +5296,7 @@ struct ContentView: View {
             DictionaryCorrectionOverlayController.shared.dismiss()
             return .dismissedOverlay
         }
-        if NotchOverlayManager.shared.isCommandOutputExpanded {
+        if NotchOverlayManager.shared.hasCommandOutputToDismiss {
             NotchOverlayManager.shared.hideExpandedCommandOutput()
             NotchOverlayManager.shared.onCommandOutputDismiss?()
             handled = true
@@ -5178,6 +5309,7 @@ struct ContentView: View {
         }
 
         if let lifecycleID = self.processingDictationLifecycleID {
+            self.cancelDictationContextCapture()
             // A stop already owns the audio; suppress its pending output without stopping again.
             self.cancelledOutputLifecycleID = lifecycleID
             handled = true
@@ -5213,9 +5345,11 @@ struct ContentView: View {
                 self.clearActiveRecordingMode()
             }
             self.cancelPrewarmDictationIfNeeded()
+            self.cancelDictationContextCapture()
             handled = true
         } else if self.activeRecordingMode != .none {
             self.cancelPrewarmDictationIfNeeded()
+            self.cancelDictationContextCapture()
             self.clearActiveRecordingMode()
             handled = true
         }
@@ -5492,6 +5626,7 @@ extension ContentView {
                     TranscriptionSoundPlayer.shared.playStartSound()
                 }
                 self.captureRecordingContext()
+                self.startDictationContextCaptureIfNeeded(for: slot)
                 self.prewarmPrivateAIDictationIfNeeded(for: slot)
                 self.appBench("overlay_phase phase=recording trigger=first_pcm")
             })
@@ -5500,6 +5635,7 @@ extension ContentView {
                 return
             }
             if startOutcome == .failed {
+                self.cancelDictationContextCapture()
                 self.menuBarManager.hideRecordingOverlayImmediately(reason: "asr_start_failed")
                 if isOnboardingTryout {
                     AnalyticsService.shared.recordOnboardingTryoutAttemptResult(

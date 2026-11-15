@@ -88,6 +88,7 @@ nonisolated enum FluidServeMeetings {
 
     enum ReadError: LocalizedError, Equatable {
         case accessOff
+        case accessUnavailable
         case noMeetings
         case notFound(String)
         case ambiguous(String, Int)
@@ -96,6 +97,9 @@ nonisolated enum FluidServeMeetings {
             switch self {
             case .accessOff:
                 return "FluidVoice is not sharing meetings with any agent yet. In FluidVoice, open FluidMeet settings > Integrations and add your agent."
+            case .accessUnavailable:
+                return "Could not verify FluidVoice meeting-sharing permission. The setting may be unset or blocked by a sandbox. "
+                    + "Check FluidMeet settings > Integrations; if sharing is on, check the agent's sandbox permissions. No meeting data was read."
             case .noMeetings:
                 return "No finished meetings with a transcript were found."
             case let .notFound(reference):
@@ -118,8 +122,10 @@ nonisolated enum FluidServeMeetings {
     /// but through CFPreferences rather than `UserDefaults`, which would also honour a
     /// `-FluidServeMeetingAccessEnabled YES` argument and let a caller switch it on.
     /// This is a consent switch, not a lock: anything running as the user could read the files anyway.
-    static func isAccessEnabled(bundleIdentifier: String) -> Bool {
-        (CFPreferencesCopyAppValue(self.accessDefaultsKey as CFString, bundleIdentifier as CFString) as? Bool) ?? false
+    /// A missing value cannot distinguish an unset preference from a sandbox-denied read.
+    /// Only an explicit true grants access; nil is unknown, not proof that sharing is off.
+    static func isAccessEnabled(bundleIdentifier: String) -> Bool? {
+        CFPreferencesCopyAppValue(self.accessDefaultsKey as CFString, bundleIdentifier as CFString) as? Bool
     }
 
     static let customSummaryPromptDefaultsKey = "MeetingSummaryCustomPrompt"
@@ -185,6 +191,7 @@ nonisolated enum FluidServeMeetings {
     static func savedSummaries(for entry: Entry, customPrompt: String = "", fileManager: FileManager = .default) -> [SavedSummary] {
         struct Stored: Decodable {
             var transcriptHash: String
+            var transcriptHashVersion: Int?
             var text: String
             var promptHash: String?
             var providerID: String?
@@ -197,16 +204,26 @@ nonisolated enum FluidServeMeetings {
             .filter { $0.hasPrefix(prefix) && $0.hasSuffix(".json") }
             .sorted()
         guard !names.isEmpty else { return [] }
-        let currentHash = self.fingerprint(self.summaryInput(for: entry.meeting))
+        let legacyHash = self.fingerprint(self.summaryInput(for: entry.meeting))
+        var contentSource = entry.meeting
+        contentSource.title = ""
+        let contentHash = self.fingerprint(self.summaryInput(for: contentSource))
         let customPromptHash = self.fingerprint(customPrompt.trimmingCharacters(in: .whitespacesAndNewlines))
         return names.compactMap { name in
             let style = String(name.dropFirst(prefix.count).dropLast(".json".count))
             guard let data = try? Data(contentsOf: entry.directory.appendingPathComponent(name, isDirectory: false)),
                   let stored = try? JSONDecoder().decode(Stored.self, from: data),
-                  stored.providerID != nil, stored.transcriptHash == currentHash,
+                  stored.providerID != nil,
                   stored.promptHash == (style == "custom" ? customPromptHash : nil),
                   !stored.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             else { return nil }
+            let currentHash: String
+            switch stored.transcriptHashVersion {
+            case nil: currentHash = legacyHash
+            case 2: currentHash = contentHash
+            default: return nil
+            }
+            guard stored.transcriptHash == currentHash else { return nil }
             return SavedSummary(
                 style: style,
                 text: stored.text,

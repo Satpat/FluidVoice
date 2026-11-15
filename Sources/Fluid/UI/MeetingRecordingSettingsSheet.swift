@@ -104,7 +104,7 @@ struct MeetingRecordingSettingsSheet: View {
     private var canSave: Bool {
         guard self.draft.transcriptionEngine.supportsLanguage(self.draft.languageCode) else { return false }
         guard self.microphones.contains(where: { $0.id == self.draft.selectedMicrophoneID }) else { return false }
-        return self.draft.mode == .inRoom
+        return self.draft.mode == .systemAudio
             || self.draft.usesAutomaticApplication
             || self.applications.contains { $0.id == self.draft.selectedApplicationID }
     }
@@ -229,31 +229,13 @@ struct MeetingRecordingSettingsSheet: View {
         VStack(alignment: .leading, spacing: self.theme.metrics.spacing.xl) {
             FluidManagementGroup(title: "Audio sources") {
                 VStack(spacing: 0) {
-                    MeetingAdaptiveSetupRow(
-                        title: "Meeting type",
-                        detail: self.draft.mode == .onlineCall ? "Meeting app and microphone." : "Microphone only."
-                    ) {
-                        Menu {
-                            Picker("Meeting type", selection: self.$draft.mode) {
-                                Text("Online call").tag(MeetingCaptureMode.onlineCall)
-                                Text("In-room").tag(MeetingCaptureMode.inRoom)
-                            }
-                            .pickerStyle(.inline)
-                        } label: {
-                            Text(self.draft.mode == .onlineCall ? "Online call" : "In-room")
-                        }
-                        .fluidDropdownStyle(fillsWidth: true)
-                        .accessibilityLabel("Default meeting type")
-                    }
-
-                    if self.draft.mode == .onlineCall {
-                        Divider()
+                    Group {
                         MeetingAdaptiveSetupRow(
                             title: "Meeting audio",
-                            detail: "Automatic follows the detected call."
+                            detail: "Saved for future recordings. Automatic captures all computer audio, including music and notifications."
                         ) {
                             Menu {
-                                self.applicationMenuEntry(title: "Automatic", id: nil)
+                                self.applicationMenuEntry(title: "Automatic · all computer audio + mic", id: nil)
                                 ForEach(self.meetingApplications) { option in
                                     self.applicationMenuEntry(title: self.applicationDisplayName(option), id: option.id)
                                 }
@@ -368,22 +350,22 @@ struct MeetingRecordingSettingsSheet: View {
         Binding(
             get: { self.draft.usesAutomaticApplication ? nil : self.draft.selectedApplicationID },
             set: {
+                self.draft.applicationSelectionWasEdited = true
+                self.draft.mode = $0 == nil ? .systemAudio : .onlineCall
                 self.draft.usesAutomaticApplication = $0 == nil
                 self.draft.selectedApplicationID = $0
+                self.draft.preferredApplicationBundleIdentifier = self.applications.first(where: { $0.id == self.draft.selectedApplicationID })?.identity.bundleIdentifier
             }
         )
     }
 
     private func applicationMenuEntry(title: String, id: String?) -> some View {
-        Button {
-            self.applicationSelection.wrappedValue = id
-        } label: {
-            if self.applicationSelection.wrappedValue == id {
-                Label(title, systemImage: "checkmark")
-            } else {
-                Text(title)
-            }
-        }
+        MeetingApplicationMenuEntry(
+            title: title,
+            icon: self.applications.first(where: { $0.id == id })?.icon,
+            selected: self.applicationSelection.wrappedValue == id,
+            systemImage: id == nil ? "wand.and.stars" : "app"
+        ) { self.applicationSelection.wrappedValue = id }
     }
 
     private var meetingApplications: [MeetingApplicationOption] {

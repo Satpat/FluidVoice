@@ -120,10 +120,32 @@ nonisolated enum MeetingProviderOptionsError: Error, Equatable {
     case unsupportedFeature(String)
 }
 
-/// Immutable provider options for the opt-in meeting post-processing path. Only the fixed
-/// Parakeet TDT v2 handles English; v3 handles its supported multilingual languages.
+/// Immutable provider options for meeting post-processing. Pro is the default;
+/// v3 is the installed fallback. Other models are not supported for meetings.
 /// Unsupported model/language combinations and enhancement features are rejected.
 nonisolated struct MeetingProviderOptions: Equatable, Sendable {
+    private static let supportedModels: Set<SettingsStore.SpeechModel> = [
+        .parakeetTDT, .fluidParakeetPro,
+    ]
+
+    /// Choose once before freezing the processing request. An empty installation starts
+    /// Pro's normal download; an existing v3 installation can transcribe offline.
+    static func defaultModel(installedModelIDs: Set<String>) -> SettingsStore.SpeechModel {
+        if installedModelIDs.contains(SettingsStore.SpeechModel.fluidParakeetPro.rawValue) { return .fluidParakeetPro }
+        if installedModelIDs.contains(SettingsStore.SpeechModel.parakeetTDT.rawValue) { return .parakeetTDT }
+        return .fluidParakeetPro
+    }
+
+    static func preferredModel(
+        for languageCode: String,
+        selected: SettingsStore.SpeechModel?
+    ) -> SettingsStore.SpeechModel {
+        if let selected, self.supportedModels.contains(selected),
+           ParakeetSpeechModelCatalog.descriptor(forModelID: selected.rawValue)?.supportedLanguageCodes.contains(languageCode) == true
+        { return selected }
+        return .fluidParakeetPro
+    }
+
     let model: SettingsStore.SpeechModel
     let vocabularyBoostingEnabled: Bool
     let pronunciationMatchingEnabled: Bool
@@ -134,12 +156,12 @@ nonisolated struct MeetingProviderOptions: Equatable, Sendable {
         _ configuration: MeetingFinalProcessingConfiguration
     ) throws -> MeetingProviderOptions {
         guard let model = SettingsStore.SpeechModel(rawValue: configuration.asrModel),
-              model == .parakeetTDTv2 || model == .parakeetTDT
+              self.supportedModels.contains(model)
         else {
             throw MeetingProviderOptionsError.unsupportedASRModel(configuration.asrModel)
         }
         guard VoiceEngineLanguageCatalog.parakeetV3LanguageIDs.contains(configuration.languageCode),
-              model != .parakeetTDTv2 || configuration.languageCode == "en"
+              ParakeetSpeechModelCatalog.descriptor(forModelID: model.rawValue)?.supportedLanguageCodes.contains(configuration.languageCode) == true
         else {
             throw MeetingProviderOptionsError.unsupportedLanguageCode(configuration.languageCode)
         }
@@ -149,9 +171,8 @@ nonisolated struct MeetingProviderOptions: Equatable, Sendable {
         guard !configuration.pronunciationMatchingEnabled else {
             throw MeetingProviderOptionsError.unsupportedFeature("pronunciationMatching")
         }
-        guard !configuration.customDictionaryRewritingEnabled else {
-            throw MeetingProviderOptionsError.unsupportedFeature("customDictionaryRewriting")
-        }
+        // Saved replacements run on final speaker turns in the meeting pipeline, never inside
+        // ASR where they would disagree with raw word timings or read live dictation settings.
         guard !configuration.experimentalUnifiedFinalEnabled else {
             throw MeetingProviderOptionsError.unsupportedFeature("experimentalUnifiedFinal")
         }
@@ -185,6 +206,8 @@ final class FluidAudioProvider: TranscriptionProvider {
 
     private static let incrementalChunkingThresholdSamples = 240_000
     private static let incrementalAppendBlockSamples = 240_000
+    /// Mac capture opens on ~0.17 s of dead audio; 0.25 s of silence first lets Parakeet catch the first word.
+    static let finalLeadInSamples = 4000
 
     /// Stable admission keeps a ninth word from evicting references used by the next match.
     struct TemporalReferenceCache {
@@ -537,7 +560,7 @@ final class FluidAudioProvider: TranscriptionProvider {
                 if installedHash == nil {
                     let release = descriptor
                     let validator: ParakeetArchiveDownloader.StageValidator?
-                    if release.variant == .mini || release.variant == .pico {
+                    if release.isHostedPack {
                         validator = { directory in
                             progressRelay.report(.loading)
                             try await CompactSpeechModelRuntimeCheck.validateStagedWeights(at: directory, descriptor: release)
@@ -916,7 +939,7 @@ final class FluidAudioProvider: TranscriptionProvider {
         // manager so the user still gets a transcription (just without CTC rescoring).
         do {
             let startedAt = Date().timeIntervalSince1970
-            let outcome = try await self.transcribeFinalResult(samples, manager: manager)
+            let outcome = try await self.transcribeFinalResult(samples, manager: manager, leadIn: true)
             try self.requireCurrentRecording(generation)
             self.logFinalBenchmark(samples: samples, text: outcome.result.text, startedAt: startedAt, usedFallback: false)
             return outcome.result
@@ -930,7 +953,7 @@ final class FluidAudioProvider: TranscriptionProvider {
                 source: "FluidAudioProvider"
             )
             let startedAt = Date().timeIntervalSince1970
-            let outcome = try await self.transcribeFinalResult(samples, manager: fallback)
+            let outcome = try await self.transcribeFinalResult(samples, manager: fallback, leadIn: true)
             try self.requireCurrentRecording(generation)
             self.logFinalBenchmark(samples: samples, text: outcome.result.text, startedAt: startedAt, usedFallback: true)
             return outcome.result
@@ -1211,6 +1234,38 @@ final class FluidAudioProvider: TranscriptionProvider {
         }
     }
 
+    /// Pronunciation matching reads encoder frames against the recording itself, and a full window has no room left.
+    static func usesFinalLeadIn(sampleCount: Int, hasPronunciationProfiles: Bool) -> Bool {
+        !hasPronunciationProfiles && sampleCount + self.finalLeadInSamples <= self.incrementalChunkingThresholdSamples
+    }
+
+    static func withLeadIn(_ samples: [Float]) -> [Float] {
+        [Float](repeating: 0, count: self.finalLeadInSamples) + samples
+    }
+
+    /// Puts timings back on the recording's own clock after transcribing `withLeadIn(_:)`.
+    static func removingLeadIn(from result: ASRResult) -> ASRResult {
+        let offset = TimeInterval(Self.finalLeadInSamples) / 16_000
+        return ASRResult(
+            text: result.text,
+            confidence: result.confidence,
+            duration: max(0, result.duration - offset),
+            processingTime: result.processingTime,
+            tokenTimings: result.tokenTimings?.map {
+                TokenTiming(
+                    token: $0.token,
+                    tokenId: $0.tokenId,
+                    startTime: max(0, $0.startTime - offset),
+                    endTime: max(0, $0.endTime - offset),
+                    confidence: $0.confidence
+                )
+            },
+            performanceMetrics: result.performanceMetrics,
+            ctcDetectedTerms: result.ctcDetectedTerms,
+            ctcAppliedTerms: result.ctcAppliedTerms
+        )
+    }
+
     private func learningAlignment(for result: ASRResult) -> DictionaryLearningAlignment? {
         guard DictionaryMatcherExperiment.sharedFeaturesEnabled, SettingsStore.shared.automaticDictionaryLearningEnabled || DictionaryMatcherExperiment.collectNegatives, !self.isWordBoostingActive,
               let timings = result.tokenTimings, !timings.isEmpty
@@ -1219,7 +1274,7 @@ final class FluidAudioProvider: TranscriptionProvider {
     }
 
     private func transcribeFinalResult(
-        _ samples: [Float], manager: AsrManager
+        _ samples: [Float], manager: AsrManager, leadIn: Bool = false
     ) async throws -> (result: ASRTranscriptionResult, tokenTimings: [TokenTiming]?, textMayBeCorrected: Bool) { // swiftlint:disable:this discouraged_optional_collection
         let generation = self.recordingGeneration
         let profiles = self.effectivePronunciationMatchingEnabled ? Self.preparedEdgeProfiles(await self.pronunciationProfiles(), cache: self.edgeReferenceCache) : []
@@ -1233,7 +1288,12 @@ final class FluidAudioProvider: TranscriptionProvider {
         let textMayBeCorrected = self.isWordBoostingActive || !profiles.isEmpty
         await manager.setPronunciationCustomizationEnabled(!profiles.isEmpty)
         do {
-            let result = try await manager.transcribe(samples, source: AudioSource.microphone)
+            let result: ASRResult
+            if leadIn, Self.usesFinalLeadIn(sampleCount: samples.count, hasPronunciationProfiles: !profiles.isEmpty) {
+                result = try await Self.removingLeadIn(from: manager.transcribe(Self.withLeadIn(samples), source: AudioSource.microphone))
+            } else {
+                result = try await manager.transcribe(samples, source: AudioSource.microphone)
+            }
             let features = await manager.consumePronunciationEncoderFeatures()
             await manager.setPronunciationCustomizationEnabled(false)
             guard DictionaryMatcherExperiment.sharedFeaturesEnabled, let features, !profiles.isEmpty else {
@@ -1803,7 +1863,7 @@ final class FluidAudioProvider: TranscriptionProvider {
     func modelsExistOnDisk() -> Bool {
         let selectedModel = self.resolvedSpeechModel
         switch selectedModel {
-        case .fluidParakeetMini, .fluidParakeetPico:
+        case .fluidParakeetMini, .fluidParakeetPico, .fluidParakeetPro:
             return SpeechModelInstallationSnapshot.shared.isInstalled(modelID: selectedModel.id)
         case .parakeetTDT, .parakeetTDTv2:
             return selectedModel.isInstalled
@@ -1827,7 +1887,7 @@ final class FluidAudioProvider: TranscriptionProvider {
     }
 
     var preservesInstalledCompactWeights: Bool {
-        self.resolvedSpeechModel == .fluidParakeetMini || self.resolvedSpeechModel == .fluidParakeetPico
+        [.fluidParakeetMini, .fluidParakeetPico, .fluidParakeetPro].contains(self.resolvedSpeechModel)
     }
 
     var shouldClearCacheAfterCancellation: Bool {

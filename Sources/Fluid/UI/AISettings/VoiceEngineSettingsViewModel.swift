@@ -97,6 +97,8 @@ final class VoiceEngineSettingsViewModel: ObservableObject {
             models = models.filter { $0.provider == .cohere }
         case .openai:
             models = models.filter { $0.provider == .openai }
+        case .qwen:
+            models = models.filter { $0.provider == .qwen }
         }
 
         if self.englishOnlyFilter {
@@ -139,6 +141,28 @@ final class VoiceEngineSettingsViewModel: ObservableObject {
             } catch {
                 DebugLogger.shared.error("Failed to prepare model after activation: \(error)", source: "AISettingsView")
                 self.asr.errorTitle = "Model Activation Failed"
+                self.asr.errorMessage = error.localizedDescription
+                self.asr.showError = true
+            }
+        }
+    }
+
+    /// The analyzer provider binds its locale during preparation, so a new locale needs a
+    /// provider reset. Preparation downloads the locale's model when it isn't installed.
+    func selectAppleSpeechLocale(_ localeIdentifier: String) {
+        guard !self.areSpeechModelActionsBlocked,
+              localeIdentifier != self.settings.selectedAppleSpeechLocaleIdentifier
+        else { return }
+        self.settings.selectedAppleSpeechLocaleIdentifier = localeIdentifier
+        self.asr.resetTranscriptionProvider()
+        Task {
+            do {
+                try await self.asr.ensureAsrReady(source: .settings)
+            } catch is CancellationError {
+                DebugLogger.shared.info("Apple Speech locale change cancelled: \(localeIdentifier)", source: "AISettingsView")
+            } catch {
+                DebugLogger.shared.error("Failed to prepare Apple Speech locale \(localeIdentifier): \(error)", source: "AISettingsView")
+                self.asr.errorTitle = "Language Change Failed"
                 self.asr.errorMessage = error.localizedDescription
                 self.asr.showError = true
             }
@@ -210,12 +234,14 @@ final class VoiceEngineSettingsViewModel: ObservableObject {
             return "Parakeet TDT v3 uses CoreML and Neural Engine for fastest transcription (25 languages) on Apple Silicon."
         case .parakeetTDTv2:
             return "Parakeet TDT v2 is an English-only model optimized for accuracy and consistency on Apple Silicon."
-        case .fluidParakeetMini, .fluidParakeetPico:
+        case .fluidParakeetMini, .fluidParakeetPico, .fluidParakeetPro:
             return "\(model.cardDescription) Requires Apple silicon."
         case .parakeetRealtime:
             return "Parakeet Flash uses FluidAudio's true streaming EOU pipeline for low-latency English dictation. Best when you want words to appear live as you speak."
         case .qwen3Asr:
             return "Qwen3 ASR is a multilingual FluidAudio model with strong quality, but higher memory usage. Requires macOS 15+."
+        case .qwen3Asr17B:
+            return "On-device dictation for Apple Silicon. Automatically detects 30 languages and produces text after you stop recording."
         case .cohereTranscribeSixBit:
             return "Cohere Transcribe downloads a CoreML pipeline from Hugging Face and caches it locally. Select the language manually before dictation. Best on Apple Silicon with 8GB+ RAM."
         case .nemotronOffline:

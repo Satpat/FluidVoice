@@ -7,6 +7,8 @@ struct MeetingRecordingCanvas: View {
     let liveTranscript: MeetingLiveTranscriptSnapshot
     let isStopping: Bool
     let onStop: () -> Void
+    var onRename: ((String) -> Void)? = nil
+    var errorMessage: String? = nil
 
     @Environment(\.theme) private var theme
 
@@ -35,12 +37,29 @@ struct MeetingRecordingCanvas: View {
             VStack(alignment: .leading, spacing: self.theme.metrics.spacing.sm) {
                 MeetingDocumentTitle(title: self.session.title)
                     .lineLimit(2)
-                    .help(self.session.title)
+                    .editableTitle(
+                        self.session.title,
+                        id: String(describing: self.session.id),
+                        enabled: !self.isStopping && self.onRename != nil,
+                        editorFont: .system(.largeTitle, design: .serif).weight(.medium),
+                        singleClickEnabled: true,
+                        submitUnchanged: true,
+                        onRename: { self.onRename?($0) }
+                    )
+                    .accessibilityIdentifier("meeting-recording-title")
                 Text(self.sourceSummary)
                     .font(self.theme.typography.caption)
                     .foregroundStyle(self.theme.palette.secondaryText)
                     .lineLimit(1)
                     .help(self.sourceSummary)
+            }
+
+            if let errorMessage, !errorMessage.isEmpty {
+                Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
+                    .font(self.theme.typography.bodySmall)
+                    .foregroundStyle(self.theme.palette.warning)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("meeting-recording-action-error")
             }
 
             VStack(alignment: .leading, spacing: self.theme.metrics.spacing.md) {
@@ -106,7 +125,7 @@ struct MeetingRecordingCanvas: View {
 
     @ViewBuilder
     private var sourceHealth: some View {
-        if self.session.mode == .onlineCall {
+        if self.session.mode.capturesComputerAudio {
             MeetingTrackHealthRow(title: "Meeting audio", systemImage: "macwindow", health: self.trackHealth[.applicationAudio] ?? .waiting)
         }
         MeetingTrackHealthRow(title: "Microphone", systemImage: "mic", health: self.trackHealth[.microphone] ?? .waiting)
@@ -114,7 +133,7 @@ struct MeetingRecordingCanvas: View {
 
     private var sourceSummary: String {
         let microphoneName = self.session.selectedMicrophone.displayName
-        guard self.session.mode == .onlineCall else { return microphoneName }
+        guard self.session.mode.capturesComputerAudio else { return microphoneName }
         let applicationName = self.session.capturedApplication?.displayName ?? "Meeting audio"
         return "\(applicationName) · \(microphoneName)"
     }
@@ -359,8 +378,10 @@ struct MeetingResultCanvas: View {
     let onNameUnknownSegment: (MeetingTranscriptSegmentID, String) -> Void
     let onUndo: () async -> Bool
     let onRenameSession: (String) -> Void
+    let onRetranscribe: (String) -> Void
     let onAssignSpeakers: (MeetingSpeakerEdits) async -> String?
     let onClose: (() -> Void)?
+    var isRetranscribing = false
     /// Opens FluidMeet settings on Integrations, so adding an agent is one step from any meeting.
     var onOpenIntegrations: (() -> Void)? = nil
 
@@ -372,6 +393,8 @@ struct MeetingResultCanvas: View {
     @State private var pendingUnknownSpeakerName = ""
     @State private var isRenamingSession = false
     @State private var pendingRenameSessionText = ""
+    @State private var isChoosingRetranscriptionLanguage = false
+    @State private var retranscriptionLanguageCode = "en"
     @State private var isShowingAssignSpeakers = false
     @State private var assignSpeakersFocus: SessionSpeakerID?
     @State private var copied = false
@@ -460,8 +483,9 @@ struct MeetingResultCanvas: View {
                             detail: warning,
                             isSubtle: true
                         )
-                    } else if self.session.events.contains(where: { $0.kind == .transcriptCoverageIncomplete }) {
-                        MeetingAudioTranscriptNotice(text: "Some recorded audio was not transcribed.")
+                    }
+                    if self.session.hasIncompleteTranscriptCoverage {
+                        MeetingAudioTranscriptNotice(text: "Transcription may be incomplete.")
                     }
                     if !activeSpeakers.isEmpty {
                         VStack(alignment: .leading, spacing: self.theme.metrics.spacing.sm) {
@@ -591,6 +615,20 @@ struct MeetingResultCanvas: View {
             Button("Rename") { self.onRenameSession(self.pendingRenameSessionText) }
         } message: {
             Text("Enter a new title for this meeting.")
+        }
+        .sheet(isPresented: self.$isChoosingRetranscriptionLanguage) {
+            MeetingRetranscriptionLanguageSheet(
+                languages: MeetingRetranscriptionLanguage.choices,
+                currentLanguageCode: self.session.languageCode,
+                selection: self.$retranscriptionLanguageCode,
+                isBusy: self.isRetranscribing,
+                onCancel: { self.isChoosingRetranscriptionLanguage = false },
+                onConfirm: {
+                    let languageCode = self.retranscriptionLanguageCode
+                    self.isChoosingRetranscriptionLanguage = false
+                    self.onRetranscribe(languageCode)
+                }
+            )
         }
         // Prevents an echo toggle left on for one meeting from leaking into the next.
         .onChange(of: self.session.id) { _, _ in
@@ -722,6 +760,11 @@ struct MeetingResultCanvas: View {
             .disabled(!hasText || self.documentSection != .transcript)
             Divider()
             self.renameMeetingAction
+            Button("Redo transcript…", systemImage: "arrow.clockwise") {
+                self.retranscriptionLanguageCode = self.session.languageCode
+                self.isChoosingRetranscriptionLanguage = true
+            }
+            .disabled(!self.isQuiescent || !self.session.hasRetryableAudio || self.isRetranscribing)
             if self.hasEchoSegments {
                 Divider()
                 Toggle("Show probable echo", isOn: self.$showsProbableEchoes)
@@ -794,9 +837,13 @@ struct MeetingResultCanvas: View {
             Label(Self.durationText(self.session.duration), systemImage: "clock")
                 .fixedSize()
             Text("·").accessibilityHidden(true)
-            Label(self.sourceName, systemImage: self.session.mode == .onlineCall ? "macwindow" : "person.2")
+            Label(self.sourceName, systemImage: self.session.mode.capturesComputerAudio ? "macwindow" : "person.2")
                 .lineLimit(1)
                 .help("\(self.sourceName)\nMicrophone: \(self.session.selectedMicrophone.displayName)")
+            Text("·").accessibilityHidden(true)
+            Label(self.transcriptLanguageName, systemImage: "globe")
+                .lineLimit(1)
+                .help("Transcript language")
         }
         .font(self.theme.typography.caption)
         .foregroundStyle(self.theme.palette.secondaryText)
@@ -804,8 +851,13 @@ struct MeetingResultCanvas: View {
         .accessibilityLabel(
             "\(self.session.startedAt.formatted(date: .abbreviated, time: .shortened)), " +
                 "\(Self.durationText(self.session.duration)), \(self.sourceName), " +
-                "microphone: \(self.session.selectedMicrophone.displayName)"
+                "microphone: \(self.session.selectedMicrophone.displayName), " +
+                "language: \(self.transcriptLanguageName)"
         )
+    }
+
+    private var transcriptLanguageName: String {
+        MeetingRetranscriptionLanguage.displayName(for: self.session.languageCode)
     }
 
     private var sourceName: String {
@@ -1300,5 +1352,61 @@ struct MeetingTranscriptTextEditor: View {
             self.isSaving = false
             if self.errorMessage != nil { self.isFocused = true }
         }
+    }
+}
+
+private struct MeetingRetranscriptionLanguageSheet: View {
+    let languages: [VoiceEngineLanguage]
+    let currentLanguageCode: String
+    @Binding var selection: String
+    let isBusy: Bool
+    let onCancel: () -> Void
+    let onConfirm: () -> Void
+
+    @Environment(\.theme) private var theme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: self.theme.metrics.spacing.lg) {
+            Text("Redo transcript")
+                .font(self.theme.typography.title)
+            Text("Transcribe saved audio again with your latest saved replacements. Keep the current language or choose another. This replaces the transcript.")
+                .font(self.theme.typography.body)
+                .foregroundStyle(self.theme.palette.secondaryText)
+                .fixedSize(horizontal: false, vertical: true)
+            Menu {
+                Picker("Language", selection: self.$selection) {
+                    ForEach(self.languages) { language in
+                        Text(language.displayName).tag(language.id)
+                    }
+                }
+                .pickerStyle(.inline)
+            } label: {
+                Text(MeetingRetranscriptionLanguage.displayName(for: self.selection))
+            }
+            .fluidDropdownStyle(fillsWidth: true)
+            .accessibilityLabel("Transcript language")
+            .disabled(self.isBusy || self.languages.isEmpty)
+            HStack {
+                Button("Cancel", action: self.onCancel)
+                    .meetingGlassAction()
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(self.isBusy)
+                Spacer()
+                Button(self.isBusy ? "Transcribing…" : "Transcribe", action: self.onConfirm)
+                    .meetingGlassAction(prominent: true)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(
+                        self.isBusy || !MeetingRetranscriptionLanguage.canRetranscribe(
+                            selection: self.selection,
+                            currentLanguageCode: self.currentLanguageCode,
+                            allowsSameLanguage: true
+                        )
+                    )
+            }
+        }
+        .padding(self.theme.metrics.spacing.xl)
+        .frame(width: 460)
+        .background(self.theme.palette.windowBackground)
+        .interactiveDismissDisabled(self.isBusy)
     }
 }

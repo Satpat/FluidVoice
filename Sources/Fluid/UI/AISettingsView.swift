@@ -73,6 +73,7 @@ enum SpeechProviderFilter: String, CaseIterable, Identifiable {
     case apple = "Apple"
     case cohere = "Cohere"
     case openai = "OpenAI"
+    case qwen = "Qwen"
 
     var id: String { self.rawValue }
     var displayName: String { self == .nvidia ? "FluidVoice / NVIDIA" : self.rawValue }
@@ -95,6 +96,9 @@ enum AISettingsLayout {
     static let promptScopeLabelWidth: CGFloat = 110
     static let promptEditorLabelColumnWidth: CGFloat = 140
     static let promptEditorControlColumnWidth: CGFloat = 340
+    static let builtInStyleMinWidth: CGFloat = 300
+    static let stylesSectionSpacing: CGFloat = 28
+    static let editModeControlWidth: CGFloat = 260
     static let rowLeadingIndent: CGFloat = labelWidth + 12
 }
 

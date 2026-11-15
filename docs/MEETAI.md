@@ -30,6 +30,7 @@ MeetAI adds meeting features to upstream FluidVoice's FluidMeet without changing
 ## Known overlaps with upstream
 - Edit speakers → Merge (1.6.12) leaves the merged-away speaker's record in MeetAI's `speakers.json`. Harmless: nothing reads records for speakers absent from the session.
 - `fv-serve` (coding-agent meeting reader) sees upstream summaries only, not MeetAI's earlier `summary.json`.
+- Redo in another language (1.6.13): `retryProcessing(sessionID:languageCode:engine:)` carries MeetAI's per-meeting engine through upstream's redo flow, so a Whisper re-transcribe, like a language change, only replaces the stored engine and language once the new transcript completes. Session validation accepts any engine's language on past attempts.
 
 ## Testing note
 Test runs are signed with the user's personal team (`DEVELOPMENT_TEAM=BVA3X42BK9`): unsigned test hosts hang on a keychain prompt.

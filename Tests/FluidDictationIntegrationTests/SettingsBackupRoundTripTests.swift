@@ -1,5 +1,6 @@
 import AppKit
 @testable import FluidVoice_Debug
+import SwiftUI
 import XCTest
 
 @MainActor
@@ -50,12 +51,62 @@ final class SettingsBackupRoundTripTests: XCTestCase {
             let meeting = self.meetingDefaults()
             let configurations = self.configurations(profileID: profile.id)
             settings.meetingRecordingDefaults = meeting
+            let recentApplication = MeetingApplicationIdentity(bundleIdentifier: "fixture.recent", processID: 55, displayName: "Recent")
+            settings.meetingRecentApplication = recentApplication
             settings.privateAIIdleUnload = .thirtyMinutes
             settings.dictationPromptConfigurations = configurations
             settings.restore(from: payload, promptProfiles: [profile], appPromptBindings: [])
             XCTAssertEqual(settings.meetingRecordingDefaults, meeting)
+            XCTAssertEqual(settings.meetingRecentApplication, recentApplication)
             XCTAssertEqual(settings.privateAIIdleUnload, .thirtyMinutes)
             XCTAssertEqual(settings.dictationPromptConfigurations, configurations)
+        }
+    }
+
+    func testRestoredMeetingSourceSupersedesPreviousAppChoice() throws {
+        try self.withSavedDefaults {
+            let settings = SettingsStore.shared
+            var meeting = self.meetingDefaults()
+            meeting.mode = .onlineCall
+            settings.meetingRecordingDefaults = meeting
+            let payload = settings.makeBackupPayload()
+            settings.meetingRecentApplication = MeetingApplicationIdentity(bundleIdentifier: "fixture.stale", processID: 55, displayName: "Old app")
+            settings.restore(from: payload)
+            XCTAssertNil(settings.meetingRecentApplication)
+            XCTAssertEqual(settings.meetingRecordingDefaults, meeting)
+            let effective = settings.meetingRecordingDefaults.preferringLastPickedApplication(settings.meetingRecentApplication)
+            XCTAssertEqual(effective.applicationBundleIdentifier, meeting.applicationBundleIdentifier)
+            XCTAssertEqual(effective.microphoneCaptureDeviceID, meeting.microphoneCaptureDeviceID)
+            XCTAssertEqual(effective.languageCode, meeting.languageCode)
+        }
+    }
+
+    func testCustomAccentColorRoundTripsAndPresetClearsIt() throws {
+        try self.withSavedDefaults {
+            let settings = SettingsStore.shared
+            XCTAssertEqual(Color(hex: "#3AC8C6")?.hexString, "#3AC8C6")
+
+            settings.accentColorOption = .purple
+            settings.customAccentColorHex = "#FF2D55"
+            XCTAssertEqual(settings.accentColor.hexString, "#FF2D55")
+            let encoded = try JSONEncoder().encode(settings.makeBackupPayload())
+
+            settings.accentColorOption = .green
+            XCTAssertNil(settings.customAccentColorHex)
+            try settings.restore(
+                from: JSONDecoder().decode(SettingsBackupPayload.self, from: encoded),
+                promptProfiles: settings.dictationPromptProfiles,
+                appPromptBindings: []
+            )
+            XCTAssertEqual(settings.accentColorOption, .purple)
+            XCTAssertEqual(settings.customAccentColorHex, "#FF2D55")
+
+            settings.restore(
+                from: try self.payload(removing: ["customAccentColorHex"]),
+                promptProfiles: settings.dictationPromptProfiles,
+                appPromptBindings: []
+            )
+            XCTAssertNil(settings.customAccentColorHex)
         }
     }
 
@@ -105,6 +156,76 @@ final class SettingsBackupRoundTripTests: XCTestCase {
             XCTAssertEqual(settings.dictationPromptShortcutAssignments().count, 2)
             XCTAssertEqual(settings.selectedProviderID, payload.selectedProviderID)
             XCTAssertEqual(settings.primaryDictationShortcuts, payload.primaryDictationShortcuts)
+        }
+    }
+
+    func testLegacyLinkedEditUsesRestoredPromptProvider() throws {
+        try self.withSavedDefaults {
+            let settings = SettingsStore.shared
+            settings.selectedProviderID = "openai"
+            settings.rewriteModeLinkedToGlobal = true
+            settings.setDictationPromptSelection(.default, for: .primary)
+            settings.dictationPromptConfigurations = ["__default__": .init(providerID: "openai", modelName: "gpt-4o-mini")]
+            let payload = settings.makeBackupPayload()
+            settings.dictationPromptConfigurations = ["__default__": .init(providerID: "anthropic", modelName: "claude-haiku")]
+
+            settings.restore(from: payload, promptProfiles: [], appPromptBindings: [])
+
+            XCTAssertEqual(settings.rewriteModeSelectedProviderID, "openai")
+            XCTAssertFalse(settings.rewriteModeLinkedToGlobal)
+            XCTAssertEqual(settings.dictationPromptSelection(for: .primary), .default)
+            XCTAssertEqual(settings.selectedProviderID, payload.selectedProviderID)
+            XCTAssertEqual(settings.primaryDictationShortcuts, payload.primaryDictationShortcuts)
+        }
+    }
+
+    func testIndependentEditBackupKeepsItsOwnProvider() throws {
+        try self.withSavedDefaults {
+            let settings = SettingsStore.shared
+            settings.rewriteModeLinkedToGlobal = false
+            settings.rewriteModeSelectedProviderID = "anthropic"
+            settings.rewriteModeSelectedModel = "saved-edit-model"
+            let payload = settings.makeBackupPayload()
+            settings.rewriteModeSelectedProviderID = "openai"
+            settings.restore(from: payload, promptProfiles: [], appPromptBindings: [])
+            XCTAssertEqual(settings.rewriteModeSelectedProviderID, "anthropic")
+            XCTAssertEqual(settings.rewriteModeSelectedModel, "saved-edit-model")
+            XCTAssertFalse(settings.rewriteModeLinkedToGlobal)
+        }
+    }
+
+    func testDictionaryPromptDelayDefaultsAndRejectsUnknownStoredValues() throws {
+        try self.withSavedDefaults {
+            let defaults = UserDefaults.standard
+            let settings = SettingsStore.shared
+            defaults.removeObject(forKey: "AutomaticDictionaryPromptDelay")
+            XCTAssertEqual(settings.automaticDictionaryPromptDelay, .three)
+            for invalid in [-1, 0, 999, 4000] {
+                defaults.set(invalid, forKey: "AutomaticDictionaryPromptDelay")
+                XCTAssertEqual(settings.automaticDictionaryPromptDelay, .three)
+            }
+        }
+    }
+
+    func testDictionaryPromptDelayBackupRoundTripAndLegacyPreservation() throws {
+        try self.withSavedDefaults {
+            let settings = SettingsStore.shared
+            let enabled = settings.automaticDictionaryLearningEnabled
+            let frequency = settings.automaticDictionarySuggestionFrequency
+            for delay in SettingsStore.AutomaticDictionaryPromptDelay.allCases {
+                settings.automaticDictionaryPromptDelay = delay
+                let data = try JSONEncoder().encode(settings.makeBackupPayload())
+                let payload = try JSONDecoder().decode(SettingsBackupPayload.self, from: data)
+                settings.automaticDictionaryPromptDelay = .three
+                settings.restore(from: payload, promptProfiles: [], appPromptBindings: [])
+                XCTAssertEqual(settings.automaticDictionaryPromptDelay, delay)
+                XCTAssertEqual(settings.automaticDictionaryLearningEnabled, enabled)
+                XCTAssertEqual(settings.automaticDictionarySuggestionFrequency, frequency)
+            }
+            let legacy = try self.payload(removing: ["automaticDictionaryPromptDelay"])
+            settings.automaticDictionaryPromptDelay = .threeQuarters
+            settings.restore(from: legacy, promptProfiles: [], appPromptBindings: [])
+            XCTAssertEqual(settings.automaticDictionaryPromptDelay, .threeQuarters)
         }
     }
 

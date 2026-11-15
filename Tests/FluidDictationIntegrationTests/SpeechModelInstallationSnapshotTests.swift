@@ -144,7 +144,7 @@ final class SpeechModelInstallationSnapshotTests: XCTestCase {
         XCTAssertThrowsError(try SpeechModelFeed.verified(envelope: data, publicKeys: CompactSpeechModelReleaseCatalog.publicKeys, lastSequence: 0)) {
             XCTAssertEqual($0 as? SpeechModelFeed.Rejection, .badSignature)
         }
-        XCTAssertEqual(CompactSpeechModelReleaseCatalog.manifestURL.absoluteString, "https://models.fluidvoice.app/feed/v1/speech-models.json")
+        XCTAssertEqual(CompactSpeechModelReleaseCatalog.manifestURL.absoluteString, "https://models.fluidvoice.com/feed/v1/speech-models.json")
         XCTAssertEqual(CompactSpeechModelReleaseCatalog.maximumManifestBytes, 64 * 1024)
     }
 
@@ -161,12 +161,13 @@ final class SpeechModelInstallationSnapshotTests: XCTestCase {
             XCTAssertNotEqual(release.archiveSHA256, original.archiveSHA256)
             XCTAssertNotEqual(release.manifestSHA256, original.manifestSHA256)
             XCTAssertEqual(release.expectedDownloadBytes, original.expectedDownloadBytes)
+            XCTAssertEqual(release.archiveURL?.host, "models.fluidvoice.com")
             XCTAssertEqual(release.folderName, original.folderName)
             XCTAssertEqual(release.requiredModelNames, original.requiredModelNames)
             XCTAssertEqual(release.vocabularyFile, original.vocabularyFile)
             XCTAssertEqual(release.displayName, original.displayName)
             XCTAssertEqual(release.cardDescription, original.cardDescription)
-            XCTAssertEqual(release.supportedLanguageCodes, ["en"])
+            XCTAssertEqual(release.supportedLanguageCodes, original.supportedLanguageCodes)
         }
         let builtins: [ParakeetSpeechModelCatalog.Variant: ParakeetSpeechModelCatalog.Descriptor] = [.mini: ParakeetSpeechModelCatalog.mini, .pico: ParakeetSpeechModelCatalog.pico]
         XCTAssertEqual(CompactSpeechModelReleaseCatalog.descriptors(in: payload, build: 26), builtins)

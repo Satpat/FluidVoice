@@ -1,7 +1,7 @@
 import Foundation
 import TranscribeCpp
 
-/// TranscriptionProvider implementation using transcribe.cpp for Whisper GGUF models.
+/// TranscriptionProvider implementation using transcribe.cpp for Whisper and Qwen GGUF models.
 final class WhisperProvider: TranscriptionProvider {
     let name = "Whisper (Universal)"
 
@@ -190,7 +190,7 @@ final class WhisperProvider: TranscriptionProvider {
         }
 
         if !FileManager.default.fileExists(atPath: self.modelURL.path) {
-            DebugLogger.shared.info("WhisperProvider: Downloading Whisper GGUF model...", source: "WhisperProvider")
+            DebugLogger.shared.info("WhisperProvider: Downloading \(targetModel.displayName) GGUF model...", source: "WhisperProvider")
             progressHandler?(.preparingDownload)
             try await self.downloadModel { progress in
                 progressHandler?(.downloading(progress))
@@ -202,10 +202,12 @@ final class WhisperProvider: TranscriptionProvider {
             throw NSError(
                 domain: "WhisperProvider",
                 code: -3,
-                userInfo: [NSLocalizedDescriptionKey: "Whisper model file is missing or corrupted. Please re-download the model."]
+                userInfo: [NSLocalizedDescriptionKey: "\(targetModel.displayName) model file is missing or corrupted. Please re-download the model."]
             )
         }
-        self.removeLegacyModelIfNeeded()
+        if targetModel.isWhisperModel {
+            self.removeLegacyModelIfNeeded()
+        }
 
         let requiredMemoryGB = targetModel.requiredMemoryGB
         let availableMemoryGB = Self.availableMemoryGB()
@@ -253,7 +255,7 @@ final class WhisperProvider: TranscriptionProvider {
         try Task.checkCancellation()
         self.installModel(loadedModel, session: loadedSession, modelName: currentModelName)
         DebugLogger.shared.info(
-            "WhisperProvider: Model ready (\(currentModelName), backend=\(loadedModel.backend), arch=\(loadedModel.arch))",
+            "WhisperProvider: Model ready (\(currentModelName), backend=\(loadedModel.backend), arch=\(loadedModel.arch), maxAudioMs=\(loadedModel.capabilities.maxAudioMs))",
             source: "WhisperProvider"
         )
     }
@@ -263,7 +265,7 @@ final class WhisperProvider: TranscriptionProvider {
             throw NSError(
                 domain: "WhisperProvider",
                 code: -5,
-                userInfo: [NSLocalizedDescriptionKey: "\(model.displayName) requires the Metal Whisper backend on Apple Silicon."]
+                userInfo: [NSLocalizedDescriptionKey: "\(model.displayName) requires the Metal transcription backend on Apple Silicon."]
             )
         }
 
@@ -311,7 +313,7 @@ final class WhisperProvider: TranscriptionProvider {
             throw NSError(
                 domain: "WhisperProvider",
                 code: -2,
-                userInfo: [NSLocalizedDescriptionKey: "Audio too short for Whisper transcription"]
+                userInfo: [NSLocalizedDescriptionKey: "Audio too short for \(self.selectedModel.displayName) transcription"]
             )
         }
 
@@ -319,23 +321,33 @@ final class WhisperProvider: TranscriptionProvider {
             throw NSError(
                 domain: "WhisperProvider",
                 code: -1,
-                userInfo: [NSLocalizedDescriptionKey: "Whisper model not loaded"]
+                userInfo: [NSLocalizedDescriptionKey: "\(self.selectedModel.displayName) model not loaded"]
             )
         }
 
         let resolvedLanguageCode = languageCode
             ?? self.languageCodeOverride
-            ?? SettingsStore.shared.selectedWhisperLanguageCode
         let transcript = try await session.run(
             samples,
-            options: Self.runOptions(languageCode: resolvedLanguageCode)
+            options: Self.runOptions(
+                languageCode: resolvedLanguageCode,
+                model: self.selectedModel,
+                whisperLanguageCode: SettingsStore.shared.selectedWhisperLanguageCode
+            )
         )
         let fullText = transcript.text.trimmingCharacters(in: .whitespacesAndNewlines)
         return ASRTranscriptionResult(text: fullText, confidence: 1.0)
     }
 
-    static func runOptions(languageCode: String?) -> RunOptions {
-        RunOptions(timestamps: .segment, language: languageCode)
+    static func runOptions(
+        languageCode: String?,
+        model: SettingsStore.SpeechModel = .whisperBase,
+        whisperLanguageCode: String? = nil
+    ) -> RunOptions {
+        // Qwen3-ASR decodes text only and rejects timestamp requests.
+        let timestamps: TimestampKind = model == .qwen3Asr17B ? .none : .segment
+        let language = languageCode ?? (model.isWhisperModel ? whisperLanguageCode : nil)
+        return RunOptions(timestamps: timestamps, language: language)
     }
 
     func modelsExistOnDisk() -> Bool {
@@ -364,7 +376,7 @@ final class WhisperProvider: TranscriptionProvider {
             throw NSError(
                 domain: "WhisperProvider",
                 code: -1,
-                userInfo: [NSLocalizedDescriptionKey: "Invalid Whisper model URL"]
+                userInfo: [NSLocalizedDescriptionKey: "Invalid \(self.selectedModel.displayName) model URL"]
             )
         }
 
@@ -391,7 +403,7 @@ final class WhisperProvider: TranscriptionProvider {
                     let message: String
                     switch error.code {
                     case NSURLErrorNotConnectedToInternet:
-                        message = "No internet connection. Please connect to the internet to download the Whisper model."
+                        message = "No internet connection. Please connect to the internet to download \(self.selectedModel.displayName)."
                     case NSURLErrorTimedOut:
                         message = "Download timed out. Please check your internet connection and try again."
                     case NSURLErrorCannotFindHost, NSURLErrorCannotConnectToHost:

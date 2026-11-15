@@ -33,6 +33,16 @@ final class TypingService {
         case insertedActionSuppressed
         case insertedAndActionDispatched
 
+        /// Dispatch is not confirmation that another app inserted the text.
+        var pipelineLogOutcome: String {
+            switch self {
+            case .inserted: "input_dispatched"
+            case .insertedActionSuppressed: "input_dispatched_action_suppressed"
+            case .insertedAndActionDispatched: "input_and_action_dispatched"
+            default: String(describing: self)
+            }
+        }
+
         var didInsert: Bool {
             switch self {
             case .inserted, .insertedActionSuppressed, .insertedAndActionDispatched:
@@ -473,6 +483,7 @@ final class TypingService {
         isOutputValid: @escaping @MainActor () -> Bool = { true }
     ) async -> TextDeliveryResult {
         guard isOutputValid() else { return .cancelled }
+        let verificationID = PasteRecoverySequence.shared.nextID()
         let requestedAt = ProcessInfo.processInfo.systemUptime
         var closeTrace = OverlayCloseTrace("typing.delivery")
         defer { closeTrace.finish() }
@@ -519,8 +530,11 @@ final class TypingService {
         }
 
         // Refuse only when the focused element certainly cannot take text.
+        let frontmost = NSWorkspace.shared.frontmostApplication
+        let focusDiagnostic = "frontmostApp=\(frontmost?.bundleIdentifier ?? "unknown") " +
+            "frontmostPID=\(frontmost?.processIdentifier ?? 0) intendedPID=\(preferredTargetPID ?? 0)"
         let targetAssessment = DeliveryTargetAssessment.assessFocusedElement()
-        DebugLogger.shared.info("FOCUS_ASSESS \(targetAssessment.logDescription)", source: "TypingService")
+        DebugLogger.shared.info("FOCUS_ASSESS \(targetAssessment.logDescription) \(focusDiagnostic)", source: "TypingService")
         if targetAssessment.isCertainlyNotEditable {
             await PasteDeliveryCoordinator.shared.copyBackup(text, enabled: preserveTranscriptOnClipboard, isOutputValid: isOutputValid)
             guard isOutputValid() else { return .cancelled }
@@ -540,7 +554,21 @@ final class TypingService {
             self.ghosttyTargetPID(preferredTargetPID: preferredTargetPID) != nil
         // The read-back baseline costs an AX value read; only the clipboard
         // paths verify, so the direct path skips it.
-        var verificationBefore = usesClipboard ? PasteVerifier.capture() : nil
+        let evidence = PasteRecoveryEvidence { recovery in
+            guard verifiesLanding else { return }
+            guard isOutputValid(), SettingsStore.shared.showPasteCheckAlerts else {
+                let reason = isOutputValid() ? "alerts_disabled" : "cancelled_output"
+                DebugLogger.shared.info("PASTE_RECOVERY suppressed id=\(verificationID) reason=\(reason)", source: "TypingService")
+                return
+            }
+            DebugLogger.shared.info("PASTE_RECOVERY available id=\(verificationID) unverified=\(recovery == .unverified)", source: "TypingService")
+            NotificationCenter.default.post(name: .fluidPasteRecoveryAvailable, object: nil, userInfo: [
+                "transcript": text, "verificationID": verificationID,
+                "unverified": recovery == .unverified,
+            ])
+        }
+        var verificationBefore = usesClipboard ? await PasteVerifier.captureForDelivery() : nil
+        guard isOutputValid() else { return .cancelled }
         let result: TextDeliveryResult
         let deliveryPath: AnalyticsInsertionPath
         var dispatchedAt: TimeInterval?
@@ -550,7 +578,8 @@ final class TypingService {
                 text,
                 preserveTranscriptOnClipboard: preserveTranscriptOnClipboard,
                 isOutputValid: isOutputValid,
-                onCommandPosted: { dispatchedAt = $0 }
+                onCommandPosted: { dispatchedAt = $0 },
+                onReadTimeout: { evidence.clipboardTimedOut() }
             )
         } else if await self.insertTextDirectlyOffMain(text, preferredTargetPID: preferredTargetPID, isOutputValid: isOutputValid) {
             deliveryPath = .direct
@@ -558,13 +587,14 @@ final class TypingService {
             result = .commandPosted
         } else {
             deliveryPath = .clipboardFallback
-            verificationBefore = PasteVerifier.capture()
+            verificationBefore = await PasteVerifier.captureForDelivery()
             self.log("[TypingService] Direct insertion failed; using non-blocking clipboard fallback")
             result = await PasteDeliveryCoordinator.shared.deliver(
                 text,
                 preserveTranscriptOnClipboard: preserveTranscriptOnClipboard,
                 isOutputValid: isOutputValid,
-                onCommandPosted: { dispatchedAt = $0 }
+                onCommandPosted: { dispatchedAt = $0 },
+                onReadTimeout: { evidence.clipboardTimedOut() }
             )
         }
 
@@ -581,10 +611,15 @@ final class TypingService {
             toggleStopRequestedAt: toggleStopRequestedAt,
             completedAt: completedAt
         )
-        if verifiesLanding, SettingsStore.shared.showPasteCheckAlerts,
-           result == .commandPosted, deliveryPath != .direct, let verificationBefore
-        {
-            self.verifyPasteLanded(text, before: verificationBefore)
+        if verifiesLanding, result == .commandPosted, deliveryPath != .direct, let verificationBefore {
+            self.verifyPasteLanded(text, before: verificationBefore, postedAt: completedAt, evidence: evidence)
+        } else if verifiesLanding, result == .commandPosted, deliveryPath != .direct {
+            DebugLogger.shared.info("PASTE_VERIFY unknown reason=baseline_unavailable \(focusDiagnostic)", source: "TypingService")
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: UInt64(PasteVerifier.totalDecisionDelay * 1_000_000_000))
+                guard !Task.isCancelled else { return }
+                evidence.verified(.unknown(reason: "baseline_unavailable"))
+            }
         }
         // The caller starts correction tracking after completing delivery UI.
         return result
@@ -697,6 +732,10 @@ final class TypingService {
         toggleStopRequestedAt: TimeInterval?,
         completedAt: TimeInterval = ProcessInfo.processInfo.systemUptime
     ) {
+        DebugLogger.shared.info(
+            "TEXT_DELIVERY path=\(path.rawValue) result=\(String(describing: result)) elapsedMs=\(max(0, Self.elapsedMs(from: requestedAt, to: completedAt)))",
+            source: "TypingService"
+        )
         guard let outcome = Self.analyticsOutcome(for: result) else { return }
         let isClipboardDispatch = outcome == .dispatched &&
             (path == .clipboard || path == .clipboardFallback)
@@ -713,27 +752,33 @@ final class TypingService {
         )
     }
 
-    /// Off-main read-back after a paste. Logs every verdict; only a certain
-    /// `notLanded` reaches the UI.
-    private func verifyPasteLanded(_ text: String, before: PasteVerifier.Snapshot) {
+    /// Bounded off-main read-back always records diagnostics. The preference-controlled card
+    /// remains separate, so turning alerts off cannot hide evidence of a miss.
+    private func verifyPasteLanded(_ text: String, before: PasteVerifier.Snapshot, postedAt: TimeInterval, evidence: PasteRecoveryEvidence) {
+        let pipelineID = DebugLogger.pipelineID
         Task.detached(priority: .utility) {
-            let startedAt = ProcessInfo.processInfo.systemUptime
-            var verdict = await PasteVerifier.verify(before: before, pastedText: text)
-            if case .notLanded = verdict, PasteVerifier.userActedAfterPaste(
-                secondsSinceLastInput: PasteVerifier.secondsSinceLastUserInput(),
-                secondsSincePaste: ProcessInfo.processInfo.systemUptime - startedAt
-            ) {
-                verdict = .unknown(reason: "user_input_after_paste")
-            }
-            let app = NSRunningApplication(processIdentifier: before.pid)?.bundleIdentifier ?? "pid\(before.pid)"
-            DebugLogger.shared.info(
-                "PASTE_VERIFY \(verdict.logDescription) app=\(app) before[\(before.summary)] " +
-                    "elapsedMs=\(Int(((ProcessInfo.processInfo.systemUptime - startedAt) * 1000).rounded()))",
-                source: "TypingService"
-            )
-            guard case .notLanded = verdict else { return }
-            await MainActor.run {
-                NotificationCenter.default.post(name: .fluidPasteNotLanded, object: nil, userInfo: ["transcript": text])
+            await DebugLogger.$pipelineID.withValue(pipelineID) {
+                let startedAt = postedAt
+                var verdict = await PasteVerifier.verify(before: before, pastedText: text)
+                if case .notLanded = verdict, PasteVerifier.userActedAfterPaste(
+                    secondsSinceLastInput: PasteVerifier.secondsSinceLastUserInput(),
+                    secondsSincePaste: ProcessInfo.processInfo.systemUptime - startedAt
+                ) {
+                    verdict = .unknown(reason: "user_input_after_paste")
+                }
+                let app = NSRunningApplication(processIdentifier: before.pid)?.bundleIdentifier ?? "pid\(before.pid)"
+                DebugLogger.shared.info(
+                    "PASTE_VERIFY \(verdict.logDescription) app=\(app) before[\(before.summary)] " +
+                        "elapsedMs=\(Int(((ProcessInfo.processInfo.systemUptime - startedAt) * 1000).rounded()))",
+                    source: "TypingService"
+                )
+                if case .unknown = verdict {
+                    let remaining = PasteVerifier.totalDecisionDelay - (ProcessInfo.processInfo.systemUptime - startedAt)
+                    if remaining > 0 { try? await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000)) }
+                    guard !Task.isCancelled else { return }
+                }
+                let completedVerdict = verdict
+                await MainActor.run { evidence.verified(completedVerdict) }
             }
         }
     }

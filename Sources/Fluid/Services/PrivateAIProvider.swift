@@ -149,6 +149,7 @@ struct PrivateAIRegisteredModel: Sendable, Codable, Hashable, Identifiable {
     var parameterCount: String
     var recommendedMemoryGB: Int?
     var artifact: PrivateAIModelArtifact
+    var presentation: PrivateAIModelPresentation?
 
     var canDownload: Bool {
         self.artifact.downloadURL != nil && self.artifact.sha256?.isEmpty == false
@@ -202,9 +203,13 @@ protocol PrivateAIProviderFeatureProviding: Sendable {
     func isKnownModelID(_ value: String) -> Bool
     func matches(model: String) -> Bool
     func localModelURL(for model: PrivateAIRegisteredModel, directoryURL: URL) -> URL
+    func recommendedModelID(for task: PrivateAIModelTask, on hardware: PrivateAIMacHardware) -> String?
 }
 
+// Optional catalog advice keeps older providers compatible.
 extension PrivateAIProviderFeatureProviding {
+    func recommendedModelID(for _: PrivateAIModelTask, on _: PrivateAIMacHardware) -> String? { nil }
+
     func selectedModelDefaultsKey(for _: PrivateAIModelTask) -> String {
         self.selectedModelDefaultsKey
     }
@@ -254,6 +259,9 @@ protocol PrivateAIIntegrationProviding: Sendable {
     func commitModelUpdate(_ token: PrivateAIModelUpdateToken) async
     func rollbackModelUpdate(_ token: PrivateAIModelUpdateToken) async
     func shouldHandleDictation(model: String) -> Bool
+    /// True when the model was trained to read the text before the cursor
+    /// and on screen, so dictation only captures them for that model.
+    func readsDictationContext(model: String) -> Bool
     func status(for runtime: PrivateAIIntegrationService.RuntimeConfiguration) async -> PrivateAIStatus
     func loadedModelState() async -> PrivateAIIntegrationService.LoadedModelState?
     func residencySnapshot() async throws -> MeetingResidentModel?
@@ -263,6 +271,8 @@ protocol PrivateAIIntegrationProviding: Sendable {
     func prewarmDictation() async
     func unloadCachedRuntime(reason: String) async
     func shutdownForTermination() async
+    /// Loads the Edit Mode model ahead of its first request.
+    func prewarmEdit() async
     nonisolated func enhanceDictation(
         _ inputText: String,
         runtime: PrivateAIIntegrationService.RuntimeConfiguration,
@@ -308,6 +318,8 @@ extension PrivateAIIntegrationProviding {
 
     func restoreResidency(_: MeetingResidentModel) async throws {}
 
+    func readsDictationContext(model _: String) -> Bool { false }
+
     func verifyModel(_ model: PrivateAIRegisteredModel) async throws -> PrivateAIStatus {
         try await self.loadModel(model)
     }
@@ -345,6 +357,8 @@ extension PrivateAIIntegrationProviding {
     func shutdownForTermination() async {
         await self.unloadCachedRuntime(reason: "termination")
     }
+
+    func prewarmEdit() async {}
 
     nonisolated func enhanceDictation(
         _ inputText: String,
@@ -456,6 +470,10 @@ enum PrivateAIModelRegistry {
 
     nonisolated static func modelIDs(for task: PrivateAIModelTask) -> [String] {
         PrivateAIProviderFeature.shared.modelIDs(for: task)
+    }
+
+    nonisolated static func recommendedModelID(for task: PrivateAIModelTask, on hardware: PrivateAIMacHardware) -> String? {
+        PrivateAIProviderFeature.shared.recommendedModelID(for: task, on: hardware)
     }
 
     nonisolated static func localModelURL(for model: PrivateAIRegisteredModel, directoryURL: URL) -> URL {
@@ -581,4 +599,21 @@ nonisolated struct PrivateAIConfirmedResidency: Sendable {
         guard generation == self.generation else { return }
         self.isResident = isResident
     }
+}
+
+/// Optional metadata returned by current private providers; older hosts need not display it.
+struct PrivateAIReleaseHighlight: Sendable, Equatable {
+    var id: String
+    var eyebrow: String
+    var title: String
+    var detail: String
+    var action: String
+    var releaseTitle: String
+    var subtitle: String
+}
+
+struct PrivateAIBoostOption: Sendable, Equatable {
+    var title: String
+    var detail: String
+    var help: String
 }

@@ -1,7 +1,7 @@
 import Foundation
 
 // Stage E of `MEETING_TRANSCRIPTION_IMPLEMENTATION_PLAN.md`: the local composite backend.
-// Parakeet TDT v2/v3 produce word-timed ASR; Nemotron-3 produces per-epoch speaker activity. The
+// Fluid Speech Pro/Parakeet v3 produce word-timed ASR; Nemotron-3 produces per-epoch speaker activity. The
 // backend owns orchestration — per-epoch materialization, unit construction, slot assignment and
 // exactly-tiling coverage receipts — while the host-injected runtime owns the two model
 // capabilities. It never touches the filesystem outside the frozen request's session directory,
@@ -16,7 +16,7 @@ final class MeetingParakeetNemotronBackend: MeetingTranscriptionBackend {
 
     static let descriptor = MeetingBackendDescriptor(
         id: .parakeetNemotron,
-        version: "8",
+        version: "12",
         execution: .local,
         supportedLanguageCodes: VoiceEngineLanguageCatalog.parakeetV3LanguageIDs,
         supportedTrackKinds: Set(MeetingAudioTrackKind.allCases),
@@ -25,7 +25,7 @@ final class MeetingParakeetNemotronBackend: MeetingTranscriptionBackend {
         knownLimits: [
             "Nemotron-3 has 8 speaker slots per analysis epoch; a ninth voice is not reliably announced or separated.",
             "Speaker slots are epoch-scoped; conservative local voice matching can reconnect identities across epochs of the same track.",
-            "Parakeet TDT v2 handles English; v3 handles the supported European languages.",
+            "Fluid Speech Pro and Parakeet v3 handle the supported European languages with automatic language recognition.",
             "When ASR returns text without usable word timings, one utterance covering the epoch is emitted instead of fabricated words.",
             "Local Nemotron model must be installed before planning. Voice matching downloads its local embedding model on first use.",
         ],
@@ -313,7 +313,9 @@ final class MeetingParakeetNemotronBackend: MeetingTranscriptionBackend {
                 }
                 try Task.checkCancellation()
                 do {
-                    let output = try await asr.transcribeWithTimings(materialized.samples)
+                    // Parakeet rejects subsecond input. Pad only inference; the original
+                    // sample count below still bounds word timings and coverage receipts.
+                    let output = try await asr.transcribeWithTimings(Self.asrInput(materialized.samples))
                     result.outputs.append(MeetingParakeetEpochOutput(
                         epochID: work.epoch.id,
                         text: output.result.text,
@@ -372,6 +374,11 @@ final class MeetingParakeetNemotronBackend: MeetingTranscriptionBackend {
             try cache.insert(materialized, spanID: work.spans.last?.id ?? "unknown")
         }
         return materialized
+    }
+
+    nonisolated static func asrInput(_ samples: [Float]) -> [Float] {
+        guard !samples.isEmpty, samples.count < 16_000 else { return samples }
+        return samples + [Float](repeating: 0, count: 16_000 - samples.count)
     }
 
     // MARK: - Units, assignment and receipts
@@ -534,6 +541,9 @@ final class MeetingParakeetNemotronBackend: MeetingTranscriptionBackend {
             }
         }
 
+        // A provider without timings may supply an utterance. Rejected timed words must
+        // not return through that fallback, including words predicted only in padded silence.
+        guard output.words.isEmpty else { return [] }
         let text = output.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return [] }
         let spanIDs = work.spans.map(\.id)

@@ -161,6 +161,7 @@ final class AutomaticDictionaryCorrectionTracker {
         let pid: pid_t
         let expectedValue: String
         let insertedRange: NSRange
+        let selection: NSRange
     }
 
     private struct PendingCorrection {
@@ -178,7 +179,9 @@ final class AutomaticDictionaryCorrectionTracker {
         let observesSelectionChanges: Bool
         let observesFocusChanges: Bool
         let learningRecording: DictionaryLearningRecording?
+        let correctionRecording: DictionaryCorrectionRecording?
         var lastValue: String
+        var lastSelection: NSRange
         var insertedRange: NSRange
         var pendingCorrection: PendingCorrection?
     }
@@ -191,8 +194,13 @@ final class AutomaticDictionaryCorrectionTracker {
         hasVoiceSpellings ? DictionaryVoiceSpellingLearner.confirmationWindow + .seconds(5) : .seconds(30)
     }
 
-    private static let completionSignalDelayNanoseconds: UInt64 = 1_000_000_000
-    private static let inactivityFallbackNanoseconds: UInt64 = 3_000_000_000
+    private static var completionSignalDelayNanoseconds: UInt64 {
+        SettingsStore.shared.automaticDictionaryPromptDelay.completionNanoseconds
+    }
+
+    private static var inactivityFallbackNanoseconds: UInt64 {
+        SettingsStore.shared.automaticDictionaryPromptDelay.inactivityNanoseconds
+    }
 
     private var observer: AXObserver?
     private var session: ObservationSession?
@@ -205,7 +213,8 @@ final class AutomaticDictionaryCorrectionTracker {
     private init() {}
 
     func beginObservingInsertion(
-        _ insertedText: String, targetPID: pid_t?, learningRecording: DictionaryLearningRecording? = nil
+        _ insertedText: String, targetPID: pid_t?, learningRecording: DictionaryLearningRecording? = nil,
+        correctionRecording: DictionaryCorrectionRecording? = nil
     ) {
         self.cancel()
         guard SettingsStore.shared.automaticDictionaryLearningEnabled || DictionaryMatcherExperiment.collectNegatives,
@@ -227,7 +236,7 @@ final class AutomaticDictionaryCorrectionTracker {
                 )
                 guard !Task.isCancelled, let self else { return }
                 if let seed {
-                    self.installObserver(for: seed, learningRecording: DictionaryMatcherExperiment.sharedFeaturesEnabled ? learningRecording : nil)
+                    self.installObserver(for: seed, learningRecording: DictionaryMatcherExperiment.sharedFeaturesEnabled ? learningRecording : nil, correctionRecording: correctionRecording)
                     return
                 }
             }
@@ -335,13 +344,18 @@ final class AutomaticDictionaryCorrectionTracker {
     }
 
     func handleObservedSelectionChange() {
-        guard let session = self.session,
-              let pending = session.pendingCorrection,
-              let correctedRange = pending.correctedRange,
-              let selection = Self.selectedRange(of: session.element)
+        guard var session = self.session,
+              let selection = Self.selectedRange(of: session.element),
+              selection != session.lastSelection
         else {
             return
         }
+        // Some editors repeat this notification while the caret has not moved.
+        // Keep the original deadline, but still track real moves before any edit.
+        session.lastSelection = selection
+        self.session = session
+        guard let pending = session.pendingCorrection,
+              let correctedRange = pending.correctedRange else { return }
 
         let delay = AutomaticDictionaryCorrectionDetector.selectionTouchesCandidate(
             selection,
@@ -411,11 +425,12 @@ final class AutomaticDictionaryCorrectionTracker {
             element: focus.element,
             pid: focus.pid,
             expectedValue: value,
-            insertedRange: insertedRange
+            insertedRange: insertedRange,
+            selection: selectedRange
         )
     }
 
-    private func installObserver(for seed: InsertionSeed, learningRecording: DictionaryLearningRecording?) {
+    private func installObserver(for seed: InsertionSeed, learningRecording: DictionaryLearningRecording?, correctionRecording: DictionaryCorrectionRecording?) {
         self.verificationTask = nil
         var createdObserver: AXObserver?
         let createResult = AXObserverCreate(seed.pid, automaticDictionaryAXObserverCallback, &createdObserver)
@@ -452,7 +467,9 @@ final class AutomaticDictionaryCorrectionTracker {
             observesSelectionChanges: selectionResult == .success,
             observesFocusChanges: focusResult == .success,
             learningRecording: learningRecording,
+            correctionRecording: correctionRecording,
             lastValue: seed.expectedValue,
+            lastSelection: seed.selection,
             insertedRange: seed.insertedRange,
             pendingCorrection: nil
         )
@@ -486,7 +503,7 @@ final class AutomaticDictionaryCorrectionTracker {
     }
 
     private func evaluate(_ pending: PendingCorrection) {
-        let candidate = AutomaticDictionaryCorrectionDetector.candidate(
+        var candidate = AutomaticDictionaryCorrectionDetector.candidate(
             before: pending.beforeValue,
             after: pending.afterValue,
             insertedRange: pending.insertedRange,
@@ -506,6 +523,17 @@ final class AutomaticDictionaryCorrectionTracker {
                     recording: recording, deliveredTextBeforeEdit: before.substring(with: insertion), selectedUTF16Range: range
                 )
             }
+        }
+        if let detected = candidate, let recording = self.session?.correctionRecording {
+            candidate?.trainingExample = DictionaryCorrectionExample.make(
+                id: detected.id,
+                recording: recording,
+                before: pending.beforeValue,
+                after: pending.afterValue,
+                insertedRange: pending.insertedRange,
+                heardWord: detected.heardText,
+                correctedWord: detected.correctedText
+            )
         }
         self.stopObservation()
 

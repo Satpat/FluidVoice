@@ -409,7 +409,7 @@ final class MeetingParakeetNemotronBackendTests: XCTestCase {
         XCTAssertNil(input[2].speakerID, "raw input evidence is unchanged")
     }
 
-    func testUnknownInheritanceUsesChronologicalSpeakerAcrossTracksWithoutMovingAudio() {
+    func testUnknownInheritanceUsesPreviousSpeakerOnItsOwnAudioTrack() {
         let mic = UUID()
         let app = UUID()
         let first = UUID()
@@ -420,10 +420,135 @@ final class MeetingParakeetNemotronBackendTests: XCTestCase {
             self.canonicalSegment(trackID: mic, start: 2, end: 2.3, speakerID: nil, text: "tail"),
         ]
         let output = MeetingProcessingPipeline.inheritPreviousSpeaker(input)
-        XCTAssertEqual(output.last?.speakerID, second)
+        XCTAssertEqual(output.last?.speakerID, first, "A microphone reply must not inherit the remote speaker")
         XCTAssertEqual(output.last?.sourceTrackID, mic)
         let turns = MeetingProcessingPipeline.mergeCanonicalSegments(input)
         XCTAssertEqual(turns.count, 3, "separate audio tracks keep separate playback ranges")
+    }
+
+    func testOpeningUnknownOnOneTrackDoesNotBorrowAnotherTracksSpeaker() {
+        let app = UUID()
+        let mic = UUID()
+        let input = [
+            self.canonicalSegment(trackID: app, start: 0, end: 1, speakerID: UUID(), text: "Question"),
+            self.canonicalSegment(trackID: mic, start: 1.2, end: 1.5, speakerID: nil, text: "Yes"),
+        ]
+        let output = MeetingProcessingPipeline.inheritPreviousSpeaker(input)
+        XCTAssertEqual(output, input, "No microphone speaker evidence means the reply stays unknown")
+    }
+
+    func testCanonicalMergeKeepsCrossTrackQuestionAnswerQuestionInOrder() {
+        let app = UUID()
+        let mic = UUID()
+        let remoteSpeaker = UUID()
+        let localSpeaker = UUID()
+        let input = [
+            self.canonicalSegment(trackID: app, start: 0, end: 1, speakerID: remoteSpeaker, text: "Where?"),
+            self.canonicalSegment(trackID: mic, start: 1.2, end: 1.5, speakerID: localSpeaker, text: "Here"),
+            self.canonicalSegment(trackID: app, start: 1.6, end: 2, speakerID: remoteSpeaker, text: "How long?"),
+            self.canonicalSegment(trackID: mic, start: 2.1, end: 2.5, speakerID: localSpeaker, text: "Two years"),
+        ]
+        let turns = MeetingProcessingPipeline.mergeCanonicalSegments(input.reversed())
+        XCTAssertEqual(turns, input, "Never join all questions ahead of all answers")
+        XCTAssertEqual(MeetingProcessingPipeline.mergeCanonicalSegments(input), turns)
+    }
+
+    func testCrossTrackEchoDoesNotSplitVisibleSpeechOrSupplyASpeaker() {
+        let app = UUID()
+        let mic = UUID()
+        let speaker = UUID()
+        let input = [
+            self.canonicalSegment(trackID: app, start: 0, end: 1, speakerID: speaker, text: "Hello"),
+            self.canonicalSegment(trackID: mic, start: 0.1, end: 1.1, speakerID: UUID(), text: "Hello", isLikelyEcho: true),
+            self.canonicalSegment(trackID: app, start: 1.2, end: 2, speakerID: speaker, text: "there"),
+            self.canonicalSegment(trackID: mic, start: 2.1, end: 2.5, speakerID: nil, text: "Yes"),
+        ]
+        let turns = MeetingProcessingPipeline.mergeCanonicalSegments(input)
+        XCTAssertEqual(turns.filter { !$0.isEcho }.map(\.text), ["Hello there", "Yes"])
+        XCTAssertEqual(turns.filter(\.isEcho), [input[1]])
+        XCTAssertNil(turns.last?.speakerID, "An echo is not evidence of the microphone speaker")
+    }
+
+    func testRealSimultaneousSpeechKeepsItsOriginalTimingAndOverlap() {
+        let app = UUID()
+        let mic = UUID()
+        let input = [
+            self.canonicalSegment(trackID: app, start: 0, end: 2, speakerID: UUID(), text: "Question", overlap: .overlapsOtherTrack),
+            self.canonicalSegment(trackID: mic, start: 1, end: 1.5, speakerID: UUID(), text: "Reply", overlap: .overlapsOtherTrack),
+        ]
+        XCTAssertEqual(MeetingProcessingPipeline.mergeCanonicalSegments(input), input, "Do not invent word timing to remove real overlaps")
+    }
+
+    func testOverlappingWordStreamsStayReadableAndNormalizeWholeQuantities() async throws {
+        let app = UUID()
+        let mic = UUID()
+        let remote = UUID()
+        let local = UUID()
+        let input = [
+            self.canonicalSegment(trackID: app, start: 0, end: 0.4, speakerID: remote, text: "twenty", overlap: .overlapsOtherTrack),
+            self.canonicalSegment(trackID: mic, start: 0.1, end: 0.5, speakerID: local, text: "Yes", overlap: .overlapsOtherTrack),
+            self.canonicalSegment(trackID: app, start: 0.41, end: 0.8, speakerID: remote, text: "dollars", overlap: .overlapsOtherTrack),
+            self.canonicalSegment(trackID: mic, start: 0.51, end: 0.9, speakerID: local, text: "please", overlap: .overlapsOtherTrack),
+        ]
+        let turns = MeetingProcessingPipeline.mergeCanonicalSegments(input)
+        XCTAssertEqual(turns.map(\.text), ["twenty dollars", "Yes please"])
+        XCTAssertEqual(turns.map(\.speakerID), [remote, local])
+        XCTAssertEqual(turns.map(\.overlap), [.overlapsOtherTrack, .overlapsOtherTrack])
+        XCTAssertEqual(turns.map { $0.start.seconds }, [0, 0.1])
+        XCTAssertEqual(turns.map { $0.end.seconds }, [0.8, 0.9])
+        let formatted = try await MeetingTranscriptNormalizer.normalize(turns, languageCode: "en")
+        XCTAssertEqual(formatted.map(\.text), ["$20", "Yes please"])
+        // Production can leave cross-track overlap unmarked; use timing, not the flag.
+        let unmarked = input.map { segment in
+            var copy = segment
+            copy.overlap = .none
+            return copy
+        }
+        XCTAssertEqual(MeetingProcessingPipeline.mergeCanonicalSegments(unmarked).map(\.text), ["twenty dollars", "Yes please"])
+    }
+
+    func testReplyAtExactWordGapBoundariesSplitsTheTurn() {
+        let app = UUID()
+        let mic = UUID()
+        let remote = UUID()
+        let input = [
+            self.canonicalSegment(trackID: app, start: 0, end: 0.4, speakerID: remote, text: "First"),
+            self.canonicalSegment(trackID: mic, start: 0.4, end: 0.5, speakerID: UUID(), text: "Yes"),
+            self.canonicalSegment(trackID: app, start: 0.5, end: 0.9, speakerID: remote, text: "Second"),
+        ]
+        XCTAssertEqual(MeetingProcessingPipeline.mergeCanonicalSegments(input), input)
+    }
+
+    func testNestedForeignTimingCannotHideACompletedReply() {
+        let app = UUID()
+        let mic = UUID()
+        let remote = UUID()
+        let local = UUID()
+        let input = [
+            self.canonicalSegment(trackID: app, start: 0, end: 0.5, speakerID: remote, text: "First"),
+            self.canonicalSegment(trackID: mic, start: 0.1, end: 1.5, speakerID: local, text: "Long"),
+            self.canonicalSegment(trackID: mic, start: 0.6, end: 0.7, speakerID: local, text: "reply"),
+            self.canonicalSegment(trackID: app, start: 1.6, end: 2, speakerID: remote, text: "Second"),
+        ]
+        let turns = MeetingProcessingPipeline.mergeCanonicalSegments(input)
+        XCTAssertEqual(turns.filter { $0.sourceTrackID == app }.map(\.text), ["First", "Second"])
+        XCTAssertEqual(turns.filter { $0.sourceTrackID == mic }.map(\.text), ["Long reply"])
+    }
+
+    func testThreeTrackRepliesRemainBarriersWhenLatestCompletedWordIsOnSameTrack() {
+        let app = UUID()
+        let mic = UUID()
+        let third = UUID()
+        let remote = UUID()
+        let local = UUID()
+        let input = [
+            self.canonicalSegment(trackID: app, start: 0, end: 0.5, speakerID: remote, text: "Question"),
+            self.canonicalSegment(trackID: mic, start: 0.6, end: 0.7, speakerID: local, text: "First reply"),
+            self.canonicalSegment(trackID: third, start: 0.8, end: 0.9, speakerID: UUID(), text: "Second reply"),
+            self.canonicalSegment(trackID: mic, start: 1, end: 1.1, speakerID: local, text: "Third reply"),
+            self.canonicalSegment(trackID: app, start: 1.2, end: 1.3, speakerID: remote, text: "Next question"),
+        ]
+        XCTAssertEqual(MeetingProcessingPipeline.mergeCanonicalSegments(input), input)
     }
 
     func testUnknownInheritanceSkipsEchoesAsBothTargetsAndAnchors() {
@@ -613,13 +738,36 @@ final class MeetingParakeetNemotronBackendTests: XCTestCase {
         XCTAssertEqual(Set(plan.chunkIDsByTrackID.keys), [fixture.micTrack.id, fixture.appTrack.id])
     }
 
+    func testSelectedProReachesTheFrozenRuntimeForEnglishAndGerman() async throws {
+        for (language, model) in [("en", "fluid-parakeet-pro"), ("de", "fluid-parakeet-pro")] {
+            let fixture = self.makeTwoEpochFixture()
+            var session = fixture.session
+            session.languageCode = language
+            let runtime = FakeRuntime()
+            let backend = self.makeBackend(runtime: runtime)
+            let configuration = MeetingFinalProcessingConfiguration(preferredASRModel: .fluidParakeetPro, languageCode: language)
+            let request = try self.makeRequest(session: session, directory: self.makeTempSessionDirectory(), configuration: configuration)
+            let plan = try backend.plan(request)
+            let manifest = try self.makeManifest(plan: plan, observations: fixture.observations)
+            runtime.asrSession.responses = (0..<3).map { _ in
+                .init(text: "Hello", words: [.init(text: "Hello", start: 0.2, end: 0.4)])
+            }
+            let outcome = try await backend.execute(plan: plan, manifest: manifest, progress: { _ in })
+            guard case let .canonicalEvidence(bundle) = outcome else { return XCTFail("Expected canonical evidence") }
+            XCTAssertEqual(configuration.asrModel, model)
+            XCTAssertEqual(runtime.asrConfigurations, [configuration])
+            XCTAssertEqual(bundle.evidence.units.map(\.text), ["Hello", "Hello", "Hello"])
+            XCTAssertTrue(bundle.coverageReceipts.allSatisfy { $0.status == .processed })
+        }
+    }
+
     func testMultilingualPlanAndExecutionKeepV3LanguageAndWordEvidence() async throws {
         let fixture = self.makeTwoEpochFixture()
         var session = fixture.session
         session.languageCode = "de"
         let runtime = FakeRuntime()
         let backend = self.makeBackend(runtime: runtime)
-        let configuration = MeetingFinalProcessingConfiguration(languageCode: "de")
+        let configuration = MeetingFinalProcessingConfiguration(preferredASRModel: .parakeetTDT, languageCode: "de")
         let request = try self.makeRequest(session: session, directory: self.makeTempSessionDirectory(), configuration: configuration)
         let plan = try backend.plan(request)
         let manifest = try self.makeManifest(plan: plan, observations: fixture.observations)
@@ -766,7 +914,8 @@ final class MeetingParakeetNemotronBackendTests: XCTestCase {
             meetingRuntimeFactory: { request in
                 spy.requests.append(request)
                 return runtime
-            }
+            },
+            preferredASRModelProvider: { .fluidParakeetPro }
         )
         runtime.asrSession.responses = [
             .init(text: "", words: []), .init(text: "", words: []), .init(text: "", words: []),
@@ -942,6 +1091,71 @@ final class MeetingParakeetNemotronBackendTests: XCTestCase {
         XCTAssertEqual(assembled.speakers.filter { $0.trackKind == .microphone }.count, 1)
         XCTAssertEqual(assembled.speakers.filter { $0.trackKind == .applicationAudio }.count, 1)
         XCTAssertEqual(assembled.sidecar.speakerIdentityLinks.count, 1)
+    }
+
+    func testASRPaddingPreservesInputAndDoesNotInventEmptyAudio() {
+        let short: [Float] = [0.25, -0.5, 0.75]
+        let padded = MeetingParakeetNemotronBackend.asrInput(short)
+        XCTAssertEqual(Array(padded.prefix(short.count)), short)
+        XCTAssertEqual(padded.count, 16_000)
+        XCTAssertTrue(padded.dropFirst(short.count).allSatisfy { $0 == 0 })
+        XCTAssertEqual(short, [0.25, -0.5, 0.75])
+        XCTAssertTrue(MeetingParakeetNemotronBackend.asrInput([]).isEmpty)
+        for count in [16_000, 16_001] {
+            let input = [Float](repeating: 0.25, count: count)
+            XCTAssertEqual(MeetingParakeetNemotronBackend.asrInput(input), input)
+        }
+    }
+
+    func testWordsEntirelyInPaddingDoNotReturnAsUntimedText() async throws {
+        let duration = 0.05
+        let chunk = self.makePCMChunk(sequence: 0, start: 100, end: 100 + duration)
+        let track = self.makeMicTrack(chunks: [chunk], eraStart: 100)
+        let session = self.makeSession(mode: .inRoom, tracks: [track])
+        let runtime = FakeRuntime()
+        runtime.asrSession.minimumSampleCount = 16_000
+        runtime.asrSession.responses = [
+            .init(text: "phantom word", words: [
+                ASRWordTiming(text: "phantom", start: 0.6, end: 0.7),
+                ASRWordTiming(text: "word", start: 0.7, end: 0.8),
+            ]),
+        ]
+        let backend = self.makeBackend(runtime: runtime, materializer: FakeMaterializer())
+        let plan = try backend.plan(self.makeRequest(session: session, directory: self.makeTempSessionDirectory()))
+        let manifest = try self.makeManifest(plan: plan, observations: [
+            MeetingAnalysisChunkKey(trackID: track.id, chunkID: chunk.id): self.makeObserved(chunk, duration: duration),
+        ])
+        let outcome = try await backend.execute(plan: plan, manifest: manifest, progress: { _ in })
+        guard case let .canonicalEvidence(bundle) = outcome else { return XCTFail("Expected canonical evidence") }
+        XCTAssertEqual(runtime.asrSession.callSampleCounts, [16_000])
+        XCTAssertTrue(bundle.coverageReceipts.allSatisfy { $0.status == .processed })
+        XCTAssertTrue(bundle.evidence.units.isEmpty, "Rejected timed words must never be reintroduced as a whole-clip utterance")
+    }
+
+    func testSubsecondEpochPadsInferenceWithoutExtendingTranscriptCoverage() async throws {
+        let duration = 0.05
+        let chunk = self.makePCMChunk(sequence: 0, start: 100, end: 100 + duration)
+        let track = self.makeMicTrack(chunks: [chunk], eraStart: 100)
+        let session = self.makeSession(mode: .inRoom, tracks: [track])
+        let runtime = FakeRuntime()
+        runtime.asrSession.minimumSampleCount = 16_000
+        runtime.asrSession.responses = [
+            .init(text: "short padding", words: [
+                ASRWordTiming(text: "short", start: 0.005, end: 0.035),
+                ASRWordTiming(text: "padding", start: 0.6, end: 0.7),
+            ]),
+        ]
+        let backend = self.makeBackend(runtime: runtime, materializer: FakeMaterializer())
+        let plan = try backend.plan(self.makeRequest(session: session, directory: self.makeTempSessionDirectory()))
+        let manifest = try self.makeManifest(plan: plan, observations: [
+            MeetingAnalysisChunkKey(trackID: track.id, chunkID: chunk.id): self.makeObserved(chunk, duration: duration),
+        ])
+        let outcome = try await backend.execute(plan: plan, manifest: manifest, progress: { _ in })
+        guard case let .canonicalEvidence(bundle) = outcome else { return XCTFail("Expected canonical evidence") }
+        XCTAssertEqual(runtime.asrSession.callSampleCounts, [16_000])
+        XCTAssertTrue(bundle.coverageReceipts.allSatisfy { $0.status == .processed })
+        XCTAssertEqual(bundle.evidence.units.map(\.text), ["short"])
+        XCTAssertTrue(bundle.coverageReceipts.allSatisfy { $0.analysisEnd <= 0.050_001 })
     }
 
     func testPCMFirstEpochMaterializesOnceForBothModelPhases() async throws {
@@ -1583,6 +1797,7 @@ private final nonisolated class FakeASRSession: MeetingParakeetASRSession, @unch
 
     var responses: [Response] = []
     var failingCallIndices: Set<Int> = []
+    var minimumSampleCount = 0
     var cancellationCallIndices: Set<Int> = []
     var latch: Latch?
     var onCall: (() -> Void)?
@@ -1596,7 +1811,7 @@ private final nonisolated class FakeASRSession: MeetingParakeetASRSession, @unch
         self.onCall?()
         if let latch { await latch.wait() }
         if self.cancellationCallIndices.contains(index) { throw CancellationError() }
-        if self.failingCallIndices.contains(index) {
+        if self.failingCallIndices.contains(index) || samples.count < self.minimumSampleCount {
             throw MeetingEpochMaterializationError.unreadable(spanID: "fake-asr-failure")
         }
         let response = index < self.responses.count ? self.responses[index] : Response(text: "", words: [])

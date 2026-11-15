@@ -1355,11 +1355,11 @@ final class MeetingSessionModelTests: XCTestCase {
         XCTAssertEqual(decoded.microphoneCoreAudioUID, "core-audio-uid")
     }
 
-    func testUnconfiguredMeetingDefaultsRemainConservative() {
+    func testUnconfiguredMeetingDefaultsCaptureComputerAudio() {
         let defaults = MeetingRecordingDefaults.unconfigured
 
         XCTAssertFalse(defaults.isConfigured)
-        XCTAssertEqual(defaults.mode, .onlineCall)
+        XCTAssertEqual(defaults.mode, .systemAudio)
         XCTAssertEqual(defaults.microphoneRole, .unknown)
         XCTAssertNil(defaults.applicationBundleIdentifier)
         XCTAssertNil(defaults.microphoneCaptureDeviceID)
@@ -1777,6 +1777,29 @@ final class MeetingSessionModelTests: XCTestCase {
         self.assertSessionValidationError(.unsupportedLanguage) {
             $0.processingAttempts[0].languageCode = "fr"
         }
+    }
+
+    func testLanguageChangeWithoutPendingAttemptLanguageIsRejected() {
+        self.assertSessionValidationError(.unsupportedLanguage) {
+            $0.languageCode = "nl"
+            var pending = $0.processingAttempts[0]
+            pending.id = UUID()
+            pending.completedAt = nil
+            pending.stage = .pending
+            pending.languageCode = nil
+            $0.processingAttempts.append(pending)
+        }
+    }
+
+    func testEarlierProcessingAttemptMayRecordPreviousRetranscriptionLanguage() throws {
+        var session = MeetingModelFixture.makeSession()
+        session.languageCode = "nl"
+        session.processingAttempts[0].languageCode = "en"
+        var latest = session.processingAttempts[0]
+        latest.id = UUID()
+        latest.languageCode = "nl"
+        session.processingAttempts.append(latest)
+        XCTAssertNoThrow(try session.validateForPersistence())
     }
 
     private func assertConfigurationValidationError(

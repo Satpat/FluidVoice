@@ -136,15 +136,19 @@ final class AppServices: ObservableObject {
         // Start-prompt episodes remain consumed until the meeting's own evidence ends.
         coordinator.$state
             .receive(on: DispatchQueue.main)
-            .sink { [weak self, weak coordinator] state in
+            .sink { [weak self, weak coordinator] _ in
                 // Deliveries are queued, so read the state as it is now before calling a recording over.
                 Self.synchronizeMeetingEndWatch(
                     state: coordinator?.state,
                     session: coordinator?.activeSession,
                     detector: self?._meetingAutoDetector
                 )
-                guard !MeetingOverlayVisibility.isVisible(for: state) else { return }
-                MeetingStillRecordingNudgeController.shared.hide()
+                if let currentState = coordinator?.state, MeetingOverlayVisibility.isVisible(for: currentState) {
+                    MeetingRecordingSourcePromptController.shared.recordingDidStart()
+                }
+                MeetingStillRecordingNudgeController.shared.synchronizeRecording(
+                    sessionID: Self.recordingSessionID(state: coordinator?.state, session: coordinator?.activeSession)
+                )
             }
             .store(in: &self.cancellables)
         Task { @MainActor in
@@ -191,17 +195,31 @@ final class AppServices: ObservableObject {
             session: self._meetingSessionCoordinator?.activeSession,
             detector: detector
         )
-        detector.onAutomaticTargetChanged = { [weak self] target in
+        detector.onAutomaticTargetChanged = { [weak self, weak detector] target in
             self?.meetingAutomaticTarget = target
+            // A cleared target may be detector teardown; never re-arm a watch from it.
+            guard target != nil else { return }
+            Self.synchronizeMeetingEndWatch(
+                state: self?._meetingSessionCoordinator?.state,
+                session: self?._meetingSessionCoordinator?.activeSession,
+                detector: detector
+            )
         }
-        detector.onPromptRequested = { request in
+        detector.onPromptRequested = { [weak detector] request in
+            guard !MeetingRecordingSourcePromptController.shared.isPresented else {
+                detector?.timeoutDismissed(episodeID: request.episodeID)
+                return
+            }
             MeetingDetectionPromptController.shared.present(request)
         }
         detector.onHealthChanged = { [weak self] health in
             self?.meetingAutoDetectHealth = health
         }
-        detector.onStillRecordingNudge = {
-            MeetingStillRecordingNudgeController.shared.present()
+        detector.onStillRecordingNudge = { [weak self, weak detector] in
+            guard let self, let sessionID = detector?.pendingEndConfirmationSessionID,
+                  self.canStopMeetingAfterEndConfirmation(sessionID: sessionID)
+            else { return }
+            MeetingStillRecordingNudgeController.shared.present(sessionID: sessionID)
         }
         detector.onStillRecordingNudgeWithdrawn = {
             MeetingStillRecordingNudgeController.shared.hide()
@@ -227,13 +245,66 @@ final class AppServices: ObservableObject {
         MeetingDetectionPromptController.shared.onTimeout = { [weak self] episodeID in
             self?._meetingAutoDetector?.timeoutDismissed(episodeID: episodeID)
         }
-        MeetingStillRecordingNudgeController.shared.onDismiss = { [weak self] in
-            self?._meetingAutoDetector?.stillRecordingNudgeDismissed()
+        MeetingStillRecordingNudgeController.shared.onDismiss = { [weak self] sessionID in
+            self?._meetingAutoDetector?.stillRecordingNudgeDismissed(sessionID: sessionID)
         }
-        MeetingStillRecordingNudgeController.shared.onStop = { [weak self] in
-            guard let self else { return }
-            Task { @MainActor in _ = try? await self.meetingSessionCoordinator.stopAndTranscribe() }
+        MeetingStillRecordingNudgeController.shared.shouldContinueCountdown = { [weak self] sessionID in
+            self?.canStopMeetingAfterEndConfirmation(sessionID: sessionID) == true
         }
+        MeetingStillRecordingNudgeController.shared.onStop = { [weak self] sessionID in
+            Task { @MainActor [weak self] in
+                await self?.stopMeetingAfterEndConfirmation(sessionID: sessionID)
+            }
+        }
+    }
+
+    static func recordingSessionID(state: MeetingCoordinatorState?, session: MeetingSession?) -> MeetingSessionID? {
+        guard let session, session.mode.capturesComputerAudio else { return nil }
+        switch state {
+        case let .recording(id), let .recordingDegraded(id):
+            return id == session.id ? id : nil
+        default:
+            return nil
+        }
+    }
+
+    private func canStopMeetingAfterEndConfirmation(sessionID: MeetingSessionID) -> Bool {
+        guard SettingsStore.shared.fluidMeetEnabled,
+              Self.recordingSessionID(state: self._meetingSessionCoordinator?.state, session: self._meetingSessionCoordinator?.activeSession) == sessionID
+        else { return false }
+        return self._meetingAutoDetector?.canStopAfterEndConfirmation(sessionID: sessionID) == true
+    }
+
+    private func stopMeetingAfterEndConfirmation(sessionID: MeetingSessionID) async {
+        guard self.canStopMeetingAfterEndConfirmation(sessionID: sessionID),
+              let coordinator = self._meetingSessionCoordinator
+        else { return }
+        do {
+            _ = try await coordinator.stopAndTranscribe()
+        } catch {
+            // Capture/processing failures publish the coordinator's existing recovery state.
+            DebugLogger.shared.error("Could not finish meeting: \(error.localizedDescription)", source: "MeetingAutoDetector")
+        }
+    }
+
+    /// Watch one positively detected call without narrowing the audio being recorded.
+    /// The detector retains this association for the session even if the target changes.
+    static func meetingEndWatchApplication(
+        session: MeetingSession,
+        target: MeetingAutoDetector.ResolvedTarget?
+    ) -> MeetingApplicationIdentity? {
+        guard session.mode.capturesComputerAudio else { return nil }
+        if session.mode == .onlineCall, session.capturedApplication?.capturesAllInstances != true {
+            return session.capturedApplication
+        }
+        guard let target,
+              session.mode == .systemAudio || session.capturedApplication?.bundleIdentifier == target.bundleIdentifier
+        else { return nil }
+        return MeetingApplicationIdentity(
+            bundleIdentifier: target.bundleIdentifier,
+            processID: target.pid,
+            displayName: session.capturedApplication?.displayName ?? target.bundleIdentifier
+        )
     }
 
     /// Inputs must be the coordinator's current snapshot, not a queued state notification.
@@ -251,10 +322,17 @@ final class AppServices: ObservableObject {
                 detector.recordingStopped()
                 return
             }
-            detector.recordingStarted(
-                sessionID: id,
-                application: session.mode == .onlineCall ? session.capturedApplication : nil
-            )
+            let application = Self.meetingEndWatchApplication(session: session, target: detector.automaticTarget)
+            if application == nil,
+               session.mode == .systemAudio || (session.mode == .onlineCall && session.capturedApplication?.capturesAllInstances == true)
+            {
+                detector.awaitDetectedCall(
+                    sessionID: id,
+                    applicationBundleIdentifier: session.mode == .systemAudio ? nil : session.capturedApplication?.bundleIdentifier
+                )
+            } else {
+                detector.recordingStarted(sessionID: id, application: application)
+            }
         default:
             detector.recordingStopped()
         }
@@ -274,6 +352,7 @@ final class AppServices: ObservableObject {
             title: MeetingTranscriptionSetupDraft.defaultTitle(mode: .onlineCall, applicationDisplayName: nil),
             preferredBundleIdentifier: target.bundleIdentifier,
             preferredWindowID: target.windowID,
+            preferredProcessID: target.pid,
             requirePreferredApplication: true
         )
         try Task.checkCancellation()
@@ -338,6 +417,7 @@ final class AppServices: ObservableObject {
             self.meetingAutomaticTarget = nil
             self.meetingAutoDetectHealth = nil
             MeetingDetectionPromptController.shared.cancelForFeatureDisable()
+            MeetingRecordingSourcePromptController.shared.cancel()
             MeetingStillRecordingNudgeController.shared.hide()
             MeetingRecordingPillController.shared.deactivate()
             return
@@ -397,6 +477,7 @@ final class AppServices: ObservableObject {
     }
 
     func shutdownForTermination() async {
+        MeetingRecordingSourcePromptController.shared.cancel()
         self._meetingAutoDetector?.stop()
         self._meetingAutoDetector = nil
         if let meetingSessionCoordinator = self._meetingSessionCoordinator {

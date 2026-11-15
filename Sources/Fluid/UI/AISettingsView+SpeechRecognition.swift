@@ -203,6 +203,7 @@ extension VoiceEngineSettingsView {
                             .font(self.theme.typography.bodySmall)
                             .foregroundStyle(self.voiceEngineSecondaryText)
                             .lineLimit(2)
+                            .help(model.supportedLanguageNames ?? supportedLanguageCodes)
                     }
 
                     // Memory warning for large models
@@ -430,6 +431,13 @@ extension VoiceEngineSettingsView {
                             .background(Capsule().fill(Color.fluidGreen.opacity(0.25)))
                             .foregroundStyle(Color.fluidGreen)
                     } else {
+                        // A failed or cancelled locale download leaves Apple Speech configured but not ready.
+                        // Keep the picker so people can switch back to an installed locale.
+                        if isConfiguredActive, model == .appleSpeechAnalyzer {
+                            self.appleSpeechLocalePickerButton
+                                .disabled(self.viewModel.areSpeechModelActionsBlocked)
+                        }
+
                         Button("Activate") {
                             self.viewModel.activateSpeechModel(model)
                         }
@@ -546,6 +554,73 @@ extension VoiceEngineSettingsView {
                 .fluidDropdownStyle()
         } else if model == .nemotronOffline || model == .nemotronStreaming || model == .nemotronStreaming320 {
             self.nemotronLanguagePickerButton
+        } else if model == .appleSpeechAnalyzer {
+            self.appleSpeechLocalePickerButton
+        }
+    }
+
+    private var appleSpeechLocalePickerButton: some View {
+        Button {
+            self.appleSpeechLocaleSearchText = ""
+            self.isShowingAppleSpeechLocalePicker.toggle()
+        } label: {
+            self.languageChipLabel(self.selectedAppleSpeechLocaleName)
+        }
+        .buttonStyle(.plain)
+        .popover(isPresented: self.$isShowingAppleSpeechLocalePicker, arrowEdge: .bottom) {
+            self.appleSpeechLocalePickerPopover
+        }
+    }
+
+    private var selectedAppleSpeechLocaleName: String {
+        let localeIdentifier = self.settings.selectedAppleSpeechLocaleIdentifier
+        return Locale.current.localizedString(forIdentifier: localeIdentifier) ?? localeIdentifier
+    }
+
+    private var filteredAppleSpeechLocaleOptions: [AppleSpeechLocaleOption] {
+        let query = self.appleSpeechLocaleSearchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !query.isEmpty else { return self.appleSpeechLocaleOptions }
+        return self.appleSpeechLocaleOptions.filter { option in
+            option.displayName.lowercased().contains(query) || option.id.lowercased().contains(query)
+        }
+    }
+
+    private var appleSpeechLocalePickerPopover: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(self.voiceEngineTertiaryText)
+                TextField("Search languages", text: self.$appleSpeechLocaleSearchText)
+                    .textFieldStyle(.plain)
+            }
+            .padding(.horizontal, 12)
+            .frame(height: 36)
+
+            Divider()
+
+            ScrollView(.vertical, showsIndicators: true) {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(self.filteredAppleSpeechLocaleOptions) { option in
+                        Button {
+                            self.viewModel.selectAppleSpeechLocale(option.id)
+                            self.isShowingAppleSpeechLocalePicker = false
+                        } label: {
+                            self.whisperLanguagePickerRow(
+                                title: option.displayName,
+                                isSelected: option.id == self.settings.selectedAppleSpeechLocaleIdentifier
+                            )
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.vertical, 6)
+            }
+        }
+        .frame(width: 280, height: 420)
+        .task {
+            guard #available(macOS 26, *) else { return }
+            let identifiers = await AppleSpeechAnalyzerProvider.supportedLocaleIdentifiers()
+            self.appleSpeechLocaleOptions = VoiceEngineLanguageCatalog.appleSpeechLocaleOptions(identifiers: identifiers)
         }
     }
 
@@ -668,7 +743,7 @@ extension VoiceEngineSettingsView {
     }
 
     private func speechModelSubtitle(for model: SettingsStore.SpeechModel) -> String {
-        if model == .fluidParakeetMini || model == .fluidParakeetPico {
+        if [.fluidParakeetMini, .fluidParakeetPico, .fluidParakeetPro].contains(model) {
             return model.languageSupport
         }
         switch model {
@@ -831,8 +906,8 @@ extension VoiceEngineSettingsView {
     private func speechModelBackgroundColor(for model: SettingsStore.SpeechModel) -> Color {
         let brand = model.brandName.lowercased()
 
-        // Both NVIDIA and OpenAI use white/light gray bg (transparent logos)
-        if brand.contains("nvidia") || brand.contains("openai") || brand.contains("whisper") {
+        // Keep these provider marks on a light background in both appearances.
+        if brand.contains("nvidia") || brand.contains("openai") || brand.contains("whisper") || brand.contains("qwen") {
             return Color(red: 0.97, green: 0.97, blue: 0.97)
         }
         if brand.contains("apple") || model.usesAppleLogo {
@@ -849,6 +924,10 @@ extension VoiceEngineSettingsView {
         }
         if brand.contains("cohere") {
             return "Provider_Cohere"
+        }
+        if brand.contains("qwen") {
+            // Official organization mark from https://github.com/QwenLM.
+            return "Provider_Qwen"
         }
         if brand.contains("openai") || brand.contains("whisper") {
             return "Provider_OpenAI"

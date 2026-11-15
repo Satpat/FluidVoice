@@ -10,7 +10,9 @@ struct ReleaseFeaturePreview: View {
             switch self.kind {
             case .meeting: self.meeting
             case .dashboard: self.dashboard
-            case .models: self.models
+            case .ripple: self.cleanupModel("Fluid 1.1 Ripple", detail: "Fast & capable", symbol: "bolt")
+            case .splash: self.cleanupModel("Fluid 1.1 Splash", detail: "Higher quality", symbol: "sparkles")
+            case .speech: self.speech
             }
         }
         .padding(16)
@@ -86,18 +88,23 @@ struct ReleaseFeaturePreview: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private var models: some View {
+    private func cleanupModel(_ name: String, detail: String, symbol: String) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            Label(PrivateAIProviderFeature.shared.isAvailable ? "Fluid Intelligence" : "AI Providers", systemImage: "sparkles")
+            Label("Fluid Intelligence", systemImage: "sparkles")
                 .font(.system(size: 11, weight: .semibold))
-            if PrivateAIProviderFeature.shared.isAvailable {
-                self.model("Fluid-1 Pico", detail: "Light & quick", symbol: "bolt")
-                self.model("Fluid-1 Mini", detail: "Everyday writing", symbol: "text.alignleft")
-                self.model("Fluid-1 Quad", detail: "More capable", symbol: "cpu")
-            } else {
-                self.model("Your provider", detail: "Your choice", symbol: "sparkles")
-                self.model("Your model", detail: "Your workflow", symbol: "cpu")
-            }
+            self.model(name, detail: detail, symbol: symbol)
+            self.model("On-device", detail: "Private", symbol: "lock")
+            self.model("Research preview", detail: "Review text", symbol: "text.magnifyingglass")
+        }
+    }
+
+    private var speech: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("Voice Engine", systemImage: "waveform")
+                .font(.system(size: 11, weight: .semibold))
+            self.model("Fluid Speech Pro", detail: "Most accurate", symbol: "star")
+            self.model("Fluid Speech Mini", detail: "Half the size", symbol: "waveform")
+            self.model("Fluid Speech Pico", detail: "Smallest", symbol: "bolt")
         }
     }
 

@@ -137,6 +137,51 @@ final class HotkeyShortcutTests: XCTestCase {
         }
     }
 
+    func testModifierOnlyCancelMigrationRestoresEscapeAndIsIdempotent() throws {
+        let key = "CancelRecordingHotkeyShortcut"
+        try self.withRestoredDefaults(keys: [key, self.primaryDictationShortcutsKey]) {
+            let defaults = UserDefaults.standard
+            let primary = try JSONEncoder().encode([HotkeyShortcut(keyCode: 61, modifierFlags: [])])
+            defaults.set(primary, forKey: self.primaryDictationShortcutsKey)
+            for keyCode: UInt16 in [54, 55, 56, 60, 58, 61, 59, 62, 63] {
+                try defaults.set(JSONEncoder().encode(HotkeyShortcut(keyCode: keyCode, modifierFlags: [])), forKey: key)
+                SettingsStore.migrateModifierOnlyCancelShortcutIfNeeded(defaults: defaults)
+                let migrated = try XCTUnwrap(defaults.data(forKey: key))
+                XCTAssertEqual(try JSONDecoder().decode(HotkeyShortcut.self, from: migrated), HotkeyShortcut(keyCode: 53, modifierFlags: []))
+                SettingsStore.migrateModifierOnlyCancelShortcutIfNeeded(defaults: defaults)
+                XCTAssertEqual(defaults.data(forKey: key), migrated)
+                XCTAssertEqual(defaults.data(forKey: self.primaryDictationShortcutsKey), primary)
+            }
+        }
+    }
+
+    func testCancelMigrationPreservesValidDisabledMissingAndMalformedSettings() throws {
+        let key = "CancelRecordingHotkeyShortcut"
+        try self.withRestoredDefaults(keys: [key]) {
+            let defaults = UserDefaults.standard
+            let values: [Data?] = try [
+                nil, Data("null".utf8), Data("invalid".utf8),
+                JSONEncoder().encode(HotkeyShortcut(keyCode: 9, modifierFlags: [])),
+                JSONEncoder().encode(HotkeyShortcut(keyCode: 9, modifierFlags: [.option])),
+            ]
+            for value in values {
+                if let value { defaults.set(value, forKey: key) } else { defaults.removeObject(forKey: key) }
+                SettingsStore.migrateModifierOnlyCancelShortcutIfNeeded(defaults: defaults)
+                XCTAssertEqual(defaults.data(forKey: key), value)
+            }
+        }
+    }
+
+    func testRestoringModifierOnlyCancelShortcutFallsBackToEscape() throws {
+        try self.withRestoredDefaults(keys: ["CancelRecordingHotkeyShortcut"]) {
+            let settings = SettingsStore.shared
+            settings.cancelRecordingHotkeyShortcut = HotkeyShortcut(keyCode: 58, modifierFlags: [.control, .option], modifierKeyCodes: [59, 58])
+            XCTAssertEqual(settings.cancelRecordingHotkeyShortcut, HotkeyShortcut(keyCode: 53, modifierFlags: []))
+            settings.cancelRecordingHotkeyShortcut = nil
+            XCTAssertNil(settings.cancelRecordingHotkeyShortcut)
+        }
+    }
+
     func testInputDeliveryTimingRejectsMissingAndFutureEventTimestamps() {
         let missing = HotkeyInputTiming(receivedAt: 100, eventTimestamp: 0, eventType: 12, receivedTimestamp: 5_000_000_000)
         XCTAssertNil(missing.deliveryAgeMs)
@@ -344,6 +389,9 @@ final class HotkeyShortcutTests: XCTestCase {
         manager.updatePrimaryShortcuts([HotkeyShortcut(mouseButton: 2, modifierFlags: [])])
         let down = try XCTUnwrap(CGEvent(mouseEventSource: nil, mouseType: .otherMouseDown, mouseCursorPosition: .zero, mouseButton: .center))
         let up = try XCTUnwrap(CGEvent(mouseEventSource: nil, mouseType: .otherMouseUp, mouseCursorPosition: .zero, mouseButton: .center))
+        // The unmodified shortcut needs explicit fixture flags, independent of the live keyboard.
+        down.flags = []
+        up.flags = []
 
         XCTAssertNil(manager.handleMouseShortcutEvent(type: .otherMouseDown, event: down))
         for _ in 0..<10 {
@@ -373,6 +421,9 @@ final class HotkeyShortcutTests: XCTestCase {
         manager.setPasteLastTranscriptionCallback {}
         let down = try XCTUnwrap(CGEvent(mouseEventSource: nil, mouseType: .otherMouseDown, mouseCursorPosition: .zero, mouseButton: .center))
         let up = try XCTUnwrap(CGEvent(mouseEventSource: nil, mouseType: .otherMouseUp, mouseCursorPosition: .zero, mouseButton: .center))
+        // Keep this unmodified click independent of keys held during the test run.
+        down.flags = []
+        up.flags = []
 
         XCTAssertNil(manager.handleMouseShortcutEvent(type: .otherMouseDown, event: down))
         manager.updatePrimaryShortcuts([HotkeyShortcut(keyCode: 3, modifierFlags: [.control, .command])])
@@ -1308,6 +1359,51 @@ final class HotkeyShortcutTests: XCTestCase {
     }
 
     @MainActor
+    func testCancelRejectsModifierOnlyShortcutsWithoutChangingSavedBindings() {
+        self.withIsolatedShortcutConflicts { settings in
+            let savedCancel = HotkeyShortcut(keyCode: 53, modifierFlags: [])
+            settings.cancelRecordingHotkeyShortcut = savedCancel
+            let modifierKeys: [UInt16] = [54, 55, 56, 60, 58, 61, 59, 62, 63]
+            let shortcuts = modifierKeys.map { HotkeyShortcut(keyCode: $0, modifierFlags: []) } + [
+                HotkeyShortcut(keyCode: 58, modifierFlags: [.control, .option], modifierKeyCodes: [59, 58]),
+                HotkeyShortcut(keyCode: 61, modifierFlags: [.shift, .option], modifierKeyCodes: [60, 61]),
+            ]
+            let view = ContentView()
+            for shortcut in shortcuts + shortcuts.reversed() {
+                XCTAssertEqual(
+                    view.shortcutConflictMessage(for: shortcut, target: .cancel),
+                    "Modifier-only keys can't cancel recording. Use Esc or include a regular key.",
+                    shortcut.displayString
+                )
+                XCTAssertEqual(settings.cancelRecordingHotkeyShortcut, savedCancel)
+                XCTAssertTrue(settings.primaryDictationShortcuts.isEmpty)
+            }
+        }
+    }
+
+    @MainActor
+    func testCancelRestrictionPreservesRegularKeysAndOtherModifierOnlyActions() {
+        self.withIsolatedShortcutConflicts { _ in
+            let view = ContentView()
+            for shortcut in [
+                HotkeyShortcut(keyCode: 53, modifierFlags: []),
+                HotkeyShortcut(keyCode: 9, modifierFlags: []),
+                HotkeyShortcut(keyCode: 9, modifierFlags: [.option]),
+                HotkeyShortcut(keyCode: 53, modifierFlags: [.control, .shift]),
+            ] {
+                XCTAssertNil(view.shortcutConflictMessage(for: shortcut, target: .cancel), shortcut.displayString)
+            }
+            let leftOption = HotkeyShortcut(keyCode: 58, modifierFlags: [])
+            for target: ShortcutRecordingTarget in [
+                .primaryDictation(.add), .secondaryDictation, .command, .edit,
+                .pasteLast, .dictationPrompt("__default__"), .newPrompt,
+            ] {
+                XCTAssertNil(view.shortcutConflictMessage(for: leftOption, target: target), "\(target)")
+            }
+        }
+    }
+
+    @MainActor
     func testCommandShortcutIsReservedOnlyWhileEnabled() {
         self.withIsolatedShortcutConflicts { settings in
             let shortcut = HotkeyShortcut(keyCode: 40, modifierFlags: [.control, .command])
@@ -1706,6 +1802,7 @@ final class HotkeyShortcutTests: XCTestCase {
             manager.updatePrimaryShortcuts([shortcut])
             if mouse {
                 let down = try XCTUnwrap(CGEvent(mouseEventSource: nil, mouseType: .otherMouseDown, mouseCursorPosition: .zero, mouseButton: .center))
+                down.flags = []
                 _ = manager.handleMouseShortcutEvent(type: .otherMouseDown, event: down)
             } else {
                 _ = try manager.handleKeyEvent(type: .keyDown, event: self.primaryReleaseTestEvent(type: .keyDown))
@@ -1713,6 +1810,7 @@ final class HotkeyShortcutTests: XCTestCase {
             manager.updatePrimaryShortcuts([shortcut, HotkeyShortcut(keyCode: 3, modifierFlags: .control)])
             if mouse {
                 let up = try XCTUnwrap(CGEvent(mouseEventSource: nil, mouseType: .otherMouseUp, mouseCursorPosition: .zero, mouseButton: .center))
+                up.flags = []
                 _ = manager.handleMouseShortcutEvent(type: .otherMouseUp, event: up)
             } else {
                 _ = try manager.handleKeyEvent(type: .keyUp, event: self.primaryReleaseTestEvent(type: .keyUp))
@@ -2674,6 +2772,9 @@ final class HotkeyShortcutTests: XCTestCase {
         controller.show(audioPublisher: audioPublisher, mode: .dictation)
         let emptySize = try XCTUnwrap(controller.windowSizeForTests)
 
+        // Captions now reserve their line slots. Use the large preset to leave a
+        // genuinely different old frame for the reopen path to discard.
+        SettingsStore.shared.overlaySize = .large
         NotchContentState.shared.updateTranscription(String(repeating: "multiline preview text ", count: 30))
         controller.refreshSizeForContent()
         // SwiftUI layout can finish after 120 ms on a busy host; await the actual resize.
@@ -2684,6 +2785,7 @@ final class HotkeyShortcutTests: XCTestCase {
         let expandedSize = try XCTUnwrap(controller.windowSizeForTests)
         XCTAssertGreaterThan(expandedSize.height, emptySize.height)
 
+        SettingsStore.shared.overlaySize = .medium
         _ = await controller.hideAndWait()
         try await Task.sleep(nanoseconds: 100_000_000)
         controller.show(audioPublisher: audioPublisher, mode: .dictation)
@@ -4766,6 +4868,153 @@ extension HotkeyShortcutTests {
 }
 
 extension HotkeyShortcutTests {
+    func testKeyedShortcutsKeepPhysicalModifierSides() throws {
+        // Device-side masks from IOKit's IOLLEvent.h; independent of production helpers.
+        for (flag, leftMask, rightMask, leftKey, rightKey) in [
+            (NSEvent.ModifierFlags.option, UInt(0x20), UInt(0x40), UInt16(58), UInt16(61)),
+            (.command, 0x08, 0x10, 55, 54), (.control, 0x01, 0x2000, 59, 62), (.shift, 0x02, 0x04, 56, 60),
+        ] {
+            let leftFlags = flag.union(.init(rawValue: leftMask))
+            let rightFlags = flag.union(.init(rawValue: rightMask))
+            let left = HotkeyShortcut(keyCode: 46, modifierFlags: leftFlags)
+            let right = HotkeyShortcut(keyCode: 46, modifierFlags: rightFlags)
+            XCTAssertNotEqual(left, right)
+            XCTAssertTrue(left.displayString.contains("Left"))
+            XCTAssertTrue(right.displayString.contains("Right"))
+            XCTAssertTrue(left.matches(keyCode: 46, modifiers: leftFlags))
+            XCTAssertFalse(left.matches(keyCode: 46, modifiers: rightFlags))
+            XCTAssertFalse(left.matches(keyCode: 46, modifiers: flag), "Unknown side must not activate a side-specific binding")
+            XCTAssertTrue(left.conflictsWith(HotkeyShortcut(keyCode: leftKey, modifierFlags: []), includingKeyboardModifierPrefixes: true))
+            XCTAssertFalse(left.conflictsWith(HotkeyShortcut(keyCode: rightKey, modifierFlags: []), includingKeyboardModifierPrefixes: true))
+            let restored = try JSONDecoder().decode(HotkeyShortcut.self, from: JSONEncoder().encode(left))
+            XCTAssertEqual(restored, left)
+            XCTAssertFalse(restored.matches(keyCode: 46, modifiers: rightFlags))
+            XCTAssertEqual(GlobalHotkeyManager.modifierFlags(from: CGEventFlags(rawValue: UInt64(leftFlags.rawValue))), leftFlags)
+        }
+    }
+
+    @MainActor
+    func testMeetingShortcutAllowsLeftOptionAlongsideRightOptionDictation() {
+        self.withIsolatedShortcutConflicts { settings in
+            settings.primaryDictationShortcuts = [HotkeyShortcut(keyCode: 61, modifierFlags: [])]
+            let left = HotkeyShortcut(keyCode: 46, modifierFlags: .option.union(.init(rawValue: 0x20)))
+            let right = HotkeyShortcut(keyCode: 46, modifierFlags: .option.union(.init(rawValue: 0x40)))
+            XCTAssertNil(ContentView().shortcutConflictMessage(for: left, target: .meeting))
+            XCTAssertNotNil(ContentView().shortcutConflictMessage(for: right, target: .meeting))
+        }
+    }
+
+    func testLegacyAndCombinedModifierSidesKeepCorrectMatchingAndConflicts() throws {
+        let leftFlags = NSEvent.ModifierFlags.option.union(.init(rawValue: 0x20))
+        let rightFlags = NSEvent.ModifierFlags.option.union(.init(rawValue: 0x40))
+        let bothFlags = leftFlags.union(rightFlags)
+        let legacy = try JSONDecoder().decode(HotkeyShortcut.self, from: Data(#"{"keyCode":46,"modifierFlagsRawValue":524288}"#.utf8))
+        let left = HotkeyShortcut(keyCode: 46, modifierFlags: leftFlags)
+        let right = HotkeyShortcut(keyCode: 46, modifierFlags: rightFlags)
+        let both = HotkeyShortcut(keyCode: 46, modifierFlags: bothFlags)
+        for flags in [leftFlags, rightFlags, bothFlags, .option] {
+            XCTAssertTrue(legacy.matches(keyCode: 46, modifiers: flags))
+        }
+        XCTAssertNotEqual(legacy, left)
+        XCTAssertTrue(legacy.hasSameTrigger(as: left))
+        XCTAssertTrue(left.hasSameTrigger(as: legacy))
+        XCTAssertTrue(legacy.hasSameTrigger(as: right))
+        XCTAssertFalse(left.hasSameTrigger(as: right))
+        XCTAssertFalse(both.hasSameTrigger(as: left))
+        XCTAssertFalse(left.matches(keyCode: 46, modifiers: bothFlags))
+        XCTAssertFalse(both.matches(keyCode: 46, modifiers: leftFlags))
+        XCTAssertTrue(both.matches(keyCode: 46, modifiers: bothFlags))
+        XCTAssertTrue(both.conflictsWith(HotkeyShortcut(keyCode: 61, modifierFlags: []), includingKeyboardModifierPrefixes: true))
+        let legacyModifier = HotkeyShortcut(keyCode: 61, modifierFlags: .option)
+        XCTAssertTrue(left.conflictsWith(legacyModifier, includingKeyboardModifierPrefixes: true), "Legacy modifier-only bindings activate on either side")
+        XCTAssertTrue(right.conflictsWith(legacyModifier, includingKeyboardModifierPrefixes: true))
+        XCTAssertTrue(HotkeyShortcut(mouseButton: 3, modifierFlags: leftFlags).conflictsWith(legacyModifier))
+        let noisy = HotkeyShortcut(keyCode: 46, modifierFlags: leftFlags.union([.capsLock, .numericPad]))
+        XCTAssertEqual(noisy, left)
+        XCTAssertTrue(left.matches(keyCode: 46, modifiers: leftFlags.union([.capsLock, .numericPad])))
+        XCTAssertTrue(HotkeyShortcut(keyCode: 46, modifierFlags: [.option, .command]).hasSameTrigger(as: HotkeyShortcut(keyCode: 46, modifierFlags: leftFlags.union(.command))))
+    }
+
+    func testMouseShortcutSidesSurvivePersistenceAndPrefixChecks() throws {
+        let leftFlags = NSEvent.ModifierFlags.option.union(.init(rawValue: 0x20))
+        let rightFlags = NSEvent.ModifierFlags.option.union(.init(rawValue: 0x40))
+        let left = HotkeyShortcut(mouseButton: 3, modifierFlags: leftFlags)
+        let right = HotkeyShortcut(mouseButton: 3, modifierFlags: rightFlags)
+        let restored = try JSONDecoder().decode(HotkeyShortcut.self, from: JSONEncoder().encode(left))
+        XCTAssertEqual(restored, left)
+        XCTAssertEqual(restored.displayString, "Left ⌥ + Mouse 4")
+        XCTAssertTrue(restored.matchesMouse(button: 3, modifiers: leftFlags))
+        XCTAssertFalse(restored.matchesMouse(button: 3, modifiers: rightFlags))
+        XCTAssertNotEqual(left, right)
+        XCTAssertFalse(left.hasSameTrigger(as: right))
+        XCTAssertTrue(left.hasSameTrigger(as: HotkeyShortcut(mouseButton: 3, modifierFlags: .option)))
+        XCTAssertFalse(left.conflictsWith(HotkeyShortcut(keyCode: 61, modifierFlags: [])))
+        XCTAssertTrue(left.conflictsWith(HotkeyShortcut(keyCode: 58, modifierFlags: [])))
+    }
+
+    @MainActor
+    func testShortcutDuplicateChecksDistinguishSidesAndRejectLegacyOverlap() {
+        self.withIsolatedShortcutConflicts { settings in
+            let left = HotkeyShortcut(keyCode: 46, modifierFlags: .option.union(.init(rawValue: 0x20)))
+            let right = HotkeyShortcut(keyCode: 46, modifierFlags: .option.union(.init(rawValue: 0x40)))
+            settings.primaryDictationShortcuts = [right]
+            for target: ShortcutRecordingTarget in [.meeting, .edit, .secondaryDictation, .command, .pasteLast, .cancel, .primaryDictation(.add)] {
+                XCTAssertNil(ContentView().shortcutConflictMessage(for: left, target: target), "\(target)")
+                XCTAssertEqual(ContentView().shortcutConflictMessage(for: right, target: target), "Duplicate with Primary Dictation Shortcut")
+            }
+            settings.primaryDictationShortcuts = [HotkeyShortcut(keyCode: 46, modifierFlags: .option)]
+            XCTAssertEqual(ContentView().shortcutConflictMessage(for: left, target: .meeting), "Duplicate with Primary Dictation Shortcut")
+            settings.primaryDictationShortcuts = [HotkeyShortcut(keyCode: 61, modifierFlags: [])]
+            settings.meetingRecordingHotkeyShortcut = left
+            XCTAssertNil(ContentView().shortcutConflictMessage(for: settings.primaryDictationShortcuts[0], target: .primaryDictation(.replace(0))))
+            XCTAssertNotNil(ContentView().shortcutConflictMessage(for: HotkeyShortcut(keyCode: 58, modifierFlags: []), target: .primaryDictation(.replace(0))))
+        }
+    }
+
+    @MainActor
+    func testLeftOptionMeetingAndRightOptionDictationRouteIndependently() async throws {
+        let defaults = UserDefaults.standard
+        let keys = ["MeetingRecordingHotkeyShortcut", "FluidMeetEnabled"]
+        let previous = keys.map { defaults.object(forKey: $0) }
+        defer { for (key, value) in zip(keys, previous) { defaults.set(value, forKey: key) } }
+        SettingsStore.shared.fluidMeetEnabled = true
+        let leftFlags = NSEvent.ModifierFlags.option.union(.init(rawValue: 0x20))
+        SettingsStore.shared.meetingRecordingHotkeyShortcut = HotkeyShortcut(keyCode: 46, modifierFlags: leftFlags)
+        let payload = SettingsStore.shared.makeBackupPayload()
+        let restored = try JSONDecoder().decode(SettingsBackupPayload.self, from: JSONEncoder().encode(payload))
+        XCTAssertEqual(restored.meetingRecordingHotkeyShortcut, SettingsStore.shared.meetingRecordingHotkeyShortcut)
+        for mode: HotkeyActivationMode in [.hold, .automatic, .toggle] {
+            var dictationCalls = 0
+            var meetingCalls = 0
+            let asr = ASRService()
+            let manager = self.makePrimaryReleaseTestManager(asr: asr, onStart: { dictationCalls += 1 })
+            manager.setHotkeyMode(mode)
+            manager.updatePrimaryShortcuts([HotkeyShortcut(keyCode: 61, modifierFlags: [])])
+            manager.setMeetingRecordingCallback { meetingCalls += 1 }
+            let leftEventFlags = CGEventFlags(rawValue: UInt64(leftFlags.rawValue))
+            let rightEventFlags = CGEventFlags.maskAlternate.union(.init(rawValue: 0x40))
+            _ = try manager.handleKeyEvent(type: .flagsChanged, event: self.primaryReleaseTestEvent(type: .flagsChanged, keyCode: 58, modifiers: leftEventFlags))
+            let leftDown = try self.primaryReleaseTestEvent(type: .keyDown, keyCode: 46, modifiers: leftEventFlags)
+            let leftUp = try self.primaryReleaseTestEvent(type: .keyUp, keyCode: 46, modifiers: [])
+            XCTAssertTrue(manager.handleKeyEvent(type: .keyDown, event: leftDown) == nil)
+            XCTAssertTrue(manager.handleKeyEvent(type: .keyUp, event: leftUp) == nil)
+            _ = try manager.handleKeyEvent(type: .flagsChanged, event: self.primaryReleaseTestEvent(type: .flagsChanged, keyCode: 58, modifiers: []))
+            for _ in 0..<20 { await Task.yield() }
+            XCTAssertEqual(meetingCalls, 1, "\(mode)")
+            XCTAssertEqual(dictationCalls, 0, "Left Option must not start Right Option dictation in \(mode)")
+            XCTAssertFalse(asr.isRunningOrStarting)
+            let rightDown = try self.primaryReleaseTestEvent(type: .keyDown, keyCode: 46, modifiers: rightEventFlags)
+            XCTAssertTrue(manager.handleKeyEvent(type: .keyDown, event: rightDown) != nil)
+            XCTAssertEqual(meetingCalls, 1)
+            _ = try manager.handleKeyEvent(type: .flagsChanged, event: self.primaryReleaseTestEvent(type: .flagsChanged, keyCode: 61, modifiers: rightEventFlags))
+            for _ in 0..<20 { await Task.yield() }
+            XCTAssertEqual(dictationCalls, mode == .toggle ? 0 : 1, "Hold capture must still start on the modifier press")
+            _ = try manager.handleKeyEvent(type: .flagsChanged, event: self.primaryReleaseTestEvent(type: .flagsChanged, keyCode: 61, modifiers: []))
+            for _ in 0..<20 { await Task.yield() }
+            XCTAssertEqual(dictationCalls, 1)
+        }
+    }
+
     func testMeetingChordRejectsModifierPrefixesWithoutChangingOtherShortcutRules() {
         let option = HotkeyShortcut(keyCode: 61, modifierFlags: [])
         let chord = HotkeyShortcut(keyCode: 46, modifierFlags: [.control, .option, .command])

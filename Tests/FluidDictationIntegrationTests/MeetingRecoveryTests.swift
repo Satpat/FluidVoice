@@ -1359,6 +1359,80 @@ final class MeetingRecoveryTests: XCTestCase {
         MeetingTimebaseMetadata(startedHostTime: 0, machTimebaseNumerator: 1, machTimebaseDenominator: 1, firstPresentationTime: nil)
     }
 
+    func testDefaultMeetingStoreIsIsolatedFromRealRecordingsInTestHost() async throws {
+        let first = MeetingSessionStore()
+        let second = MeetingSessionStore()
+        let id = UUID()
+        let firstDirectory = try await first.sessionDirectory(for: id)
+        let secondDirectory = try await second.sessionDirectory(for: id)
+        let temporaryDirectory = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().path + "/"
+        XCTAssertTrue(firstDirectory.resolvingSymlinksInPath().path.hasPrefix(temporaryDirectory))
+        XCTAssertTrue(firstDirectory.path.contains("FluidVoice-XCTest-"))
+        XCTAssertEqual(firstDirectory, secondDirectory, "test-host views and coordinators share one isolated store")
+        let explicitRoot = self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: explicitRoot) }
+        let explicit = MeetingSessionStore(rootDirectory: explicitRoot)
+        let explicitDirectory = try await explicit.sessionDirectory(for: id)
+        XCTAssertEqual(explicitDirectory, explicitRoot.appendingPathComponent(id.uuidString, isDirectory: true))
+    }
+
+    func testCoverageWarningUsesCurrentResultAndPreservesRealGaps() {
+        var session = self.makeSession(state: .completed)
+        let warning = MeetingSessionEvent(id: UUID(), occurredAt: Date(), kind: .transcriptCoverageIncomplete, trackID: nil, detail: "old result")
+        session.events = [warning]
+        XCTAssertTrue(session.hasIncompleteTranscriptCoverage, "legacy warnings remain visible")
+        session.transcriptIsComplete = true
+        XCTAssertFalse(session.hasIncompleteTranscriptCoverage, "old diagnostic events cannot override the latest verified result")
+        session.transcriptIsComplete = false
+        session.events = []
+        XCTAssertTrue(session.hasIncompleteTranscriptCoverage, "quarantined text must warn even without a timed gap")
+        session.transcriptIsComplete = nil
+        for reason in [MeetingTranscriptCoverageGapReason.processingFailed, .providerTruncated, .missingOrUnreadableAudio, .inadmissibleCaptureEra] {
+            session.transcriptCoverageGaps = [.init(trackID: UUID(), start: 0, end: 0.01, reason: reason)]
+            XCTAssertTrue(session.hasIncompleteTranscriptCoverage, "short duration is not proof that a real loss is harmless")
+        }
+    }
+
+    func testSuccessfulRetryClearsOldCoverageWarningButKeepsCaptureEvents() async throws {
+        let dir = self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = MeetingSessionStore(rootDirectory: dir)
+        var session = self.makeSession(state: .interrupted, endedAt: Date(), audioTracks: [self.makeMicrophoneTrack(chunks: [self.makeFinalizedChunk()])])
+        let captureEvent = MeetingSessionEvent(id: UUID(), occurredAt: Date(), kind: .microphoneDisconnected, trackID: nil, detail: "capture interruption")
+        session.events = [captureEvent, MeetingSessionEvent(id: UUID(), occurredAt: Date(), kind: .transcriptCoverageIncomplete, trackID: nil, detail: "previous attempt")]
+        try await store.create(session)
+        let coordinator = MeetingSessionCoordinator(store: store, capture: StubCaptureController(), processing: StubProcessingController(), audioArbiter: StubArbiter())
+        await coordinator.ensureRestored()
+        let result = try await coordinator.retryProcessing()
+        XCTAssertFalse(result.hasIncompleteTranscriptCoverage)
+        XCTAssertEqual(result.events.map(\.id), [captureEvent.id])
+        let saved = try await store.load(id: session.id)
+        XCTAssertEqual(saved?.hasIncompleteTranscriptCoverage, false)
+        XCTAssertEqual(saved?.events.map(\.id), [captureEvent.id])
+    }
+
+    func testFailedRetryRetainsCoverageWarning() async throws {
+        for error: Error in [CancellationError(), NSError(domain: "test", code: 1)] {
+            let dir = self.makeTempDirectory()
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let store = MeetingSessionStore(rootDirectory: dir)
+            var session = self.makeSession(state: .interrupted, endedAt: Date(), audioTracks: [self.makeMicrophoneTrack(chunks: [self.makeFinalizedChunk()])])
+            let warning = MeetingSessionEvent(id: UUID(), occurredAt: Date(), kind: .transcriptCoverageIncomplete, trackID: nil, detail: "previous attempt")
+            session.events = [warning]
+            session.transcriptIsComplete = false
+            try await store.create(session)
+            let coordinator = MeetingSessionCoordinator(store: store, capture: StubCaptureController(), processing: DiagnosticFailingProcessingController(error: error), audioArbiter: StubArbiter())
+            await coordinator.ensureRestored()
+            do {
+                _ = try await coordinator.retryProcessing()
+                XCTFail("Expected processing to fail")
+            } catch {}
+            let saved = try await store.load(id: session.id)
+            XCTAssertEqual(saved?.hasIncompleteTranscriptCoverage, true)
+            XCTAssertEqual(saved?.events.filter { $0.kind == .transcriptCoverageIncomplete }.map(\.id), [warning.id])
+        }
+    }
+
     private func makeFinalizedChunk(
         sequence: Int = 0,
         path: String = "tracks/microphone/chunk_0.caf"
@@ -1458,6 +1532,115 @@ final class MeetingRecoveryTests: XCTestCase {
         session.speakers = [speakerA, speakerB]
         session.transcriptSegments = [segment]
         return (session, speakerA.id, speakerB.id, segment.id)
+    }
+
+    // MARK: - Catalog read failures
+
+    func testCatalogThrowsWhenEveryManifestIsCorrupt() async throws {
+        let dir = self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = MeetingSessionStore(rootDirectory: dir)
+        let session = self.makeSession(state: .completed, audioTracks: [self.makeMicrophoneTrack(chunks: [])])
+        try await store.create(session)
+        let directory = try await store.sessionDirectory(for: session.id)
+        let manifest = directory.appendingPathComponent("session.json")
+        let corruptData = Data("{invalid session".utf8)
+        try corruptData.write(to: manifest)
+
+        let reads: [@Sendable () async throws -> [MeetingSession]] = [
+            { try await store.loadHistory() },
+            { try await store.loadAll() },
+            { try await store.loadRecoverable() },
+        ]
+        for read in reads {
+            do {
+                _ = try await read()
+                XCTFail("An unreadable catalog must not look like empty history")
+            } catch {
+                XCTAssertTrue(error is DecodingError, "Preserve the underlying manifest error: \(error)")
+            }
+            XCTAssertEqual(try Data(contentsOf: manifest), corruptData)
+        }
+    }
+
+    func testHistorySnapshotRetainsRowsWhenStoredManifestBecomesCorrupt() async throws {
+        let dir = self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = MeetingSessionStore(rootDirectory: dir)
+        let session = self.makeSession(state: .completed, audioTracks: [self.makeMicrophoneTrack(chunks: [])])
+        try await store.create(session)
+        let directory = try await store.sessionDirectory(for: session.id)
+        let manifest = directory.appendingPathComponent("session.json")
+        let originalData = try Data(contentsOf: manifest)
+        let snapshot = MeetingHistorySnapshot { try await store.loadHistory() }
+        await snapshot.refresh()
+        XCTAssertEqual(snapshot.sessions.map(\.id), [session.id])
+
+        let corruptData = Data("{invalid session".utf8)
+        try corruptData.write(to: manifest)
+        await snapshot.refresh()
+        XCTAssertEqual(snapshot.sessions.map(\.id), [session.id])
+        XCTAssertNotNil(snapshot.errorMessage)
+        XCTAssertTrue(snapshot.hasLoaded)
+        XCTAssertEqual(try Data(contentsOf: manifest), corruptData)
+
+        try originalData.write(to: manifest)
+        await snapshot.refresh()
+        XCTAssertEqual(snapshot.sessions.map(\.id), [session.id])
+        XCTAssertNil(snapshot.errorMessage)
+    }
+
+    func testCatalogKeepsValidSessionsWhenAnotherManifestIsCorrupt() async throws {
+        let dir = self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = MeetingSessionStore(rootDirectory: dir)
+        let track = self.makeMicrophoneTrack(chunks: [])
+        let older = self.makeSession(state: .completed, startedAt: Date(timeIntervalSince1970: 100), audioTracks: [track])
+        let newer = self.makeSession(state: .completed, startedAt: Date(timeIntervalSince1970: 200), audioTracks: [track])
+        let corrupt = self.makeSession(state: .completed, audioTracks: [track])
+        for session in [older, newer, corrupt] {
+            try await store.create(session)
+        }
+        let directory = try await store.sessionDirectory(for: corrupt.id)
+        let manifest = directory.appendingPathComponent("session.json")
+        let corruptData = Data("{invalid session".utf8)
+        try corruptData.write(to: manifest)
+
+        let history = try await store.loadHistory()
+        let all = try await store.loadAll()
+        XCTAssertEqual(history.map(\.id), [newer.id, older.id])
+        XCTAssertEqual(all.map(\.id), [newer.id, older.id])
+        XCTAssertEqual(try Data(contentsOf: manifest), corruptData)
+    }
+
+    func testCatalogWithStaleIndexAndMissingManifestsIsEmpty() async throws {
+        let dir = self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = MeetingSessionStore(rootDirectory: dir)
+        let track = self.makeMicrophoneTrack(chunks: [])
+        let missingManifest = self.makeSession(state: .completed, audioTracks: [track])
+        let missingDirectory = self.makeSession(state: .completed, audioTracks: [track])
+        try await store.create(missingManifest)
+        try await store.create(missingDirectory)
+        let firstDirectory = try await store.sessionDirectory(for: missingManifest.id)
+        let secondDirectory = try await store.sessionDirectory(for: missingDirectory.id)
+        try FileManager.default.removeItem(at: firstDirectory.appendingPathComponent("session.json"))
+        try FileManager.default.removeItem(at: secondDirectory)
+
+        let history = try await store.loadHistory()
+        let all = try await store.loadAll()
+        XCTAssertTrue(history.isEmpty)
+        XCTAssertTrue(all.isEmpty)
+    }
+
+    func testNewCatalogIsEmpty() async throws {
+        let dir = self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = MeetingSessionStore(rootDirectory: dir.appendingPathComponent("Meetings", isDirectory: true))
+        let history = try await store.loadHistory()
+        let all = try await store.loadAll()
+        XCTAssertTrue(history.isEmpty)
+        XCTAssertTrue(all.isEmpty)
     }
 
     // MARK: - Test 1: loadRecoverable classification
@@ -2011,24 +2194,46 @@ final class MeetingRecoveryTests: XCTestCase {
         await coordinator.ensureRestored()
 
         do {
-            _ = try await coordinator.retryProcessing(
-                sessionID: session.id,
-                override: .init(engine: .parakeet, languageCode: "bn")
-            )
+            _ = try await coordinator.retryProcessing(sessionID: session.id, languageCode: "bn", engine: .parakeet)
             XCTFail("Parakeet cannot transcribe Bengali")
         } catch {
-            XCTAssertEqual(error as? MeetingModelValidationError, .unsupportedLanguage)
+            guard case MeetingCoordinatorError.unsupportedRetranscriptionLanguage = error else {
+                return XCTFail("unexpected error \(error)")
+            }
         }
 
-        let result = try await coordinator.retryProcessing(
-            sessionID: session.id,
-            override: .init(engine: .whisperTurbo, languageCode: "bn")
-        )
+        let result = try await coordinator.retryProcessing(sessionID: session.id, languageCode: "bn", engine: .whisperTurbo)
         XCTAssertEqual(result.state, .completed)
         let loaded = try await store.load(id: session.id)
         let persisted = try XCTUnwrap(loaded)
         XCTAssertEqual(persisted.transcriptionEngine, .whisperTurbo)
         XCTAssertEqual(persisted.languageCode, "bn")
+    }
+
+    func testFailedRetranscribeKeepsStoredEngineAndLanguage() async throws {
+        let dir = self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = MeetingSessionStore(rootDirectory: dir)
+        let session = self.makeSession(
+            state: .completed,
+            endedAt: Date(),
+            audioTracks: [self.makeMicrophoneTrack(chunks: [self.makeFinalizedChunk()])]
+        )
+        try await store.create(session)
+        let coordinator = MeetingSessionCoordinator(
+            store: store,
+            capture: StubCaptureController(),
+            processing: ThrowingProcessingController(),
+            audioArbiter: StubArbiter()
+        )
+        await coordinator.ensureRestored()
+
+        _ = try? await coordinator.retryProcessing(sessionID: session.id, languageCode: "bn", engine: .whisperTurbo)
+
+        let loaded = try await store.load(id: session.id)
+        let persisted = try XCTUnwrap(loaded)
+        XCTAssertEqual(persisted.transcriptionEngine, session.transcriptionEngine)
+        XCTAssertEqual(persisted.languageCode, session.languageCode)
     }
 
     // MARK: - Test 11: retry-by-id displaces a passive recovery offer
@@ -2725,6 +2930,484 @@ final class MeetingRecoveryTests: XCTestCase {
         XCTAssertFalse(lines.first?.contains("errorCode=") == true)
         XCTAssertEqual(result.state, .completed)
         XCTAssertFalse(FileManager.default.fileExists(atPath: checkpointURL.path))
+    }
+
+    private func completedEnglishRetranscriptionFixture() throws -> MeetingSession {
+        let started = Date(timeIntervalSinceNow: -120)
+        var session = self.makeSession(
+            state: .completed,
+            startedAt: started,
+            endedAt: Date(),
+            audioTracks: [self.makeMicrophoneTrack(chunks: [self.makeFinalizedChunk()])],
+            processingAttempts: [MeetingProcessingAttempt(
+                id: UUID(),
+                startedAt: started,
+                completedAt: started.addingTimeInterval(10),
+                stage: .completed,
+                pipelineVersion: MeetingProcessingPipeline.pipelineVersion,
+                asrProvider: "fixture",
+                asrModel: "parakeet-tdt-v2",
+                languageCode: "en",
+                diarizationModel: nil,
+                lastCompletedTrackID: nil,
+                errorCode: nil
+            )]
+        )
+        session.languageCode = "en"
+        let trackID = try XCTUnwrap(session.audioTracks.first?.id)
+        session.transcriptSegments = [self.makeTranscriptSegment(sourceTrackID: trackID, speakerID: nil)]
+        session.transcriptSegments[0].text = "Existing English transcript"
+        return session
+    }
+
+    func testLanguageRetryKeepsStoredLanguageUntilSuccessfulReplacement() async throws {
+        let dir = self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = MeetingSessionStore(rootDirectory: dir)
+        let session = try self.completedEnglishRetranscriptionFixture()
+        try await store.create(session)
+        let processing = GatedProcessingController()
+        var dutch = try XCTUnwrap(session.transcriptSegments.first)
+        dutch.text = "Nieuwe transcript"
+        processing.completedSegments = [dutch]
+        let coordinator = MeetingSessionCoordinator(store: store, capture: StubCaptureController(), processing: processing, audioArbiter: StubArbiter())
+        await coordinator.ensureRestored()
+        let retry = Task { try await coordinator.retryProcessing(sessionID: session.id, languageCode: "nl") }
+        for _ in 0..<1000 {
+            if processing.didStart { break }
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        guard processing.didStart else {
+            processing.openGate()
+            _ = try? await retry.value
+            return XCTFail("Processing did not start")
+        }
+        let pendingSaved = try await store.load(id: session.id)
+        let pending = try XCTUnwrap(pendingSaved)
+        XCTAssertEqual(pending.languageCode, "en")
+        XCTAssertEqual(pending.transcriptSegments.map(\.text), ["Existing English transcript"])
+        XCTAssertEqual(pending.processingAttempts.last?.languageCode, "nl")
+        XCTAssertEqual(pending.processingAttempts.last?.retainedTranscriptLanguageCode, "en")
+        XCTAssertEqual(processing.receivedLanguageCode, "nl", "Only the model input uses the requested language before success")
+        processing.openGate()
+        let result = try await retry.value
+        XCTAssertEqual(result.languageCode, "nl")
+        XCTAssertEqual(result.transcriptSegments.map(\.text), ["Nieuwe transcript"])
+        XCTAssertNil(result.processingAttempts.last?.retainedTranscriptLanguageCode)
+        let saved = try await store.load(id: session.id)
+        XCTAssertEqual(saved?.languageCode, "nl")
+        XCTAssertEqual(saved?.transcriptSegments.map(\.text), ["Nieuwe transcript"])
+    }
+
+    func testCancelledLanguageRetryRetainsCompletedResultAndReleasesLease() async throws {
+        let dir = self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = MeetingSessionStore(rootDirectory: dir)
+        let session = try self.completedEnglishRetranscriptionFixture()
+        try await store.create(session)
+        let arbiter = StubArbiter()
+        let coordinator = MeetingSessionCoordinator(store: store, capture: StubCaptureController(), processing: DiagnosticFailingProcessingController(error: CancellationError()), audioArbiter: arbiter)
+        await coordinator.ensureRestored()
+        do {
+            _ = try await coordinator.retryProcessing(sessionID: session.id, languageCode: "nl")
+            XCTFail("Expected cancellation")
+        } catch { XCTAssertTrue(error is CancellationError) }
+        let saved = try await store.load(id: session.id)
+        XCTAssertEqual(saved?.state, .completed)
+        XCTAssertEqual(saved?.languageCode, "en")
+        XCTAssertEqual(saved?.transcriptSegments.map(\.text), ["Existing English transcript"])
+        XCTAssertEqual(saved?.processingAttempts.last?.languageCode, "nl")
+        XCTAssertEqual(saved?.processingAttempts.last?.errorCode, "cancelled")
+        XCTAssertNotNil(saved?.processingAttempts.last?.completedAt)
+        XCTAssertEqual(arbiter.acquireCount, arbiter.releaseCount)
+    }
+
+    func testRestartRestoresLegacyCompletedTextWithoutAttemptLanguageMetadata() async throws {
+        let dir = self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = MeetingSessionStore(rootDirectory: dir)
+        var session = try self.completedEnglishRetranscriptionFixture()
+        session.state = .processing
+        session.processingAttempts = [MeetingProcessingAttempt(
+            id: UUID(),
+            startedAt: Date(),
+            completedAt: nil,
+            stage: .pending,
+            pipelineVersion: MeetingProcessingPipeline.pipelineVersion,
+            asrProvider: nil,
+            asrModel: nil,
+            languageCode: "nl",
+            retainedTranscriptLanguageCode: "en",
+            diarizationModel: nil,
+            lastCompletedTrackID: nil,
+            errorCode: nil
+        )]
+        try await store.create(session)
+        let coordinator = MeetingSessionCoordinator(store: store, capture: StubCaptureController(), processing: StubProcessingController(), audioArbiter: StubArbiter())
+        await coordinator.ensureRestored()
+        let saved = try await store.load(id: session.id)
+        XCTAssertEqual(saved?.state, .completed)
+        XCTAssertEqual(saved?.languageCode, "en")
+        XCTAssertEqual(saved?.transcriptSegments.map(\.text), ["Existing English transcript"])
+        XCTAssertEqual(saved?.processingAttempts.last?.languageCode, "nl")
+        XCTAssertNotNil(saved?.processingAttempts.last?.completedAt)
+        XCTAssertNil(coordinator.activeSession)
+    }
+
+    func testRestartRepairsTheOlderPRPendingLanguageSnapshot() async throws {
+        let dir = self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = MeetingSessionStore(rootDirectory: dir)
+        var session = try self.completedEnglishRetranscriptionFixture()
+        session.state = .processing
+        session.languageCode = "nl"
+        session.processingAttempts.append(MeetingProcessingAttempt(
+            id: UUID(),
+            startedAt: Date(),
+            completedAt: nil,
+            stage: .pending,
+            pipelineVersion: MeetingProcessingPipeline.pipelineVersion,
+            asrProvider: nil,
+            asrModel: nil,
+            languageCode: "nl",
+            diarizationModel: nil,
+            lastCompletedTrackID: nil,
+            errorCode: nil
+        ))
+        try await store.create(session)
+        let coordinator = MeetingSessionCoordinator(store: store, capture: StubCaptureController(), processing: StubProcessingController(), audioArbiter: StubArbiter())
+        await coordinator.ensureRestored()
+        let saved = try await store.load(id: session.id)
+        XCTAssertEqual(saved?.state, .completed)
+        XCTAssertEqual(saved?.languageCode, "en")
+        XCTAssertEqual(saved?.transcriptSegments.map(\.text), ["Existing English transcript"])
+        XCTAssertNil(coordinator.activeSession)
+    }
+
+    func testRetryAfterInterruptedEmptyResultDoesNotCommitAbandonedLanguage() async throws {
+        let dir = self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = MeetingSessionStore(rootDirectory: dir)
+        var session = try self.completedEnglishRetranscriptionFixture()
+        session.transcriptSegments = []
+        session.state = .interrupted
+        var abandoned = try XCTUnwrap(session.processingAttempts.last)
+        abandoned.id = UUID()
+        abandoned.completedAt = nil
+        abandoned.languageCode = "nl"
+        abandoned.stage = .completed
+        session.processingAttempts.append(abandoned)
+        try await store.create(session)
+        let arbiter = StubArbiter()
+        let coordinator = MeetingSessionCoordinator(
+            store: store,
+            capture: StubCaptureController(),
+            processing: DiagnosticFailingProcessingController(error: ProcessingFailure()),
+            audioArbiter: arbiter
+        )
+        await coordinator.ensureRestored()
+        do {
+            _ = try await coordinator.retryProcessing(sessionID: session.id, languageCode: "nl")
+            XCTFail("Expected processing failure")
+        } catch { XCTAssertTrue(error is ProcessingFailure) }
+        let saved = try await store.load(id: session.id)
+        let result = try XCTUnwrap(saved)
+        XCTAssertEqual(result.languageCode, "en")
+        XCTAssertEqual(MeetingRetranscriptionLanguage.failedAttemptLanguage(for: result), "nl")
+        XCTAssertEqual(result.state, .failed)
+        XCTAssertEqual(result.processingAttempts.first(where: { $0.id == abandoned.id })?.errorCode, "interrupted")
+        XCTAssertNotNil(result.processingAttempts.last?.errorCode)
+        XCTAssertFalse(result.failures.isEmpty)
+        XCTAssertEqual(arbiter.acquireCount, arbiter.releaseCount)
+        await coordinator.shutdownForTermination()
+    }
+
+    func testUnsupportedRetranscriptionLanguageDoesNotLeakAudioLease() async throws {
+        let dir = self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = MeetingSessionStore(rootDirectory: dir)
+        let session = try self.completedEnglishRetranscriptionFixture()
+        try await store.create(session)
+        let arbiter = StubArbiter()
+        let coordinator = MeetingSessionCoordinator(store: store, capture: StubCaptureController(), processing: StubProcessingController(), audioArbiter: arbiter)
+        await coordinator.ensureRestored()
+        do {
+            _ = try await coordinator.retryProcessing(sessionID: session.id, languageCode: "zh")
+            XCTFail("Unsupported language should fail")
+        } catch {
+            guard case MeetingCoordinatorError.unsupportedRetranscriptionLanguage = error else { return XCTFail("Unexpected error: \(error)") }
+        }
+        XCTAssertEqual(arbiter.acquireCount, arbiter.releaseCount, "An invalid language must not leave dictation blocked")
+        await coordinator.shutdownForTermination()
+    }
+
+    func testInterruptedLanguageRetryPreservesCompletedTranscriptAndFailure() async throws {
+        let dir = self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = MeetingSessionStore(rootDirectory: dir)
+        let session = try self.completedEnglishRetranscriptionFixture()
+        try await store.create(session)
+        let processing = GatedProcessingController()
+        processing.stageBeforeGate = .completed
+        let coordinator = MeetingSessionCoordinator(store: store, capture: StubCaptureController(), processing: processing, audioArbiter: StubArbiter())
+        await coordinator.ensureRestored()
+        let retry = Task { try await coordinator.retryProcessing(sessionID: session.id, languageCode: "nl") }
+        for _ in 0..<1000 {
+            if processing.didStart { break }
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        guard processing.didStart else {
+            processing.openGate()
+            _ = try? await retry.value
+            return XCTFail("Processing never reached the controlled pause")
+        }
+        await coordinator.shutdownForTermination()
+        processing.openGate()
+        _ = try? await retry.value
+        let interruptedSaved = try await store.load(id: session.id)
+        let interrupted = try XCTUnwrap(interruptedSaved)
+        XCTAssertEqual(interrupted.languageCode, "en", "Stored English text must keep its English label across restart")
+        XCTAssertEqual(interrupted.state, .completed, "The previous usable transcript must remain available")
+        XCTAssertEqual(interrupted.transcriptSegments.map(\.text), ["Existing English transcript"])
+
+        let restarted = MeetingSessionCoordinator(store: store, capture: StubCaptureController(), processing: DiagnosticFailingProcessingController(error: ProcessingFailure()), audioArbiter: StubArbiter())
+        await restarted.ensureRestored()
+        do {
+            _ = try await restarted.retryProcessing(sessionID: session.id, languageCode: "nl")
+            XCTFail("Expected processing failure")
+        } catch {}
+        let failureSaved = try await store.load(id: session.id)
+        let afterFailure = try XCTUnwrap(failureSaved)
+        XCTAssertNotNil(afterFailure.processingAttempts.last?.errorCode, "Failure after reopening must be persisted")
+        XCTAssertFalse(afterFailure.failures.isEmpty, "The new failure must survive another restart")
+        await restarted.shutdownForTermination()
+    }
+
+    func testFailedSameLanguageRedoKeepsSavedTranscriptAndReleasesAudio() async throws {
+        let dir = self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = MeetingSessionStore(rootDirectory: dir)
+        let original = try self.completedEnglishRetranscriptionFixture()
+        try await store.create(original)
+        let arbiter = StubArbiter()
+        let coordinator = MeetingSessionCoordinator(
+            store: store,
+            capture: StubCaptureController(),
+            processing: DiagnosticFailingProcessingController(error: ProcessingFailure()),
+            audioArbiter: arbiter
+        )
+        await coordinator.ensureRestored()
+        do {
+            _ = try await coordinator.retryProcessing(sessionID: original.id, languageCode: "en")
+            XCTFail("Expected fixture failure")
+        } catch { XCTAssertTrue(error is ProcessingFailure) }
+        let saved = try await store.load(id: original.id)
+        let restored = try XCTUnwrap(saved)
+        XCTAssertEqual(restored.state, .completed)
+        XCTAssertEqual(restored.languageCode, original.languageCode)
+        XCTAssertEqual(restored.transcriptSegments, original.transcriptSegments)
+        XCTAssertEqual(restored.speakers, original.speakers)
+        XCTAssertEqual(restored.audioTracks, original.audioTracks)
+        XCTAssertEqual(restored.postProcessing, original.postProcessing)
+        XCTAssertEqual(arbiter.acquireCount, arbiter.releaseCount)
+        XCTAssertNil(MeetingRetranscriptionLanguage.failedAttemptLanguage(for: restored))
+        await coordinator.shutdownForTermination()
+    }
+
+    func testFailedLanguageChangeRetryKeepsChosenLanguage() async throws {
+        let dir = self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = MeetingSessionStore(rootDirectory: dir)
+        let started = Date(timeIntervalSinceNow: -120)
+        var session = self.makeSession(
+            state: .completed,
+            startedAt: started,
+            endedAt: Date(),
+            audioTracks: [self.makeMicrophoneTrack(chunks: [self.makeFinalizedChunk()])],
+            processingAttempts: [MeetingProcessingAttempt(
+                id: UUID(),
+                startedAt: started,
+                completedAt: started.addingTimeInterval(10),
+                stage: .completed,
+                pipelineVersion: MeetingProcessingPipeline.pipelineVersion,
+                asrProvider: "fixture",
+                asrModel: "parakeet-tdt-v2",
+                languageCode: "en",
+                diarizationModel: nil,
+                lastCompletedTrackID: nil,
+                errorCode: nil
+            )]
+        )
+        session.languageCode = "en"
+        let trackID = try XCTUnwrap(session.audioTracks.first?.id)
+        session.transcriptSegments = [self.makeTranscriptSegment(sourceTrackID: trackID, speakerID: nil)]
+        session.transcriptSegments[0].text = "English transcript"
+        try await store.create(session)
+
+        let coordinator = MeetingSessionCoordinator(
+            store: store,
+            capture: StubCaptureController(),
+            processing: DiagnosticFailingProcessingController(error: ProcessingFailure()),
+            audioArbiter: StubArbiter()
+        )
+        await coordinator.ensureRestored()
+        do {
+            _ = try await coordinator.retryProcessing(sessionID: session.id, languageCode: "nl")
+            XCTFail("Expected the language-changing retry to fail during transcription")
+        } catch {
+            XCTAssertTrue(error is ProcessingFailure)
+        }
+
+        let saved = try await store.load(id: session.id)
+        let persisted = try XCTUnwrap(saved)
+        XCTAssertEqual(persisted.languageCode, "en")
+        XCTAssertEqual(persisted.state, .completed)
+        XCTAssertEqual(persisted.transcriptSegments.map(\.text), ["English transcript"])
+        XCTAssertEqual(persisted.processingAttempts.map(\.languageCode), ["en", "nl"])
+        XCTAssertNotNil(persisted.processingAttempts.last?.errorCode)
+        let exported = try JSONSerialization.jsonObject(with: MeetingTranscriptExporter.json(for: persisted)) as? [String: Any]
+        XCTAssertEqual(exported?["languageCode"] as? String, "en")
+    }
+
+    func testFailedLanguageChangeOfEmptyTranscriptStillPersists() async throws {
+        let dir = self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = MeetingSessionStore(rootDirectory: dir)
+        let started = Date(timeIntervalSinceNow: -120)
+        var session = self.makeSession(
+            state: .completed,
+            startedAt: started,
+            endedAt: Date(),
+            audioTracks: [self.makeMicrophoneTrack(chunks: [self.makeFinalizedChunk()])],
+            processingAttempts: [MeetingProcessingAttempt(
+                id: UUID(),
+                startedAt: started,
+                completedAt: started.addingTimeInterval(10),
+                stage: .completed,
+                pipelineVersion: MeetingProcessingPipeline.pipelineVersion,
+                asrProvider: "fixture",
+                asrModel: "parakeet-tdt-v2",
+                languageCode: "en",
+                diarizationModel: nil,
+                lastCompletedTrackID: nil,
+                errorCode: nil
+            )]
+        )
+        session.languageCode = "en"
+        try await store.create(session)
+
+        let coordinator = MeetingSessionCoordinator(
+            store: store,
+            capture: StubCaptureController(),
+            processing: DiagnosticFailingProcessingController(error: ProcessingFailure()),
+            audioArbiter: StubArbiter()
+        )
+        await coordinator.ensureRestored()
+        do {
+            _ = try await coordinator.retryProcessing(sessionID: session.id, languageCode: "nl")
+            XCTFail("Expected the language-changing retry to fail during transcription")
+        } catch {
+            XCTAssertTrue(error is ProcessingFailure)
+        }
+
+        let saved = try await store.load(id: session.id)
+        let persisted = try XCTUnwrap(saved)
+        XCTAssertEqual(persisted.languageCode, "en")
+        XCTAssertEqual(persisted.state, .failed)
+        XCTAssertTrue(persisted.transcriptSegments.isEmpty)
+        XCTAssertFalse(persisted.failures.isEmpty)
+        XCTAssertEqual(persisted.processingAttempts.map(\.languageCode), ["en", "nl"])
+        XCTAssertNotNil(persisted.processingAttempts.last?.errorCode)
+        XCTAssertEqual(MeetingRetranscriptionLanguage.failedAttemptLanguage(for: persisted), "nl")
+    }
+
+    func testFailedAttemptLanguageUsesLatestAttemptNotAnOlderError() {
+        var session = self.makeSession(state: .completed, endedAt: Date())
+        session.languageCode = "en"
+        session.transcriptSegments = []
+        let started = Date(timeIntervalSinceNow: -60)
+        session.processingAttempts = [
+            MeetingProcessingAttempt(
+                id: UUID(),
+                startedAt: started,
+                completedAt: started.addingTimeInterval(5),
+                stage: .completed,
+                pipelineVersion: 1,
+                asrProvider: nil,
+                asrModel: nil,
+                languageCode: "nl",
+                diarizationModel: nil,
+                lastCompletedTrackID: nil,
+                errorCode: "failed"
+            ),
+            MeetingProcessingAttempt(
+                id: UUID(),
+                startedAt: Date(),
+                completedAt: nil,
+                stage: .pending,
+                pipelineVersion: 1,
+                asrProvider: nil,
+                asrModel: nil,
+                languageCode: "de",
+                diarizationModel: nil,
+                lastCompletedTrackID: nil,
+                errorCode: nil
+            ),
+        ]
+        XCTAssertEqual(MeetingRetranscriptionLanguage.failedAttemptLanguage(for: session), "de")
+        session.processingAttempts.append(MeetingProcessingAttempt(
+            id: UUID(),
+            startedAt: Date(),
+            completedAt: nil,
+            stage: .pending,
+            pipelineVersion: 1,
+            asrProvider: nil,
+            asrModel: nil,
+            languageCode: nil,
+            diarizationModel: nil,
+            lastCompletedTrackID: nil,
+            errorCode: nil
+        ))
+        XCTAssertEqual(MeetingRetranscriptionLanguage.failedAttemptLanguage(for: session), "de")
+    }
+
+    func testFailedLanguageChangeWithoutAttemptMetadataKeepsOriginalLanguage() async throws {
+        let dir = self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = MeetingSessionStore(rootDirectory: dir)
+        var session = self.makeSession(
+            state: .completed,
+            endedAt: Date(),
+            audioTracks: [self.makeMicrophoneTrack(chunks: [self.makeFinalizedChunk()])]
+        )
+        session.languageCode = "en"
+        session.processingAttempts = []
+        let trackID = try XCTUnwrap(session.audioTracks.first?.id)
+        session.transcriptSegments = [self.makeTranscriptSegment(sourceTrackID: trackID, speakerID: nil)]
+        session.transcriptSegments[0].text = "Legacy transcript"
+        try await store.create(session)
+
+        let coordinator = MeetingSessionCoordinator(
+            store: store,
+            capture: StubCaptureController(),
+            processing: DiagnosticFailingProcessingController(error: ProcessingFailure()),
+            audioArbiter: StubArbiter()
+        )
+        await coordinator.ensureRestored()
+        do {
+            _ = try await coordinator.retryProcessing(sessionID: session.id, languageCode: "nl")
+            XCTFail("Expected the language-changing retry to fail during transcription")
+        } catch {
+            XCTAssertTrue(error is ProcessingFailure)
+        }
+
+        let saved = try await store.load(id: session.id)
+        let persisted = try XCTUnwrap(saved)
+        XCTAssertEqual(persisted.languageCode, "en")
+        XCTAssertEqual(persisted.state, .completed)
+        XCTAssertEqual(persisted.transcriptSegments.map(\.text), ["Legacy transcript"])
+        let exported = try JSONSerialization.jsonObject(with: MeetingTranscriptExporter.json(for: persisted)) as? [String: Any]
+        XCTAssertEqual(exported?["languageCode"] as? String, "en")
     }
 
     func testProcessingDiagnosticsPreserveFailureAndTranscriptAcrossRetries() async throws {
@@ -5118,6 +5801,132 @@ final class MeetingRecoveryTests: XCTestCase {
 
     // MARK: - Rename session
 
+    func testAwaitedPersistenceSurvivesCoalescingAndFailure() async throws {
+        let dir = self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let recorder = EventRecorder()
+        let store = GatedThrowingSaveStore(inner: MeetingSessionStore(rootDirectory: dir), recorder: recorder)
+        let queue = MeetingSessionPersistenceQueue(store: store)
+        var session = self.makeSession(state: .recording, audioTracks: [self.makeMicrophoneTrack(chunks: [])])
+        await store.closeGate()
+        queue.enqueue(session)
+        for _ in 0..<100 {
+            if await recorder.events.contains("store.save.start") { break }
+            await Task.yield()
+        }
+        session.title = "Renamed"
+        let titleSnapshot = session
+        let rename = Task { try await queue.save(titleSnapshot) }
+        for _ in 0..<20 {
+            await Task.yield()
+        }
+        session.events = [.init(id: UUID(), occurredAt: Date(timeIntervalSince1970: 1000), kind: .echoFilteringUnavailable, trackID: nil, detail: nil)]
+        queue.enqueue(session)
+        await store.openGate()
+        try await rename.value
+        await queue.flush()
+        let saved = try await store.load(id: session.id)
+        XCTAssertEqual(saved?.title, "Renamed")
+        XCTAssertEqual(saved?.events, session.events)
+        await store.throwOnNextSave()
+        await XCTAssertThrowsErrorAsync(try await queue.save(session))
+        try await queue.save(session)
+        let counts = await store.savedEventCounts
+        XCTAssertEqual(counts, [0, 1, 1], "Coalescing must retain the waiter and failure must not strand the worker")
+    }
+
+    func testRenameWhileRecordingPreservesCaptureAndFinalTitle() async throws {
+        let dir = self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = MeetingSessionStore(rootDirectory: dir)
+        let capture = StubCaptureController()
+        let microphone = self.makeMicrophoneTrack(chunks: [self.makeFinalizedChunk()])
+        capture.startResult = MeetingCaptureStartResult(tracks: [microphone], firstPresentationTime: nil)
+        let coordinator = MeetingSessionCoordinator(store: store, capture: capture, processing: StubProcessingController(), audioArbiter: StubArbiter())
+        let started = try await coordinator.startRecording(configuration: self.makeConfiguration())
+        try await Task.sleep(nanoseconds: 100_000_000) // Let startup retention maintenance finish before gating saves.
+        let renamed = try await coordinator.renameSession(sessionID: started.id, to: "  Weekly planning  ")
+        XCTAssertEqual(renamed.title, "Weekly planning")
+        XCTAssertNil(renamed.defaultTitleBase)
+        XCTAssertEqual(coordinator.state, .recording(started.id))
+        XCTAssertEqual(capture.startCount, 1)
+        XCTAssertEqual(capture.stopCount, 0)
+        XCTAssertEqual(renamed.audioTracks, started.audioTracks)
+        XCTAssertEqual(renamed.selectedMicrophone, started.selectedMicrophone)
+        XCTAssertEqual(renamed.events, started.events)
+        XCTAssertEqual(renamed.startedAt, started.startedAt)
+        XCTAssertFalse(coordinator.canUndoCorrection(sessionID: started.id))
+        let saved = try await store.load(id: started.id)
+        XCTAssertEqual(saved?.title, renamed.title)
+        capture.stopResult = MeetingCaptureStopResult(tracks: [microphone], stoppedAt: Date())
+        let completed = try await coordinator.stopAndTranscribe()
+        XCTAssertEqual(completed.title, renamed.title)
+        let reloaded = try await store.load(id: started.id)
+        XCTAssertEqual(reloaded?.title, renamed.title)
+        XCTAssertEqual(reloaded?.state, .completed)
+    }
+
+    func testRenameWhileRecordingRejectsBlankAndRecoversAfterSaveFailure() async throws {
+        let dir = self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = GatedThrowingSaveStore(inner: MeetingSessionStore(rootDirectory: dir), recorder: EventRecorder())
+        let capture = StubCaptureController()
+        capture.startResult = MeetingCaptureStartResult(tracks: [self.makeMicrophoneTrack(chunks: [])], firstPresentationTime: nil)
+        let coordinator = MeetingSessionCoordinator(store: store, capture: capture, processing: StubProcessingController(), audioArbiter: StubArbiter())
+        let started = try await coordinator.startRecording(configuration: self.makeConfiguration())
+        try await Task.sleep(nanoseconds: 100_000_000) // Let startup retention maintenance finish before gating saves.
+        await XCTAssertThrowsErrorAsync(try await coordinator.renameSession(sessionID: started.id, to: " \n "))
+        XCTAssertEqual(coordinator.activeSession?.title, started.title)
+        await store.throwOnNextSave()
+        await XCTAssertThrowsErrorAsync(try await coordinator.renameSession(sessionID: started.id, to: "Planning"))
+        XCTAssertTrue(coordinator.isRecording)
+        XCTAssertEqual(capture.startCount, 1)
+        XCTAssertEqual(capture.stopCount, 0)
+        _ = try await coordinator.renameSession(sessionID: started.id, to: "Planning")
+        let reloaded = try await store.load(id: started.id)
+        XCTAssertEqual(reloaded?.title, "Planning")
+        await coordinator.shutdownForTermination()
+    }
+
+    func testRenameWhileRecordingKeepsIncomingEventsAndAllowsStopDuringSave() async throws {
+        let dir = self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let recorder = EventRecorder()
+        let store = GatedThrowingSaveStore(inner: MeetingSessionStore(rootDirectory: dir), recorder: recorder)
+        let capture = StubCaptureController()
+        let microphone = self.makeMicrophoneTrack(chunks: [self.makeFinalizedChunk()])
+        capture.startResult = MeetingCaptureStartResult(tracks: [microphone], firstPresentationTime: nil)
+        let coordinator = MeetingSessionCoordinator(store: store, capture: capture, processing: StubProcessingController(), audioArbiter: StubArbiter())
+        let started = try await coordinator.startRecording(configuration: self.makeConfiguration())
+        try await Task.sleep(nanoseconds: 100_000_000) // Let startup retention maintenance finish before gating saves.
+        await store.closeGate()
+        let rename = Task { try await coordinator.renameSession(sessionID: started.id, to: "Live planning") }
+        for _ in 0..<200 where coordinator.activeSession?.title != "Live planning" {
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        XCTAssertEqual(coordinator.activeSession?.title, "Live planning")
+        await XCTAssertThrowsErrorAsync(try await coordinator.renameSession(sessionID: started.id, to: "Overlapping edit"))
+        capture.emit(.microphoneEchoProtectionChanged(.unfiltered))
+        await self.drainCaptureEvents()
+        let events = try XCTUnwrap(coordinator.activeSession).events
+        XCTAssertFalse(events.isEmpty)
+        capture.stopResult = MeetingCaptureStopResult(tracks: [microphone], stoppedAt: Date())
+        let stop = Task { try await coordinator.stopAndTranscribe() }
+        for _ in 0..<100 where coordinator.state != .stopping(started.id) {
+            await Task.yield()
+        }
+        XCTAssertEqual(coordinator.state, .stopping(started.id), "Stop must be accepted while the title save is pending")
+        await store.openGate()
+        _ = try await rename.value
+        let completed = try await stop.value
+        XCTAssertEqual(completed.title, "Live planning")
+        XCTAssertEqual(completed.events, events)
+        let saved = try await store.load(id: started.id)
+        XCTAssertEqual(saved?.state, .completed, "A queued rename must never overwrite terminal state")
+        XCTAssertEqual(saved?.events.map(\.id), events.map(\.id))
+        XCTAssertEqual(saved?.title, "Live planning")
+    }
+
     func testRenameSessionRejectsEmptyOrWhitespaceTitle() async throws {
         let dir = self.makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -5181,6 +5990,148 @@ final class MeetingRecoveryTests: XCTestCase {
         let reloaded = try await store.load(id: session.id)
         XCTAssertEqual(reloaded, before)
     }
+
+    func testRenameSessionPreservesLegacySummaryKindsAcrossReloads() async throws {
+        let root = self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let prompt = "List risks by owner."
+        let generatedAt = Date(timeIntervalSince1970: 1_700_000_000)
+
+        for provider in ["fixture", MeetingSummaryOnDevice.providerID] {
+            let dir = root.appendingPathComponent(provider, isDirectory: true)
+            let store = MeetingSessionStore(rootDirectory: dir)
+            let (session, _, _, _) = self.makeCorrectionSession(state: .completed)
+            try await store.create(session)
+            let directory = try await store.sessionDirectory(for: session.id)
+            let legacyHash = MeetingSummaryInput.fingerprint(MeetingSummaryInput.transcript(for: session))
+            for kind in MeetingSummaryKind.allCases {
+                let saved = MeetingSummaryController.SavedSummary(
+                    transcriptHash: legacyHash,
+                    modelID: "fixture-model",
+                    text: "Saved \(kind.rawValue) summary",
+                    providerID: provider,
+                    providerName: "Fixture provider",
+                    generatedAt: generatedAt,
+                    promptHash: kind == .custom ? MeetingSummaryInput.fingerprint(prompt) : nil
+                )
+                let file = directory.appendingPathComponent("manual-summary-\(kind.rawValue).json")
+                try JSONEncoder().encode(saved).write(to: file, options: .atomic)
+                let controller = MeetingSummaryController(store: store)
+                await controller.refresh(session: session, kind: kind, customPrompt: prompt)
+                XCTAssertEqual(controller.output, saved.text, "Legacy \(kind) summary should load before rename")
+            }
+
+            let coordinator = MeetingSessionCoordinator(
+                store: store, capture: StubCaptureController(), processing: StubProcessingController(), audioArbiter: StubArbiter()
+            )
+            _ = try await coordinator.renameSession(sessionID: session.id, to: "Weekly Sync")
+
+            // A new store and controller must recover the summaries from disk, without live state.
+            let reloadedStore = MeetingSessionStore(rootDirectory: dir)
+            let loaded = try await reloadedStore.loadTranscript(id: session.id)
+            let renamed = try XCTUnwrap(loaded)
+            XCTAssertEqual(renamed.title, "Weekly Sync")
+            let controller = MeetingSummaryController(store: reloadedStore)
+            var upgradedFiles: [MeetingSummaryKind: Data] = [:]
+            for kind in MeetingSummaryKind.allCases {
+                await controller.refresh(session: renamed, kind: kind, customPrompt: prompt)
+                XCTAssertEqual(controller.output, "Saved \(kind.rawValue) summary", "\(provider): \(kind)")
+                XCTAssertEqual(controller.outputProvenance, "Fixture provider · fixture-model")
+                let file = directory.appendingPathComponent("manual-summary-\(kind.rawValue).json")
+                let data = try Data(contentsOf: file)
+                upgradedFiles[kind] = data
+                let saved = try JSONDecoder().decode(MeetingSummaryController.SavedSummary.self, from: data)
+                XCTAssertEqual(saved.transcriptHashVersion, MeetingSummaryController.SavedSummary.currentTranscriptHashVersion)
+                XCTAssertEqual(saved.generatedAt, generatedAt)
+                XCTAssertEqual(saved.providerID, provider)
+            }
+
+            // Already-upgraded summaries survive another rename without rewriting their files.
+            let secondRename = try await coordinator.renameSession(sessionID: session.id, to: "New Weekly Sync")
+            for kind in MeetingSummaryKind.allCases {
+                await controller.refresh(session: secondRename, kind: kind, customPrompt: prompt)
+                XCTAssertEqual(controller.output, "Saved \(kind.rawValue) summary")
+                let file = directory.appendingPathComponent("manual-summary-\(kind.rawValue).json")
+                XCTAssertEqual(try Data(contentsOf: file), upgradedFiles[kind])
+            }
+            await controller.refresh(session: secondRename, kind: .custom, customPrompt: "Edited prompt")
+            XCTAssertTrue(controller.output.isEmpty, "Migrating a custom summary must retain its prompt check")
+            var corrected = secondRename
+            corrected.transcriptSegments[0].text += " A transcript correction."
+            await controller.refresh(session: corrected, kind: .detailed)
+            XCTAssertTrue(controller.output.isEmpty, "Renaming must not disable transcript invalidation")
+            corrected = secondRename
+            corrected.speakers[0].displayName = "Corrected speaker"
+            await controller.refresh(session: corrected, kind: .participants)
+            XCTAssertTrue(controller.output.isEmpty, "Renaming must not disable speaker invalidation")
+        }
+    }
+
+    func testRenameSessionDoesNotReviveInvalidSavedSummaries() async throws {
+        let dir = self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = MeetingSessionStore(rootDirectory: dir)
+        let (session, _, _, _) = self.makeCorrectionSession(state: .completed)
+        try await store.create(session)
+        let directory = try await store.sessionDirectory(for: session.id)
+        let hash = MeetingSummaryInput.fingerprint(MeetingSummaryInput.transcript(for: session))
+        let stale = MeetingSummaryController.SavedSummary(transcriptHash: "old transcript", modelID: "fixture", text: "Stale", providerID: "fixture")
+        let retired = MeetingSummaryController.SavedSummary(transcriptHash: hash, modelID: "old-model", text: "Retired")
+        let unknownVersion = MeetingSummaryController.SavedSummary(transcriptHash: hash, modelID: "fixture", text: "Future", providerID: "fixture", transcriptHashVersion: 99)
+        let files: [MeetingSummaryKind: Data] = try [
+            .executive: JSONEncoder().encode(stale),
+            .detailed: JSONEncoder().encode(retired),
+            .actions: Data("corrupt summary".utf8),
+            .decisions: JSONEncoder().encode(unknownVersion),
+        ]
+        for (kind, data) in files {
+            try data.write(to: directory.appendingPathComponent("manual-summary-\(kind.rawValue).json"), options: .atomic)
+        }
+        let coordinator = MeetingSessionCoordinator(
+            store: store, capture: StubCaptureController(), processing: StubProcessingController(), audioArbiter: StubArbiter()
+        )
+        let renamed = try await coordinator.renameSession(sessionID: session.id, to: "Weekly Sync")
+        let controller = MeetingSummaryController(store: store)
+        for (kind, data) in files {
+            await controller.refresh(session: renamed, kind: kind)
+            XCTAssertTrue(controller.output.isEmpty, "\(kind) must stay hidden")
+            let file = directory.appendingPathComponent("manual-summary-\(kind.rawValue).json")
+            XCTAssertEqual(try Data(contentsOf: file), data, "An invalid file must not be upgraded")
+        }
+    }
+
+    func testFailedRenameKeepsMigratedSummaryVisibleAndAllowsRetry() async throws {
+        let dir = self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = MeetingSessionStore(rootDirectory: dir)
+        let (session, _, _, _) = self.makeCorrectionSession(state: .completed)
+        try await store.create(session)
+        let directory = try await store.sessionDirectory(for: session.id)
+        let file = directory.appendingPathComponent("manual-summary-detailed.json")
+        let saved = MeetingSummaryController.SavedSummary(
+            transcriptHash: MeetingSummaryInput.fingerprint(MeetingSummaryInput.transcript(for: session)),
+            modelID: "fixture",
+            text: "Detailed summary",
+            providerID: "fixture"
+        )
+        try JSONEncoder().encode(saved).write(to: file, options: .atomic)
+        let failingStore = GatedThrowingSaveStore(inner: store, recorder: EventRecorder())
+        await failingStore.throwOnNextSave()
+        let coordinator = MeetingSessionCoordinator(
+            store: failingStore, capture: StubCaptureController(), processing: StubProcessingController(), audioArbiter: StubArbiter()
+        )
+        await XCTAssertThrowsErrorAsync(try await coordinator.renameSession(sessionID: session.id, to: "Weekly Sync"))
+        let loaded = try await store.loadTranscript(id: session.id)
+        let unchanged = try XCTUnwrap(loaded)
+        XCTAssertEqual(unchanged.title, session.title)
+        let controller = MeetingSummaryController(store: store)
+        await controller.refresh(session: unchanged, kind: .detailed)
+        XCTAssertEqual(controller.output, saved.text)
+
+        let renamed = try await coordinator.renameSession(sessionID: session.id, to: "Weekly Sync")
+        await controller.refresh(session: renamed, kind: .detailed)
+        XCTAssertEqual(controller.output, saved.text)
+    }
 }
 
 /// XCTAssertThrowsError has no async overload; this bridges an async throwing expression.
@@ -5238,6 +6189,8 @@ private final class StubCaptureController: MeetingCaptureControlling, @unchecked
     var onPreflight: (@Sendable () async -> Void)?
     private(set) var preflightCount = 0
     private(set) var startCount = 0
+    private(set) var stopCount = 0
+    var stopResult: MeetingCaptureStopResult?
     private var eventHandler: (@Sendable (MeetingCaptureEvent) -> Void)?
 
     func emit(_ event: MeetingCaptureEvent) { self.eventHandler?(event) }
@@ -5266,7 +6219,8 @@ private final class StubCaptureController: MeetingCaptureControlling, @unchecked
     }
 
     func stop(sessionID: MeetingSessionID) async throws -> MeetingCaptureStopResult {
-        MeetingCaptureStopResult(tracks: [], stoppedAt: Date())
+        self.stopCount += 1
+        return self.stopResult ?? MeetingCaptureStopResult(tracks: [], stoppedAt: Date())
     }
 
     func shutdownForTermination() async {}
@@ -5368,6 +6322,10 @@ private final class SkippedChunkProcessingController: MeetingProcessingControlli
 /// Blocks `process(...)` until `openGate()` is called, so tests can inspect mid-flight state.
 @MainActor
 private final class GatedProcessingController: MeetingProcessingControlling {
+    private(set) var didStart = false
+    private(set) var receivedLanguageCode: String?
+    var completedSegments: [MeetingTranscriptSegment] = []
+    var stageBeforeGate: MeetingProcessingStage?
     private var isOpen = false
     private var continuation: CheckedContinuation<Void, Never>?
 
@@ -5382,6 +6340,9 @@ private final class GatedProcessingController: MeetingProcessingControlling {
         sessionDirectory: URL,
         progress: @escaping @MainActor (MeetingProcessingStage) -> Void
     ) async throws -> MeetingProcessingResult {
+        self.didStart = true
+        self.receivedLanguageCode = session.languageCode
+        if let stageBeforeGate { progress(stageBeforeGate) }
         // Mirrors the real pipeline's convention of reusing the still-open attempt's id.
         let attemptID = session.processingAttempts.last(where: { $0.completedAt == nil })?.id ?? UUID()
         if !self.isOpen {
@@ -5389,7 +6350,7 @@ private final class GatedProcessingController: MeetingProcessingControlling {
         }
         return MeetingProcessingResult(
             speakers: [],
-            segments: [],
+            segments: self.completedSegments,
             attempt: MeetingProcessingAttempt(
                 id: attemptID,
                 startedAt: Date(),

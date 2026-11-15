@@ -97,9 +97,10 @@ actor MeetingCaptureEngine: MeetingCaptureControlling {
 
         let runtime: any MeetingCaptureRuntime
         switch configuration.mode {
-        case .onlineCall:
-            guard let application = configuration.application,
-                  let applicationWriter = writersByKind[.applicationAudio],
+        case .onlineCall, .systemAudio:
+            let application = configuration.application
+            guard configuration.mode == .systemAudio || application != nil else { throw MeetingCaptureError.applicationNotSelected }
+            guard let applicationWriter = writersByKind[.applicationAudio],
                   let microphoneWriter = writersByKind[.microphone]
             else { throw MeetingCaptureError.applicationNotSelected }
 
@@ -335,12 +336,13 @@ actor MeetingCaptureEngine: MeetingCaptureControlling {
         configuration: MeetingCaptureConfiguration
     ) -> [MeetingAudioTrack] {
         var tracks: [MeetingAudioTrack] = []
-        if let application = configuration.application {
+        if configuration.mode.capturesComputerAudio {
+            let application = configuration.application
             tracks.append(MeetingAudioTrack(
                 id: UUID(),
                 kind: .applicationAudio,
-                sourceIdentifier: application.bundleIdentifier,
-                sourceDisplayName: application.displayName,
+                sourceIdentifier: application?.bundleIdentifier ?? "system-audio",
+                sourceDisplayName: application?.displayName ?? "Computer audio",
                 format: nil,
                 timebase: session.timebase,
                 health: .waiting,
@@ -357,7 +359,7 @@ actor MeetingCaptureEngine: MeetingCaptureControlling {
             timebase: session.timebase,
             health: .waiting,
             chunks: [],
-            captureMethod: configuration.mode == .onlineCall ? .screenCaptureKit : .avCaptureSession
+            captureMethod: configuration.mode.capturesComputerAudio ? .screenCaptureKit : .avCaptureSession
         ))
         return tracks
     }
@@ -609,7 +611,7 @@ private final nonisolated class ScreenCaptureMeetingRuntime: NSObject, MeetingCa
     /// Delays before each of the (up to 3) rebuild attempts following an unexpected stream stop.
     private static let rebuildDelays: [TimeInterval] = [0.5, 1.0, 2.0]
 
-    private let application: MeetingApplicationIdentity
+    private let application: MeetingApplicationIdentity?
     private let requestedMicrophone: MeetingMicrophoneIdentity
     /// Immutable for the runtime's lifetime: a rebuild never drops/adds the mic.
     private let includeMicrophone: Bool
@@ -672,7 +674,7 @@ private final nonisolated class ScreenCaptureMeetingRuntime: NSObject, MeetingCa
     private init(
         stream: SCStream,
         scope: MeetingCaptureScope,
-        application: MeetingApplicationIdentity,
+        application: MeetingApplicationIdentity?,
         requestedMicrophone: MeetingMicrophoneIdentity,
         activeMicrophone: MeetingMicrophoneIdentity,
         includeMicrophone: Bool,
@@ -705,7 +707,7 @@ private final nonisolated class ScreenCaptureMeetingRuntime: NSObject, MeetingCa
     }
 
     static func make(
-        application: MeetingApplicationIdentity,
+        application: MeetingApplicationIdentity?,
         microphone: MeetingMicrophoneIdentity,
         includeMicrophone: Bool = true,
         comparisonProbe: MeetingAudioComparisonProbe? = nil,
@@ -715,12 +717,11 @@ private final nonisolated class ScreenCaptureMeetingRuntime: NSObject, MeetingCa
         eventHandler: @escaping @Sendable (MeetingCaptureEvent) -> Void,
         liveAudioHandler: (@Sendable (MeetingAudioTrackKind, CMSampleBuffer) -> Void)?
     ) async throws -> ScreenCaptureMeetingRuntime {
-        let electedMicrophone = includeMicrophone
-            ? await MeetingCaptureDeviceElection.elect(original: microphone).identity
-            : microphone
+        // Initial capture honors the microphone shown at confirmation. Route recovery
+        // can elect a replacement later, but starting cannot silently switch inputs.
         let resolvedMicrophone = includeMicrophone
-            ? try MeetingAVCaptureMicrophoneResolver.resolve(electedMicrophone)
-            : electedMicrophone
+            ? try MeetingAVCaptureMicrophoneResolver.resolve(microphone)
+            : microphone
         let built = try await Self.buildStream(
             application: application,
             microphone: resolvedMicrophone,
@@ -758,9 +759,10 @@ private final nonisolated class ScreenCaptureMeetingRuntime: NSObject, MeetingCa
     /// Resolves the shareable content, filter, configuration and stream. Re-invoked both for the
     /// initial `make` and for every rebuild attempt after an unexpected stream stop.
     private static func buildStream(
-        application: MeetingApplicationIdentity,
+        application: MeetingApplicationIdentity?,
         microphone: MeetingMicrophoneIdentity,
-        includeMicrophone: Bool
+        includeMicrophone: Bool,
+        allowApplicationRelaunch: Bool = false
     ) async throws -> BuiltStream {
         let content: SCShareableContent
         do {
@@ -768,30 +770,51 @@ private final nonisolated class ScreenCaptureMeetingRuntime: NSObject, MeetingCa
         } catch {
             throw MeetingCaptureError.screenCapturePermissionDenied(error.localizedDescription)
         }
-        let byProcessID = application.processID.flatMap { processID in
-            content.applications.first(where: { $0.processID == processID })
-        }
-        // The saved PID goes stale when the app relaunches; the bundle match keeps rebuilds working.
-        guard let runningApplication = byProcessID ?? content.applications.first(where: {
-            $0.bundleIdentifier == application.bundleIdentifier
-        }) else {
-            throw MeetingCaptureError.applicationUnavailable(application.displayName)
-        }
-
         let filter: SCContentFilter
         let scope: MeetingCaptureScope
-        if let window = Self.selectWindow(for: runningApplication, in: content, preferredWindowID: application.windowID) {
-            filter = SCContentFilter(desktopIndependentWindow: window)
-            scope = .window
+        if let application, application.capturesAllInstances == true {
+            let matching = content.applications.filter { $0.bundleIdentifier == application.bundleIdentifier && $0.processID > 0 }
+            guard !matching.isEmpty else { throw MeetingCaptureError.applicationUnavailable(application.displayName) }
+            guard let display = content.displays.first else { throw MeetingCaptureError.noCaptureDisplay }
+            filter = SCContentFilter(display: display, including: matching, exceptingWindows: [])
+            scope = .display
+        } else if let application {
+            let candidates = content.applications.map {
+                MeetingApplicationIdentity(bundleIdentifier: $0.bundleIdentifier, processID: $0.processID, displayName: $0.applicationName)
+            }
+            var requested = application
+            // Only recovery may follow a relaunched app, and the resolver still requires one
+            // unambiguous replacement. Initial capture must keep the confirmed process.
+            if allowApplicationRelaunch, !candidates.contains(where: {
+                $0.processID == application.processID && $0.bundleIdentifier == application.bundleIdentifier
+            }) {
+                requested.processID = nil
+                requested.windowID = nil
+                requested.displayID = nil
+            }
+            let resolved = try MeetingRecordingSourceResolver.resolve(
+                mode: .onlineCall, source: MeetingRecordingSource(application: requested), target: nil, applications: candidates
+            )
+            guard let runningApplication = content.applications.first(where: { $0.processID == resolved?.processID }) else {
+                throw MeetingCaptureError.applicationUnavailable(application.displayName)
+            }
+
+            if let window = Self.selectWindow(for: runningApplication, in: content, preferredWindowID: requested.windowID) {
+                filter = SCContentFilter(desktopIndependentWindow: window)
+                scope = .window
+            } else {
+                let display = requested.displayID.flatMap { displayID in
+                    content.displays.first(where: { $0.displayID == displayID })
+                } ?? content.displays.first
+                guard let display else { throw MeetingCaptureError.noCaptureDisplay }
+                filter = SCContentFilter(display: display, including: [runningApplication], exceptingWindows: [])
+                scope = .display
+            }
         } else {
-            let display = application.displayID.flatMap { displayID in
-                content.displays.first(where: { $0.displayID == displayID })
-            } ?? content.displays.first
-            guard let display else { throw MeetingCaptureError.noCaptureDisplay }
-            filter = SCContentFilter(display: display, including: [runningApplication], exceptingWindows: [])
+            guard let display = content.displays.first else { throw MeetingCaptureError.noCaptureDisplay }
+            filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
             scope = .display
         }
-
         let configuration = SCStreamConfiguration()
         configuration.width = 2
         configuration.height = 2
@@ -1057,13 +1080,19 @@ private final nonisolated class ScreenCaptureMeetingRuntime: NSObject, MeetingCa
             case .active:
                 pipeline?.consumeCapture(sampleBuffer, stream: streamToken)
             case .armed:
+                // The format handshake is raw warm-up too. Persist its provenance before
+                // validation can activate or invalidate the pipeline; never drop the first PCM.
+                if let pipeline {
+                    pipeline.commitValidationCapture(sampleBuffer)
+                } else {
+                    self.emitDirectRawMicrophone(sampleBuffer, producerEpoch: streamToken.generation)
+                }
                 self.validateArmedCallback(
                     sampleBuffer,
                     kind: .capture,
                     stream: stream,
                     token: streamToken
                 )
-                self.emitDirectRawMicrophone(sampleBuffer, producerEpoch: streamToken.generation)
             case .raw, .constructing, .ready:
                 self.emitDirectRawMicrophone(sampleBuffer, producerEpoch: streamToken.generation)
             }
@@ -1643,7 +1672,8 @@ private final nonisolated class ScreenCaptureMeetingRuntime: NSObject, MeetingCa
             built = try await Self.buildStream(
                 application: self.application,
                 microphone: resolved,
-                includeMicrophone: self.includeMicrophone
+                includeMicrophone: self.includeMicrophone,
+                allowApplicationRelaunch: true
             )
         } catch {
             guard self.isCurrentRouteRevision(revision) else { return .superseded }
@@ -1765,16 +1795,20 @@ private final nonisolated class ScreenCaptureMeetingRuntime: NSObject, MeetingCa
             return owner
         }
         guard let rebuildOwner else { return }
-        self.invalidateAECForStreamRebuild()
+        self.invalidateAECForStreamRebuild(error: error)
         self.eventHandler(.interrupted(kind: .sourceLost, trackID: nil, detail: error.localizedDescription))
         self.runRebuildLoop(triggeringError: error, stoppedStream: stoppedStream, owner: rebuildOwner)
     }
 
-    private func invalidateAECForStreamRebuild() {
-        let shouldInvalidate = self.stateLock.withLock {
-            self.routeDisposition == .supportedSpeaker || self.aecPipeline != nil
+    private func invalidateAECForStreamRebuild(error: Error) {
+        let routeRevision = self.stateLock.withLock { () -> UInt64? in
+            guard self.routeDisposition == .supportedSpeaker || self.aecPipeline != nil else { return nil }
+            return self.outputRouteRevision
         }
-        guard shouldInvalidate else { return }
+        guard let routeRevision else { return }
+        let streamError = error as NSError
+        let sourceDisappeared = streamError.domain == SCStreamErrorDomain
+            && streamError.code == SCStreamError.noCaptureSource.rawValue
         let boundary = self.microphoneTranscriptGate.invalidate()
         self.stateLock.withLock {
             self.aecActivation.invalidate()
@@ -1785,7 +1819,16 @@ private final nonisolated class ScreenCaptureMeetingRuntime: NSObject, MeetingCa
                 return self.aecPipeline
             }
             if let detached {
-                detached.invalidate(reason: .streamChanged, boundary: boundary)
+                let routeUnchanged = self.stateLock.withLock {
+                    self.outputRouteRevision == routeRevision
+                        && self.routeDisposition == .supportedSpeaker
+                        && !self.routeListenerDegraded
+                }
+                detached.retireStoppedStream(
+                    sourceDisappeared: sourceDisappeared,
+                    routeUnchanged: routeUnchanged,
+                    boundary: boundary
+                )
                 self.retainRetiredCommitterIfPending(detached.committer)
             } else {
                 self.microphoneWriter.enqueueMetadata(
@@ -1834,7 +1877,7 @@ private final nonisolated class ScreenCaptureMeetingRuntime: NSObject, MeetingCa
                 do {
                     let microphone = self.stateLock.withLock { self.activeMicrophone }
                     let built = try await Self.buildStream(
-                        application: self.application, microphone: microphone, includeMicrophone: self.includeMicrophone
+                        application: self.application, microphone: microphone, includeMicrophone: self.includeMicrophone, allowApplicationRelaunch: true
                     )
                     guard self.stateLock.withLock({ !self.stopping && self.rebuildOwner == owner }) else { return }
                     built.delegateProxy.owner = self
@@ -2601,13 +2644,16 @@ nonisolated enum MeetingCaptureSourceCatalog {
     static func resolveApplication(
         from applications: [MeetingApplicationIdentity],
         preferredBundleIdentifier: String?,
+        preferredProcessID: Int32? = nil,
         requirePreferredApplication: Bool
     ) throws -> MeetingApplicationIdentity {
         if requirePreferredApplication {
             guard let preferredBundleIdentifier else {
                 throw MeetingCaptureError.applicationNotSelected
             }
-            guard let match = applications.first(where: { $0.bundleIdentifier == preferredBundleIdentifier }) else {
+            guard let match = applications.first(where: {
+                $0.bundleIdentifier == preferredBundleIdentifier && (preferredProcessID == nil || $0.processID == preferredProcessID)
+            }) else {
                 throw MeetingCaptureError.applicationUnavailable(preferredBundleIdentifier)
             }
             return match
@@ -3145,7 +3191,7 @@ nonisolated enum MeetingCapturePathDecider {
         forcePairedScreenCaptureKit: Bool = false,
         preferDirectAEC3: Bool = false
     ) -> MeetingCapturePathDecision {
-        guard mode == .onlineCall else {
+        guard mode.capturesComputerAudio else {
             return .screenCaptureKit(reason: "Voice-processing capture only applies to online-call recordings.")
         }
         guard let coreAudioUID = microphone.coreAudioUID, !coreAudioUID.isEmpty else {
@@ -4067,7 +4113,7 @@ private final nonisolated class VoiceProcessingMeetingRuntime: MeetingCaptureRun
         case failed(String)
     }
 
-    private let application: MeetingApplicationIdentity
+    private let application: MeetingApplicationIdentity?
     private let originalMicrophone: MeetingMicrophoneIdentity
     private let applicationWriter: MeetingAudioChunkWriter
     private let microphoneWriter: MeetingAudioChunkWriter
@@ -4110,7 +4156,7 @@ private final nonisolated class VoiceProcessingMeetingRuntime: MeetingCaptureRun
     }
 
     private init(
-        application: MeetingApplicationIdentity,
+        application: MeetingApplicationIdentity?,
         microphone: MeetingMicrophoneIdentity,
         applicationWriter: MeetingAudioChunkWriter,
         microphoneWriter: MeetingAudioChunkWriter,
@@ -4132,7 +4178,7 @@ private final nonisolated class VoiceProcessingMeetingRuntime: MeetingCaptureRun
     #endif
 
     static func make(
-        application: MeetingApplicationIdentity,
+        application: MeetingApplicationIdentity?,
         microphone: MeetingMicrophoneIdentity,
         applicationWriter: MeetingAudioChunkWriter,
         microphoneWriter: MeetingAudioChunkWriter,

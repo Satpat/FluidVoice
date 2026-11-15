@@ -191,6 +191,13 @@ final class SettingsNavigationStateTests: XCTestCase {
         XCTAssertEqual(results.first?.target, .accentColor)
     }
 
+    func testTranscriptionSoundsSearchOpensDictationSettings() {
+        XCTAssertEqual(SettingsSearchTarget.transcriptionSounds.section, .dictation)
+        XCTAssertTrue(SettingsSearchIndex.results(for: "transcription sounds").contains {
+            $0.target == .transcriptionSounds && $0.section == .dictation
+        })
+    }
+
     func testSettingsSearchMatchesPrefixesAliasesAndMultipleWords() {
         XCTAssertEqual(SettingsSearchIndex.results(for: "start").first?.target, .launchAtStartup)
         XCTAssertEqual(SettingsSearchIndex.results(for: "meeting shortcut").first?.target, .meetingRecordingShortcut)
@@ -235,7 +242,8 @@ final class SettingsNavigationStateTests: XCTestCase {
             accessibilityEnabled: true,
             savesTranscriptionHistory: false,
             savesAudioWithTranscriptionHistory: false,
-            overlayAtBottom: false
+            overlayAtBottom: false,
+            privateAIAvailable: false
         )
 
         let permissionTargets = SettingsSearchIndex.results(
@@ -261,7 +269,8 @@ final class SettingsNavigationStateTests: XCTestCase {
             accessibilityEnabled: false,
             savesTranscriptionHistory: true,
             savesAudioWithTranscriptionHistory: true,
-            overlayAtBottom: true
+            overlayAtBottom: true,
+            privateAIAvailable: false
         )
         let gatedTargets: [(SettingsSearchTarget, String)] = [
             (.primaryDictationShortcuts, "primary dictation shortcuts"),

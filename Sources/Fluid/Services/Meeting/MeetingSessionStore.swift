@@ -49,8 +49,25 @@ actor MeetingSessionStore: MeetingSessionStoring {
     private let decoder: JSONDecoder
     private var tombstonedIDs: Set<MeetingSessionID> = []
 
+    #if DEBUG
+    /// XCTest launches the real app host as well as the fixture coordinators. Its startup
+    /// maintenance must never see recordings belonging to the person running the tests.
+    private static let testHostRoot: URL? = {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment.keys.contains(where: { $0.hasPrefix("XCTest") })
+            || NSClassFromString("XCTestCase") != nil
+        else { return nil }
+        return FileManager.default.temporaryDirectory
+            .appendingPathComponent("FluidVoice-XCTest-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("Meetings", isDirectory: true)
+    }()
+    #endif
+
     init(rootDirectory: URL? = nil, fileManager: FileManager = .default) {
         self.fileSystem = MeetingSessionFileSystem(manager: fileManager)
+        #if DEBUG
+        let rootDirectory = rootDirectory ?? Self.testHostRoot
+        #endif
         if let rootDirectory {
             self.rootDirectory = rootDirectory
         } else {
@@ -149,17 +166,25 @@ actor MeetingSessionStore: MeetingSessionStoring {
         let allIDs = Array(Set(indexedIDs).union(discoveredIDs))
 
         var sessions: [MeetingSession] = []
+        var firstLoadError: Error?
         sessions.reserveCapacity(allIDs.count)
         for id in allIDs {
             do {
                 let session = try reconcileAudio ? self.load(id: id) : self.readTranscript(id: id)
                 if let session { sessions.append(session) }
             } catch {
+                if firstLoadError == nil {
+                    firstLoadError = error
+                }
                 DebugLogger.shared.error(
                     "Failed to load meeting session \(id): \(error.localizedDescription)",
                     source: "MeetingSessionStore"
                 )
             }
+        }
+        // Keep partial results, but do not replace history with an empty catalog after a read failure.
+        if sessions.isEmpty, let firstLoadError {
+            throw firstLoadError
         }
         return sessions.sorted { $0.startedAt > $1.startedAt }
     }
@@ -385,7 +410,7 @@ actor MeetingSessionStore: MeetingSessionStoring {
             return session
         }
 
-        let expectedKinds: Set<MeetingAudioTrackKind> = session.mode == .onlineCall
+        let expectedKinds: Set<MeetingAudioTrackKind> = session.mode.capturesComputerAudio
             ? [.applicationAudio, .microphone]
             : [.microphone]
         let sessionDirectory = self.sessionDirectoryURL(for: session.id)

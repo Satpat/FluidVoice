@@ -29,6 +29,18 @@ actor PrivateAIIntegrationService {
         let bundleID: String
         let windowTitle: String
         let appVersion: String?
+        /// Raw text for models trained to read it; others ignore both.
+        var textBeforeCursor: String? = nil
+        // Absence means no screen context was read.
+        // swiftlint:disable:next discouraged_optional_collection
+        var screenText: [String]? = nil
+        /// The text an Edit Mode instruction applies to, when any was selected.
+        var selectedText: String? = nil
+        // The front window, for Edit Mode models that read it.
+        // swiftlint:disable:next discouraged_optional_collection
+        var windowLines: [EditModeWindowLine]? = nil
+        /// Signs what Edit Mode writes.
+        var userDisplayName: String? = nil
     }
 
     struct EnhancementResult: Sendable, Equatable {
@@ -110,6 +122,11 @@ actor PrivateAIIntegrationService {
 
     nonisolated static var modelDirectoryURL: URL {
         provider.modelDirectoryURL
+    }
+
+    /// The local model Edit Mode runs on. Dictation's model choice never changes it.
+    nonisolated static var editModel: PrivateAIRegisteredModel? {
+        PrivateAIModelRegistry.modelIDs(for: .edit).first.flatMap { PrivateAIModelRegistry.model(id: $0) }
     }
 
     nonisolated static func expectedLocalModelURL(for model: PrivateAIRegisteredModel) -> URL {
@@ -279,6 +296,10 @@ actor PrivateAIIntegrationService {
         self.provider.shouldHandleDictation(model: model)
     }
 
+    nonisolated static func readsDictationContext(model: String) -> Bool {
+        self.provider.readsDictationContext(model: model)
+    }
+
     func status(for runtime: RuntimeConfiguration) async -> PrivateAIStatus {
         do { return try await Self.modelActivity { await Self.provider.status(for: runtime) } } catch { return PrivateAIStatus(state: .failed, message: error.localizedDescription) }
     }
@@ -372,6 +393,11 @@ actor PrivateAIIntegrationService {
         _ = try? await Self.modelActivity { await Self.provider.prewarmDictation() }
     }
 
+    func prewarmEdit() async {
+        guard !Task.isCancelled, let model = Self.editModel else { return }
+        _ = try? await Self.modelActivity(modelID: model.id) { await Self.provider.prewarmEdit() }
+    }
+
     func unloadCachedRuntime(reason: String = "manual") async {
         let token: UUID
         do {
@@ -444,7 +470,7 @@ actor PrivateAIIntegrationService {
         runtime: RuntimeConfiguration,
         context: AppContext
     ) async throws -> EnhancementResult {
-        try await Self.modelActivity {
+        try await Self.modelActivity(modelID: runtime.model) {
             try await Self.provider.rewrite(
                 inputText,
                 systemPrompt: systemPrompt,
@@ -524,6 +550,35 @@ private struct UnavailableAIIntegrationShim: PrivateAIIntegrationProviding {
             outputText: inputText,
             backendKind: nil,
             latencyMilliseconds: nil
+        )
+    }
+}
+
+// Accept the current provider bridge's name without changing existing callers or stored settings.
+extension PrivateAIIntegrationService.RuntimeConfiguration {
+    var usesBoost: Bool { self.usesFluid1Boost }
+
+    init(
+        selectedProviderID: String,
+        providerKey: String,
+        baseURL: String,
+        model: String,
+        apiKey: String,
+        localModelPath: String?,
+        usesStablePromptPrefixKVCache: Bool,
+        usesBoost: Bool,
+        contextTokenLimit: Int
+    ) {
+        self.init(
+            selectedProviderID: selectedProviderID,
+            providerKey: providerKey,
+            baseURL: baseURL,
+            model: model,
+            apiKey: apiKey,
+            localModelPath: localModelPath,
+            usesStablePromptPrefixKVCache: usesStablePromptPrefixKVCache,
+            usesFluid1Boost: usesBoost,
+            contextTokenLimit: contextTokenLimit
         )
     }
 }

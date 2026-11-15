@@ -266,7 +266,8 @@ final class MeetingTranscriptionBackendTests: XCTestCase {
     private func makePipeline(
         registry: MeetingTranscriptionBackendRegistry,
         backendID: MeetingBackendID?,
-        gate: MeetingProcessingSerializationGate = MeetingProcessingSerializationGate()
+        gate: MeetingProcessingSerializationGate = MeetingProcessingSerializationGate(),
+        dictionaryEntriesProvider: @escaping @MainActor () -> [SettingsStore.CustomDictionaryEntry] = { [] }
     ) -> MeetingProcessingPipeline {
         MeetingProcessingPipeline(
             asrServiceProvider: {
@@ -276,7 +277,8 @@ final class MeetingTranscriptionBackendTests: XCTestCase {
             managesModelResidency: false,
             serializationGate: gate,
             backendRegistry: registry,
-            backendID: backendID
+            backendID: backendID,
+            dictionaryEntriesProvider: dictionaryEntriesProvider
         )
     }
 
@@ -598,6 +600,26 @@ final class MeetingTranscriptionBackendTests: XCTestCase {
         XCTAssertEqual(MeetingLegacyCompatibilityBackend.descriptor.supportedLanguageCodes, ["en"])
     }
 
+    func testLegacyDictionaryRunsOnceOnFinalTextWithoutChangingMetadata() async throws {
+        let registry = MeetingTranscriptionBackendRegistry(defaultBackendID: Self.fixtureBackendID)
+        var raw: MeetingProcessingResult?
+        registry.register(Self.fixtureBackendID) { [self] _ in
+            FixtureMeetingBackend(descriptor: self.makeFixtureDescriptor()) { plan in
+                let result = self.makeResult(attemptID: plan.attemptID, text: "space fest costs twenty dollars")
+                raw = result
+                return .legacyCompatibility(result)
+            }
+        }
+        let entries: [SettingsStore.CustomDictionaryEntry] = [.init(triggers: ["space fest"], replacement: "Spacefast")]
+        let pipeline = self.makePipeline(registry: registry, backendID: nil, dictionaryEntriesProvider: { entries })
+        let result = try await pipeline.process(session: self.makeSession(), sessionDirectory: FileManager.default.temporaryDirectory, progress: { _ in })
+        var expected = try XCTUnwrap(raw).segments
+        expected[0].text = "Spacefast costs $20"
+        XCTAssertEqual(result.segments, expected)
+        XCTAssertEqual(result.coverageGaps, raw?.coverageGaps)
+        XCTAssertEqual(result.isComplete, raw?.isComplete)
+    }
+
     func testPipelineDispatchesToTheInjectedBackendBeforeAnyModelWork() async throws {
         let session = self.makeSession()
         var captured: MeetingProcessingResult?
@@ -726,7 +748,54 @@ final class MeetingTranscriptionBackendTests: XCTestCase {
         XCTAssertEqual(factoryCallCount, 0, "preflight failures must not construct a backend")
     }
 
-    func testSavedLegacyBackendUsesProductionForFrenchWithoutChangingPreference() async {
+    func testCustomBackendDoesNotReadTheDictationModelPreference() async throws {
+        let backend = FixtureMeetingBackend(descriptor: self.makeFixtureDescriptor()) { plan in
+            .legacyCompatibility(self.makeResult(attemptID: plan.attemptID, text: "Fixture"))
+        }
+        let registry = MeetingTranscriptionBackendRegistry(defaultBackendID: Self.fixtureBackendID)
+        registry.register(Self.fixtureBackendID) { _ in backend }
+        let pipeline = MeetingProcessingPipeline(
+            asrServiceProvider: { XCTFail("Fixture must not load models"); return ASRService() },
+            managesModelResidency: false,
+            serializationGate: MeetingProcessingSerializationGate(),
+            backendRegistry: registry,
+            preferredASRModelProvider: { XCTFail("Other backends keep their own model policy"); return .fluidParakeetPro }
+        )
+        _ = try await pipeline.process(
+            session: self.makeSession(),
+            sessionDirectory: FileManager.default.temporaryDirectory,
+            progress: { _ in }
+        )
+        XCTAssertEqual(backend.lastPlan?.request.configuration, MeetingFinalProcessingConfiguration())
+    }
+
+    func testPreferredASRModelIsFrozenBeforeDiarizationPreparation() async throws {
+        var selected = SettingsStore.SpeechModel.fluidParakeetPro
+        var reads = 0
+        let backend = FixtureMeetingBackend(descriptor: self.makeFixtureDescriptor(id: .parakeetNemotron)) { plan in
+            .legacyCompatibility(self.makeResult(attemptID: plan.attemptID, text: "Fixture"))
+        }
+        let registry = MeetingTranscriptionBackendRegistry(defaultBackendID: .parakeetNemotron)
+        registry.register(.parakeetNemotron) { _ in backend }
+        let pipeline = MeetingProcessingPipeline(
+            asrServiceProvider: { XCTFail("Fixture selection must not load models"); return ASRService() },
+            managesModelResidency: false,
+            serializationGate: MeetingProcessingSerializationGate(),
+            backendRegistry: registry,
+            prepareDiarizationModel: { await Task.yield(); selected = .parakeetTDTv2 },
+            preferredASRModelProvider: { reads += 1; return selected }
+        )
+        _ = try await pipeline.process(
+            session: self.makeSession(),
+            sessionDirectory: FileManager.default.temporaryDirectory,
+            progress: { _ in }
+        )
+        XCTAssertEqual(reads, 1)
+        XCTAssertEqual(selected, .parakeetTDTv2)
+        XCTAssertEqual(backend.lastPlan?.request.configuration.asrModel, "fluid-parakeet-pro")
+    }
+
+    func testSavedLegacyBackendUsesProductionForEnglishAndFrenchWithoutChangingPreference() async {
         let settings = SettingsStore.shared
         let previous = settings.meetingTranscriptionBackendID
         defer { settings.meetingTranscriptionBackendID = previous }
@@ -736,19 +805,22 @@ final class MeetingTranscriptionBackendTests: XCTestCase {
         let pipeline = MeetingProcessingPipeline(
             asrServiceProvider: { XCTFail("Routing must happen before ASR loading"); return ASRService() },
             managesModelResidency: false,
-            prepareDiarizationModel: { productionPreparations += 1; throw marker }
+            prepareDiarizationModel: { productionPreparations += 1; throw marker },
+            preferredASRModelProvider: { .fluidParakeetPro }
         )
-        do {
-            _ = try await pipeline.process(
-                session: self.makeSession(languageCode: "fr"),
-                sessionDirectory: FileManager.default.temporaryDirectory,
-                progress: { _ in }
-            )
-            XCTFail("Expected the production preparation marker")
-        } catch {
-            XCTAssertEqual(error as? CocoaError, marker)
+        for language in ["en", "fr"] {
+            do {
+                _ = try await pipeline.process(
+                    session: self.makeSession(languageCode: language),
+                    sessionDirectory: FileManager.default.temporaryDirectory,
+                    progress: { _ in }
+                )
+                XCTFail("Expected the production preparation marker")
+            } catch {
+                XCTAssertEqual(error as? CocoaError, marker)
+            }
         }
-        XCTAssertEqual(productionPreparations, 1)
+        XCTAssertEqual(productionPreparations, 2)
         XCTAssertEqual(settings.meetingTranscriptionBackendID, .legacyCompatibility)
     }
 
