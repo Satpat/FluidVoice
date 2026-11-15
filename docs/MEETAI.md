@@ -26,6 +26,7 @@ MeetAI adds meeting features to upstream FluidVoice's FluidMeet without changing
 | H6 | `Services/Meeting/MeetingSessionCoordinator.swift` (`performCorrection`) | `MeetAIHooks.notifySessionCorrected(target)` |
 | - | `build.sh` | `install` profile with the release bundle ID |
 | - | `Services/Meeting/MeetingTranscriptExporter.swift` | `translations:` on `text` and `markdown` |
+| - | `Services/Meeting/MeetingSummaryController.swift`, `Services/FluidServe/FluidServeMeetings.swift` | Fork fix (not MeetAI): summary fingerprint v3 reads the meeting time in UTC, and v1/v2 summaries are matched in any UTC offset, so a time-zone change no longer hides saved summaries. Drop it if upstream fixes this. |
 
 ## Known overlaps with upstream
 - Edit speakers → Merge (1.6.12) leaves the merged-away speaker's record in MeetAI's `speakers.json`. Harmless: nothing reads records for speakers absent from the session.
